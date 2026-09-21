@@ -12,6 +12,7 @@ import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { gunzipSync, inflateRawSync } from 'node:zlib';
 
 import { verifyResolvedSourceInventory } from './semgrep-source-inventory.mjs';
+import { verifyInternalBundleEvidenceV2 } from './semgrep-source-bundle.mjs';
 
 const HASH = /^[0-9a-f]{64}$/;
 const GIT_ID = /^[0-9a-f]{40}$/;
@@ -237,6 +238,12 @@ export function parseSidecarManifest(json) {
       hash(material.sha256, `${materialPath}.sha256`);
     }
     uniquePaths(tool.materials, `${path}.materials`);
+    if (tool.id === 'semgrep' && tool.materials.some((material) => material.role === 'windows-build')) {
+      const helpers = tool.materials.filter((material) => material.role === 'windows-offline-firewall');
+      if (helpers.length !== 1 || helpers[0].path !== 'third_party/sidecars/semgrep/windows-offline-firewall.ps1') {
+        throw new Error('semgrep Windows build requires its hashed shared firewall helper');
+      }
+    }
 
     exactKeys(tool.commandTemplate, ['id', 'argv', 'sha256'], ['id', 'argv', 'sha256'], `${path}.commandTemplate`);
     if (!ID.test(tool.commandTemplate.id)) throw new Error(`${path}.commandTemplate.id is invalid`);
@@ -374,14 +381,9 @@ async function verifyMaterial(workspace, material, label) {
   }
   let bytes;
   try {
-    let current = root;
-    for (let index = 0; index < parts.length; index += 1) {
-      current = join(current, parts[index]);
-      const info = await lstat(current);
-      if (info.isSymbolicLink()) throw new Error('link component');
-      if (index < parts.length - 1 ? !info.isDirectory() : !info.isFile()) throw new Error('wrong material type');
-    }
-    bytes = await readFile(path);
+    const info = await lstat(path);
+    if (info.size > 16_777_216) throw new Error('material size exceeds bounds');
+    ({ bytes } = await readSafeClosureFile(root, path, { path: material.path, size: info.size }));
   } catch {
     throw new Error(`${label} material is missing or not a regular no-link file: ${material.path}`);
   }
@@ -542,6 +544,30 @@ export function validateSemgrepNativeBuildEvidence(
   manifestSupport,
   enabledTargets,
 ) {
+  return validateNativeBuildEvidence(evidence, sourceLock, nativeMaterial, manifestSupport, enabledTargets, null);
+}
+
+export function validateInternalWindowsNativeBuildEvidence(
+  evidence,
+  sourceLock,
+  nativeMaterial,
+  manifestSupport,
+  enabledTargets,
+  qualification,
+) {
+  if (qualification === null) throw new Error('semgrep native build evidence qualification is required');
+  return validateNativeBuildEvidence(evidence, sourceLock, nativeMaterial, manifestSupport, enabledTargets, qualification);
+}
+
+function validateNativeBuildEvidence(
+  evidence,
+  sourceLock,
+  nativeMaterial,
+  manifestSupport,
+  enabledTargets,
+  qualification,
+) {
+  const internal = qualification !== null;
   const fail = (message) => { throw new Error(`semgrep native build evidence ${message}`); };
   try {
     exactKeys(evidence, [
@@ -607,13 +633,25 @@ export function validateSemgrepNativeBuildEvidence(
       'commit', 'runId', 'runAttempt', 'workflowRef', 'workflowSha',
     ], 'ci');
     if (!GIT_ID.test(evidence.ci.commit) || !GIT_ID.test(evidence.ci.workflowSha)
-        || evidence.ci.commit !== evidence.ci.workflowSha
         || !/^[1-9][0-9]{0,31}$/u.test(evidence.ci.runId)
-        || typeof evidence.ci.workflowRef !== 'string'
-        || !evidence.ci.workflowRef.endsWith('/.github/workflows/ci.yml@refs/heads/main')) fail('CI identity is invalid');
+        || typeof evidence.ci.workflowRef !== 'string') fail('CI identity is invalid');
+    if (internal) {
+      const fields = ['commit', 'runId', 'runAttempt', 'workflowRef', 'workflowSha'];
+      exactKeys(qualification, fields, fields, 'qualification');
+      if (fields.some((key) => evidence.ci[key] !== qualification[key])
+          || ['commit', 'runId', 'workflowRef', 'workflowSha'].some((key) => typeof qualification[key] !== 'string')
+          || !/^[\x21-\x7e]{1,1024}$/u.test(qualification.workflowRef)
+          || qualification.workflowRef.includes('\\')) fail('CI identity does not match the exact qualification');
+    } else if (evidence.ci.commit !== evidence.ci.workflowSha
+        || !evidence.ci.workflowRef.endsWith('/.github/workflows/ci.yml@refs/heads/main')) {
+      fail('CI identity is invalid');
+    }
     integer(evidence.ci.runAttempt, 'ci.runAttempt', 1);
 
     const targets = enabledTargets.map((target) => target.target).sort();
+    if (internal && (targets.length !== 1 || targets[0] !== 'windows-x86_64')) {
+      fail('internal qualification requires exactly the Windows target');
+    }
     if (targets.length === 0 || targets.some((target) => !NATIVE_EVIDENCE_TARGETS.has(target))) {
       fail('enabled target inventory is invalid');
     }
@@ -787,6 +825,10 @@ function validateSemgrepBundleEvidence(bytes, sourceLockSha256, generatorSha256)
 }
 
 export async function validateManifestMaterials(manifest, workspace) {
+  return validateManifestMaterialsForDelivery(manifest, workspace, null);
+}
+
+async function validateManifestMaterialsForDelivery(manifest, workspace, internal) {
   workspace = asPath(workspace);
   for (const tool of manifest.tools) {
     const sourceLock = await verifyMaterial(
@@ -809,11 +851,15 @@ export async function validateManifestMaterials(manifest, workspace) {
       if (evidence.length !== 1 || generator.length !== 1) {
         throw new Error('semgrep bundle evidence requires exactly one evidence and generator material');
       }
-      validateSemgrepBundleEvidence(
-        evidence[0].bytes,
-        tool.source.materialSha256,
-        generator[0].sha256,
-      );
+      if (internal) {
+        const bundle = JSON.parse(decodeUtf8(evidence[0].bytes, 'internal bundle evidence'));
+        if (bundle.bundleGeneratorSha256 !== generator[0].sha256
+            || bundle.sourceLockSha256 !== tool.source.materialSha256) {
+          throw new Error('internal bundle evidence material identity mismatch');
+        }
+      } else {
+        validateSemgrepBundleEvidence(evidence[0].bytes, tool.source.materialSha256, generator[0].sha256);
+      }
       const nativeEvidence = verifiedMaterials.filter((material) => material.role === 'native-build-evidence');
       if (nativeEvidence.length !== 1) throw new Error('semgrep native build evidence requires exactly one material');
       let nativeEvidenceValue;
@@ -822,13 +868,13 @@ export async function validateManifestMaterials(manifest, workspace) {
       } catch {
         throw new Error('semgrep native build evidence is not valid UTF-8 JSON');
       }
-      validateSemgrepNativeBuildEvidence(
-        nativeEvidenceValue,
-        sourceGate,
-        nativeEvidence[0],
-        verifiedMaterials,
-        enabledTargets,
-      );
+      if (internal) {
+        validateInternalWindowsNativeBuildEvidence(
+          nativeEvidenceValue, sourceGate, nativeEvidence[0], verifiedMaterials, enabledTargets, internal.qualification,
+        );
+      } else {
+        validateSemgrepNativeBuildEvidence(nativeEvidenceValue, sourceGate, nativeEvidence[0], verifiedMaterials, enabledTargets);
+      }
     }
   }
 }
@@ -1443,49 +1489,219 @@ function parseCiCandidateDocument(bytes) {
   hash(candidate.productionManifestSha256, 'CI candidate document.productionManifestSha256');
   hash(candidate.sourceLockSha256, 'CI candidate document.sourceLockSha256');
   hash(candidate.bundleEvidenceSha256, 'CI candidate document.bundleEvidenceSha256');
+  return validateCandidateRuntime(candidate, 'CI candidate');
+}
+
+function validateCandidateRuntime(candidate, label) {
   exactKeys(
     candidate.archive,
     ['format', 'size', 'sha256', 'entries', 'extractPath'],
     ['format', 'size', 'sha256', 'entries', 'extractPath'],
-    'CI candidate document.archive',
+    `${label} document.archive`,
   );
-  if (candidate.archive.format !== 'tar.gz') throw new Error('CI candidate archive format is unsupported');
-  integer(candidate.archive.size, 'CI candidate document.archive.size', 1, MAX_ARTIFACT_BYTES);
-  hash(candidate.archive.sha256, 'CI candidate document.archive.sha256');
+  if (candidate.archive.format !== 'tar.gz') throw new Error(`${label} archive format is unsupported`);
+  integer(candidate.archive.size, `${label} document.archive.size`, 1, MAX_ARTIFACT_BYTES);
+  hash(candidate.archive.sha256, `${label} document.archive.sha256`);
   if (!Array.isArray(candidate.archive.entries) || candidate.archive.entries.length === 0
       || candidate.archive.entries.length > MAX_ARCHIVE_ENTRIES) {
-    throw new Error('CI candidate archive entries are invalid');
+    throw new Error(`${label} archive entries are invalid`);
   }
-  candidate.archive.entries.forEach((entry, index) => validateEntry(entry, `CI candidate document.archive.entries[${index}]`));
-  uniquePaths(candidate.archive.entries, 'CI candidate document.archive.entries');
-  safeRelativePath(candidate.archive.extractPath, 'CI candidate document.archive.extractPath');
+  candidate.archive.entries.forEach((entry, index) => validateEntry(entry, `${label} document.archive.entries[${index}]`));
+  uniquePaths(candidate.archive.entries, `${label} document.archive.entries`);
+  safeRelativePath(candidate.archive.extractPath, `${label} document.archive.extractPath`);
   exactKeys(
     candidate.executable,
     ['path', 'size', 'sha256'],
     ['path', 'size', 'sha256'],
-    'CI candidate document.executable',
+    `${label} document.executable`,
   );
-  safeRelativePath(candidate.executable.path, 'CI candidate document.executable.path');
-  integer(candidate.executable.size, 'CI candidate document.executable.size', 1, MAX_ARTIFACT_BYTES);
-  hash(candidate.executable.sha256, 'CI candidate document.executable.sha256');
+  safeRelativePath(candidate.executable.path, `${label} document.executable.path`);
+  integer(candidate.executable.size, `${label} document.executable.size`, 1, MAX_ARTIFACT_BYTES);
+  hash(candidate.executable.sha256, `${label} document.executable.sha256`);
   if (!Array.isArray(candidate.closure) || candidate.closure.length === 0
       || candidate.closure.length > MAX_CLOSURE_ENTRIES) {
-    throw new Error('CI candidate closure is invalid');
+    throw new Error(`${label} closure is invalid`);
   }
-  candidate.closure.forEach((entry, index) => validateClosure(entry, `CI candidate document.closure[${index}]`));
-  uniquePaths(candidate.closure, 'CI candidate document.closure');
+  candidate.closure.forEach((entry, index) => validateClosure(entry, `${label} document.closure[${index}]`));
+  uniquePaths(candidate.closure, `${label} document.closure`);
   const executable = candidate.closure.find((entry) => entry.path === candidate.executable.path);
   if (!executable || !executable.executable
       || executable.size !== candidate.executable.size
       || executable.sha256 !== candidate.executable.sha256
       || candidate.archive.extractPath !== candidate.executable.path) {
-    throw new Error('CI candidate executable does not match its closure');
+    throw new Error(`${label} executable does not match its closure`);
   }
   const expectedEntries = candidate.closure.map(({ path, size }) => ({ path, type: 'file', size }));
   if (JSON.stringify(candidate.archive.entries) !== JSON.stringify(expectedEntries)) {
-    throw new Error('CI candidate archive inventory does not match its closure');
+    throw new Error(`${label} archive inventory does not match its closure`);
   }
   return candidate;
+}
+
+// Parsing establishes shape only. Installed authority requires equality with producer-owned bytes.
+export function parseInternalWindowsDescriptorV2(bytes) {
+  const label = 'internal Windows descriptor';
+  if (!Buffer.isBuffer(bytes) || bytes.length === 0 || bytes.length > MAX_MANIFEST_BYTES) {
+    throw new Error(`${label} is missing or too large`);
+  }
+  const value = JSON.parse(decodeUtf8(bytes, label));
+  const keys = [
+    'schemaVersion', 'purpose', 'publishable', 'enabled', 'target', 'sidecar', 'version',
+    'applicationSourceCommit', 'qualification', 'sidecarManifest', 'sourceLock',
+    'nativeBuildEvidence', 'bundleEvidence', 'commandTemplate', 'archive', 'executable',
+    'closure', 'sourceCompanion', 'complianceManifest',
+  ];
+  exactKeys(value, keys, keys, label);
+  if (value.schemaVersion !== 2 || value.purpose !== 'internal-windows-package-qualification'
+      || value.publishable !== false || value.enabled !== true || value.target !== 'windows-x86_64'
+      || value.sidecar !== 'semgrep' || value.version !== '1.170.0'
+      || typeof value.applicationSourceCommit !== 'string' || !GIT_ID.test(value.applicationSourceCommit)) {
+    throw new Error(`${label} has invalid qualification literals`);
+  }
+  const qualificationKeys = ['commit', 'runId', 'runAttempt', 'workflowRef', 'workflowSha'];
+  const q = value.qualification;
+  exactKeys(q, qualificationKeys, qualificationKeys, `${label}.qualification`);
+  if (typeof q.commit !== 'string' || !GIT_ID.test(q.commit)
+      || typeof q.workflowSha !== 'string' || !GIT_ID.test(q.workflowSha)
+      || typeof q.runId !== 'string' || !/^[1-9][0-9]{0,31}$/u.test(q.runId)
+      || typeof q.workflowRef !== 'string' || !/^[\x21-\x7e]{1,1024}$/u.test(q.workflowRef)
+      || q.workflowRef.includes('\\')) throw new Error(`${label} qualification identity is invalid`);
+  integer(q.runAttempt, `${label}.qualification.runAttempt`, 1);
+  const prefix = 'sidecars/semgrep/verification/';
+  for (const [key, path, maximum] of [
+    ['sidecarManifest', `${prefix}third_party/sidecars/manifest.v1.json`, MAX_MANIFEST_BYTES],
+    ['sourceLock', `${prefix}third_party/sidecars/semgrep/source-lock.v1.json`, 16_777_216],
+    ['nativeBuildEvidence', `${prefix}third_party/sidecars/semgrep/native-build-evidence.v1.json`, MAX_MANIFEST_BYTES],
+    ['bundleEvidence', `${prefix}third_party/sidecars/semgrep/bundle-evidence.internal-windows.v2.json`, 65_536],
+    ['complianceManifest', 'compliance/manifest.v1.json', 16_777_216],
+  ]) {
+    exactKeys(value[key], ['path', 'size', 'sha256'], ['path', 'size', 'sha256'], `${label}.${key}`);
+    if (value[key].path !== path) throw new Error(`${label}.${key} path is not fixed`);
+    integer(value[key].size, `${label}.${key}.size`, 1, maximum);
+    evidenceHash(value[key].sha256, `${label}.${key}.sha256`);
+  }
+  exactKeys(value.commandTemplate, ['id', 'sha256'], ['id', 'sha256'], `${label}.commandTemplate`);
+  if (value.commandTemplate.id !== 'osemgrep-scan-v1') throw new Error(`${label} command template is invalid`);
+  evidenceHash(value.commandTemplate.sha256, `${label}.commandTemplate.sha256`);
+  const source = value.sourceCompanion;
+  const sourceKeys = ['path', 'size', 'sha256', 'payloadEntries', 'recordedLinks'];
+  exactKeys(source, sourceKeys, sourceKeys, `${label}.sourceCompanion`);
+  if (source.path !== 'compliance/semgrep/semgrep-1.170.0-corresponding-source.tar') {
+    throw new Error(`${label} source companion path is not fixed`);
+  }
+  integer(source.size, `${label}.sourceCompanion.size`, 1, MAX_SOURCE_BUNDLE_BYTES);
+  integer(source.payloadEntries, `${label}.sourceCompanion.payloadEntries`, 1, 1_000_000);
+  integer(source.recordedLinks, `${label}.sourceCompanion.recordedLinks`, 0, 1_000_000);
+  evidenceHash(source.sha256, `${label}.sourceCompanion.sha256`);
+  validateCandidateRuntime(value, label);
+  evidenceHash(value.archive.sha256, `${label}.archive.sha256`);
+  if (value.closure.filter(({ executable }) => executable).length !== 1) {
+    throw new Error(`${label} requires exactly one executable`);
+  }
+  let previous;
+  for (const entry of value.closure) {
+    evidenceHash(entry.sha256, `${label} closure SHA-256`);
+    integer(entry.size, `${label} closure size`, 1, MAX_ARTIFACT_BYTES);
+    if (Buffer.byteLength(entry.path) > 1024 || entry.path.split('/').some((part) => Buffer.byteLength(part) > 255)) {
+      throw new Error(`${label} closure path exceeds byte bounds`);
+    }
+    if (previous !== undefined && Buffer.compare(Buffer.from(previous), Buffer.from(entry.path)) >= 0) {
+      throw new Error(`${label} closure path order is invalid`);
+    }
+    previous = entry.path;
+  }
+  return value;
+}
+
+// Verifies staged Semgrep inputs, not the application compliance inventory. The release
+// license checker must validate the returned compliance bytes and their actual files.
+export async function verifyInternalWindowsPackageInputs({ resourceRoot, expectedDescriptorBytes, archiveBytes }) {
+  if (!Buffer.isBuffer(expectedDescriptorBytes) || expectedDescriptorBytes.length === 0
+      || expectedDescriptorBytes.length > MAX_MANIFEST_BYTES) throw new Error('expected descriptor bytes are invalid');
+  const root = resolve(asPath(resourceRoot));
+  const descriptorPath = 'sidecars/semgrep/internal-windows-package-qualification.v2.json';
+  const { bytes: descriptorBytes } = await readSafeClosureFile(root, join(root, descriptorPath), {
+    path: descriptorPath, size: expectedDescriptorBytes.length,
+  });
+  if (!descriptorBytes.equals(expectedDescriptorBytes)) throw new Error('installed descriptor differs from producer bytes');
+  const descriptor = parseInternalWindowsDescriptorV2(descriptorBytes);
+  const materials = {};
+  for (const key of ['sidecarManifest', 'sourceLock', 'nativeBuildEvidence', 'bundleEvidence', 'complianceManifest']) {
+    const identity = descriptor[key];
+    const { bytes } = await readSafeClosureFile(root, join(root, identity.path), identity);
+    if (sha256(bytes) !== identity.sha256) throw new Error(`internal ${key} SHA-256 mismatch`);
+    materials[key] = bytes;
+  }
+  const workspace = join(root, 'sidecars/semgrep/verification');
+  const manifest = parseSidecarManifest(decodeUtf8(materials.sidecarManifest, 'internal sidecar manifest'));
+  const semgrep = manifest.tools.find(({ id }) => id === 'semgrep');
+  const target = semgrep?.targets.find(({ target: name }) => name === 'windows-x86_64');
+  const prefix = 'sidecars/semgrep/verification/';
+  if (!target?.enabled || semgrep.version !== descriptor.version
+      || semgrep.targets.filter(({ enabled }) => enabled).length !== 1
+      || target.reproducibleBuilds !== 2 || target.correspondingSourceComplete !== true
+      || semgrep.targets.find(({ target: name }) => name === 'macos-aarch64')?.disabledReason !== 'deferred_apple_native_qualification'
+      || `${prefix}${semgrep.source.materialPath}` !== descriptor.sourceLock.path
+      || semgrep.source.materialSha256 !== descriptor.sourceLock.sha256
+      || semgrep.commandTemplate.id !== descriptor.commandTemplate.id
+      || semgrep.commandTemplate.sha256 !== descriptor.commandTemplate.sha256
+      || ['path', 'size', 'sha256'].some((key) => target.executable[key] !== descriptor.executable[key])
+      || target.closure.length !== descriptor.closure.length
+      || target.closure.some((entry, index) => ['path', 'size', 'sha256', 'executable']
+        .some((key) => entry[key] !== descriptor.closure[index][key]))
+      || ['format', 'size', 'sha256', 'extractPath'].some((key) => target.download[key] !== descriptor.archive[key])) {
+    throw new Error('internal descriptor and manifest disagree');
+  }
+  if (target.download.entries.length !== descriptor.archive.entries.length
+      || target.download.entries.some((entry, index) => ['path', 'type', 'size']
+        .some((key) => entry[key] !== descriptor.archive.entries[index][key]))) {
+    throw new Error('internal descriptor and manifest archive inventory disagree');
+  }
+  for (const [role, key] of [['native-build-evidence', 'nativeBuildEvidence'], ['source-bundle-evidence', 'bundleEvidence']]) {
+    const matches = semgrep.materials.filter((material) => material.role === role);
+    if (matches.length !== 1 || `${prefix}${matches[0].path}` !== descriptor[key].path
+        || matches[0].sha256 !== descriptor[key].sha256) throw new Error(`internal ${role} identity mismatch`);
+  }
+  await validateManifestMaterialsForDelivery(manifest, workspace, descriptor);
+  const source = descriptor.sourceCompanion;
+  const sourcePath = join(root, source.path);
+  const parents = await safeDirectoryChain(root, dirname(sourcePath));
+  const before = await lstat(sourcePath, { bigint: true });
+  if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n || before.size !== BigInt(source.size)) {
+    throw new Error('internal source companion is not an exact regular no-link file');
+  }
+  const verifiedSource = await verifyInternalBundleEvidenceV2({
+    bundlePath: sourcePath,
+    evidencePath: join(root, descriptor.bundleEvidence.path),
+    sourceLockPath: join(root, descriptor.sourceLock.path),
+  });
+  const after = await lstat(sourcePath, { bigint: true });
+  if (!after.isFile() || after.isSymbolicLink() || after.nlink !== 1n || !sameIdentity(before, after)
+      || after.size !== before.size || verifiedSource.sha256 !== source.sha256
+      || verifiedSource.size !== source.size || verifiedSource.payloadEntries !== source.payloadEntries
+      || verifiedSource.links !== source.recordedLinks) throw new Error('internal source companion identity changed');
+  await recheckDirectoryChain(parents);
+  // The source verifier reads these paths itself; reject any intervening replacement.
+  for (const key of ['sourceLock', 'bundleEvidence']) {
+    const identity = descriptor[key];
+    const { bytes } = await readSafeClosureFile(root, join(root, identity.path), identity);
+    if (!bytes.equals(materials[key])) throw new Error(`internal ${key} changed during source verification`);
+  }
+  if (!Buffer.isBuffer(archiveBytes) || archiveBytes.length !== descriptor.archive.size) {
+    throw new Error('internal runtime archive size mismatch');
+  }
+  if (sha256(archiveBytes) !== descriptor.archive.sha256) throw new Error('internal runtime archive SHA-256 mismatch');
+  return {
+    descriptor,
+    descriptorDigest: sha256(Buffer.concat([
+      Buffer.from('context-relay/internal-windows-package-qualification/v2\0'), descriptorBytes,
+    ])),
+    files: extractRuntimeClosure(archiveBytes, descriptor.archive.format, {
+      download: descriptor.archive, executable: descriptor.executable, closure: descriptor.closure,
+    }),
+    complianceManifestBytes: materials.complianceManifest,
+    complianceVerified: false,
+  };
 }
 
 function ciCandidateDigest(bytes) {

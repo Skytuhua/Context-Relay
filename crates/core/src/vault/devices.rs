@@ -302,6 +302,7 @@ impl Vault {
         approval: &UnconfirmedPairingGrant,
         prepared_at_ms: u64,
     ) -> Result<CommitDisposition, VaultError> {
+        super::membership::require_legacy_pairing(&self.connection)?;
         let reverified = inspect_pairing_approval(approval.canonical_bytes(), signed_request)
             .map_err(crypto_error)?;
         if &reverified != approval {
@@ -340,6 +341,7 @@ impl Vault {
         let canonical_grant_sha256 = sha256(&canonical_grant);
         let approved_payload_sha256 = sha256(approval.canonical_bytes());
         let transaction = self.connection.transaction()?;
+        super::membership::require_legacy_pairing(&transaction)?;
         ensure_active_certificate_tx(
             &transaction,
             payload.issuer_certificate_id,
@@ -440,6 +442,7 @@ impl Vault {
         approved_payload_sha256: Sha256Digest,
         accepted_at_ms: u64,
     ) -> Result<CommitDisposition, VaultError> {
+        super::membership::require_legacy_pairing(&self.connection)?;
         let stored = self.validated_approver_transcript(pairing_id)?;
         if stored.approved_payload_sha256 != approved_payload_sha256 {
             return Err(VaultError::OperationConflict);
@@ -456,6 +459,7 @@ impl Vault {
             _ => return Err(VaultError::OperationConflict),
         }
         let transaction = self.connection.transaction()?;
+        super::membership::require_legacy_pairing(&transaction)?;
         let decision_changed = transaction.execute(
             "UPDATE pairing_decisions SET state = 'accepted', finished_at_ms = ?2
              WHERE pairing_id = ?1 AND state = 'prepared' AND finished_at_ms IS NULL",
@@ -479,6 +483,7 @@ impl Vault {
         &self,
         pairing_id: PairingId,
     ) -> Result<StoredPairingApproval, VaultError> {
+        super::membership::require_legacy_pairing(&self.connection)?;
         let stored = self
             .pairing_approval_transcript(pairing_id)?
             .ok_or_else(|| VaultError::Validation("missing pairing approval".to_owned()))?;
@@ -687,6 +692,7 @@ impl Vault {
         confirmed: &ConfirmedPairingApproval,
         completed_at_ms: u64,
     ) -> Result<CommitDisposition, VaultError> {
+        super::membership::require_legacy_pairing(&self.connection)?;
         let payload = confirmed.approved_payload();
         let pairing_id = payload.grant.pairing_id;
         let stored = self.validated_joiner_transcript(pairing_id)?;
@@ -721,6 +727,7 @@ impl Vault {
         };
         let canonical_grant = encode_pairing_grant_v1(&payload.grant).map_err(crypto_error)?;
         let transaction = self.connection.transaction()?;
+        super::membership::require_legacy_pairing(&transaction)?;
         ensure_active_certificate_tx(
             &transaction,
             payload.issuer_certificate_id,
@@ -771,6 +778,7 @@ impl Vault {
         pairing_id: PairingId,
         joiner_keys: &DeviceKeys,
     ) -> Result<Option<ConfirmedPairingApproval>, VaultError> {
+        super::membership::require_legacy_pairing(&self.connection)?;
         let Some(stored) = self.completed_pairing_transcript(pairing_id)? else {
             return Ok(None);
         };
@@ -1001,6 +1009,11 @@ impl Vault {
         &self,
         certificate_id: DeviceCertificateId,
     ) -> Result<Option<StoredDeviceCertificate>, VaultError> {
+        if let Some(devices) = self.accepted_device_views()? {
+            return Ok(devices
+                .into_iter()
+                .find(|row| row.certificate_id == certificate_id));
+        }
         self.connection
             .query_row(
                 "SELECT account_id, workspace_id, device_id, canonical_bytes, canonical_sha256, state, device_name, platform, stored_at_ms
@@ -1040,6 +1053,15 @@ impl Vault {
     }
 
     pub fn devices(&self, scope: SyncScope) -> Result<Vec<StoredDeviceCertificate>, VaultError> {
+        if let Some(devices) = self.accepted_device_views()? {
+            return Ok(devices
+                .into_iter()
+                .filter(|row| {
+                    row.certificate.account_id == scope.account_id
+                        && row.certificate.workspace_id == scope.workspace_id
+                })
+                .collect());
+        }
         let mut statement = self.connection.prepare(
             "SELECT certificate_id FROM device_certificates
              WHERE account_id = ?1 AND workspace_id = ?2 ORDER BY device_id",
@@ -1061,6 +1083,9 @@ impl Vault {
     }
 
     pub fn all_devices(&self) -> Result<Vec<StoredDeviceCertificate>, VaultError> {
+        if let Some(devices) = self.accepted_device_views()? {
+            return Ok(devices);
+        }
         let mut statement = self.connection.prepare(
             "SELECT certificate_id FROM device_certificates
              ORDER BY account_id, workspace_id, device_id, certificate_id",
@@ -1084,6 +1109,7 @@ impl Vault {
         canonical_grant: &[u8],
         prepared_at_ms: u64,
     ) -> Result<CommitDisposition, VaultError> {
+        super::membership::require_legacy_pairing(&self.connection)?;
         let parsed = decode_pairing_grant_v1(canonical_grant).map_err(crypto_error)?;
         if &parsed != grant {
             return Err(VaultError::Validation(
@@ -1102,6 +1128,7 @@ impl Vault {
         }
         let digest = sha256(canonical_grant);
         let transaction = self.connection.transaction()?;
+        super::membership::require_legacy_pairing(&transaction)?;
         if let Some((stored_request, stored_certificate, stored_grant, stored_digest, state, stored_at)) =
             transaction
                 .query_row(
@@ -1205,6 +1232,7 @@ impl Vault {
         finished_at_ms: u64,
     ) -> Result<CommitDisposition, VaultError> {
         let transaction = self.connection.transaction()?;
+        super::membership::require_legacy_pairing(&transaction)?;
         let existing: Option<StoredDecisionRow> = transaction
             .query_row(
                 "SELECT request_digest, state, finished_at_ms, certificate_id, canonical_grant, grant_sha256 FROM pairing_decisions WHERE pairing_id = ?1",
@@ -1441,6 +1469,7 @@ impl Vault {
         display: &DeviceDisplayMetadata,
         completed_at_ms: u64,
     ) -> Result<CommitDisposition, VaultError> {
+        super::membership::require_legacy_pairing(&self.connection)?;
         self.finish_pairing_join_inner(
             pairing_id,
             canonical_request,
@@ -1461,6 +1490,7 @@ impl Vault {
         display: &DeviceDisplayMetadata,
         completed_at_ms: u64,
     ) -> Result<CommitDisposition, VaultError> {
+        super::membership::require_legacy_pairing(&self.connection)?;
         display.validate()?;
         let request = decode_pairing_request_v1(canonical_request)
             .map_err(|_| VaultError::Validation("invalid canonical pairing request".to_owned()))?;
@@ -1491,6 +1521,7 @@ impl Vault {
         let certificate_bytes = encode_device_certificate_v1(certificate).map_err(crypto_error)?;
         let certificate_hash = sha256(&certificate_bytes);
         let transaction = self.connection.transaction()?;
+        super::membership::require_legacy_pairing(&transaction)?;
         let existing: Option<StoredJoinRow> = transaction
             .query_row(
                 "SELECT canonical_request, request_sha256, certificate_id, wrapped_key_bundle, state, completed_at_ms

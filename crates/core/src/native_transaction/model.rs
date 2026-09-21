@@ -148,10 +148,42 @@ pub struct CanonicalCliDeclaration {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApprovedCliMutation {
     pub stable_id: String,
+    /// Persisted launch target. None is retained only for legacy plans and
+    /// harnesses that do not yet have a qualified explicit context contract.
+    pub execution_context: Option<CliExecutionContext>,
     pub expected: Option<CanonicalCliDeclaration>,
     pub intended: Option<CanonicalCliDeclaration>,
     pub forward: Vec<CliOperation>,
     pub rollback: Vec<CliOperation>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum CliExecutionContext {
+    CodexV1 {
+        codex_home: WireNativeValue,
+        user_home: WireNativeValue,
+        project_root: WireNativeValue,
+        working_directory: WireNativeValue,
+    },
+    /// Legacy binding retained for reading sealed plans. Its inferred home is
+    /// insufficient for custom configurations; new execution requires V2.
+    ClaudeCodeV1 {
+        config_dir: WireNativeValue,
+        state_path: WireNativeValue,
+        project_root: WireNativeValue,
+    },
+    ClaudeCodeV2 {
+        config_dir: WireNativeValue,
+        state_path: WireNativeValue,
+        project_root: WireNativeValue,
+        user_home: WireNativeValue,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -178,10 +210,21 @@ pub struct NativeTransactionPlan {
     pub scanner_result_hash: Sha256Digest,
     pub mutations: Vec<ApprovedMutation>,
     pub cli_mutations: Vec<ApprovedCliMutation>,
+    pub installed_runtime: Option<InstalledRuntimeBinding>,
     /// Exact native fallback source descriptors activated only after this
     /// sealed setup plan commits successfully.
     pub native_memory_registrations: Vec<NativeMemoryRegistration>,
     pub ownership_changes: Vec<OwnershipChange>,
+}
+
+/// Closed runtime/command-policy identity, distinct from shipped sidecar provenance.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", deny_unknown_fields)]
+pub enum InstalledRuntimeBinding {
+    #[serde(rename = "hermesPythonV1")]
+    HermesPythonV1 {
+        runtime: crate::hermes::python_runtime::RetainedRuntimeReference,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

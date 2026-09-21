@@ -1845,6 +1845,7 @@ impl RandomizedScenario {
         };
         let content_key = ContentKey::from_bytes(CONTENT_KEY);
         let built = OperationBuilder::new(SyncIdentity {
+            membership_endpoint: None,
             account_id: scope().account_id,
             workspace_id: scope().workspace_id,
             device_id: replica.device.certificate.device_id,
@@ -2380,6 +2381,7 @@ fn build_broken_chain_operation(
     });
     let content_key = ContentKey::from_bytes(CONTENT_KEY);
     OperationBuilder::new(SyncIdentity {
+        membership_endpoint: None,
         account_id: scope().account_id,
         workspace_id: scope().workspace_id,
         device_id: device.certificate.device_id,
@@ -2424,6 +2426,7 @@ fn build_operation_in_scope(
 ) -> context_relay_core::sync::BuiltOperation {
     let content_key = ContentKey::from_bytes(CONTENT_KEY);
     OperationBuilder::new(SyncIdentity {
+        membership_endpoint: None,
         account_id: sync_scope.account_id,
         workspace_id: sync_scope.workspace_id,
         device_id: device.certificate.device_id,

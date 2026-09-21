@@ -70,7 +70,23 @@ export function validateIndependentBuilderIdentities(a, b, expected) {
   return true;
 }
 
+export function validateWindowsOfflineEvidence(bytes, mode) {
+  const mechanism = mode === 'qualification'
+    ? 'windows-firewall-default-outbound-block-ancestor-runner-hca-tcp443-hca-imds80-experiment'
+    : mode === 'runtime-smoke' ? 'windows-firewall-runtime-smoke-network-deny' : null;
+  const expected = `${JSON.stringify({ mechanism, probe: 'hostile-outbound-tcp443-and-imds-tcp80-denied', schemaVersion: 1 })}\n`;
+  if (!mechanism || !Buffer.isBuffer(bytes) || !bytes.equals(Buffer.from(expected))) {
+    throw new Error('invalid Windows offline evidence');
+  }
+  return true;
+}
+
 function main(argv) {
+  if (argv[0] === '--windows-offline-evidence') {
+    if (argv.length !== 3) fail('offline evidence usage');
+    validateWindowsOfflineEvidence(readFileSync(argv[2]), argv[1]);
+    return;
+  }
   if (argv.length !== 10) fail('usage');
   const [aPath, bPath, target, commit, runId, runAttemptText, workflowRef, workflowSha, jobDefinition, artifactPrefix] = argv;
   const expected = {

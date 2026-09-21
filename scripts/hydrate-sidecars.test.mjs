@@ -16,6 +16,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import test from 'node:test';
 import { gunzipSync, gzipSync } from 'node:zlib';
+import * as sidecarHydration from './hydrate-sidecars.mjs';
 
 import {
   digestArgv,
@@ -33,6 +34,58 @@ const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
 const fullHex = (value) => value.repeat(64).slice(0, 64);
 const digestForFixture = (argv) => sha256(Buffer.from(argv.join(String.fromCharCode(0))));
 const gunzipForTest = (bytes) => gunzipSync(bytes);
+
+test('internal descriptor binds fixed inputs and rejects incomplete or ambiguous runtime identities', async () => {
+  const bytes = await readFile(new URL('./fixtures/semgrep-internal-windows.v2.json', import.meta.url));
+  const descriptor = JSON.parse(bytes);
+  const parse = sidecarHydration.parseInternalWindowsDescriptorV2;
+  assert.equal(typeof parse, 'function');
+  assert.deepEqual(parse(bytes), descriptor);
+  const encode = (value) => Buffer.from(`${JSON.stringify(value, null, 2)}\n`);
+  for (const key of Object.keys(descriptor)) {
+    const missing = structuredClone(descriptor);
+    delete missing[key];
+    assert.throws(() => parse(encode(missing)), /missing|invalid|required/i, key);
+  }
+  for (const change of [
+    (v) => { v.schemaVersion = 1; },
+    (v) => { v.enabled = false; },
+    (v) => { v.publishable = true; },
+    (v) => { v.target = 'macos-aarch64'; },
+    (v) => { v.extra = true; },
+    (v) => { v.qualification = null; },
+    (v) => { v.qualification.workflowRef = 'owner\\workflow'; },
+    (v) => { v.qualification.runId = '01'; },
+    (v) => { v.applicationSourceCommit = 'x'.repeat(40); },
+    (v) => { v.sourceLock.sha256 = '0'.repeat(64); },
+    (v) => { v.sidecarManifest.path = '../manifest.v1.json'; },
+    (v) => { v.bundleEvidence.size = 65537; },
+    (v) => { v.sourceCompanion.size = 2147483649; },
+    (v) => { v.sourceCompanion.payloadEntries = 1000001; },
+    (v) => { v.complianceManifest = null; },
+    (v) => { v.commandTemplate.id = 'another-command'; },
+    (v) => { v.archive.sha256 = '0'.repeat(64); },
+    (v) => { v.archive.entries[0].size = 0; },
+    (v) => { v.closure[0].sha256 = '0'.repeat(64); },
+    (v) => { v.closure[0].executable = false; },
+    (v) => { v.closure.push({ ...v.closure[0], path: 'other.exe' }); v.archive.entries.push({ path: 'other.exe', type: 'file', size: 1 }); },
+    (v) => { v.closure.push({ ...v.closure[0], path: 'OSEMGREP.EXE', executable: false }); v.archive.entries.push({ path: 'OSEMGREP.EXE', type: 'file', size: 1 }); },
+  ]) {
+    const changed = structuredClone(descriptor);
+    change(changed);
+    assert.throws(() => parse(encode(changed)));
+  }
+  const unicode = structuredClone(descriptor);
+  unicode.closure.push({ ...unicode.closure[0], path: 'é.dll', executable: false });
+  unicode.archive.entries.push({ path: 'é.dll', type: 'file', size: 1 });
+  assert.doesNotThrow(() => parse(encode(unicode)));
+  for (const path of ['é'.repeat(126) + '.dll', 'e\u0301.dll', 'aux.dll', 'parent/../file.dll']) {
+    unicode.closure[1].path = path;
+    unicode.archive.entries[1].path = path;
+    assert.throws(() => parse(encode(unicode)), /path|canonical|order/i);
+  }
+  assert.throws(() => parse(Buffer.alloc(1048577)), /large|size/i);
+});
 
 function canonicalSemgrepLicenseMaterials() {
   const sources = [
@@ -530,6 +583,47 @@ test('enabled Semgrep requires complete internal evidence in the hashed source l
     support,
     [tool.targets[0]],
   ));
+  await t.test('internal Windows native evidence retains the exact qualified workflow identity', () => {
+    const internalEvidence = structuredClone(directEvidence);
+    const qualification = {
+      ...internalEvidence.ci,
+      workflowRef: 'Skytuhua/Context-Relay/.github/workflows/ci.yml@refs/pull/16/merge',
+      workflowSha: 'e'.repeat(40),
+    };
+    internalEvidence.ci = { ...qualification };
+    const lock = { ...complete, nativeBuildEvidence: {
+      path: nativeEvidencePath,
+      sha256: fullHex('f'),
+      support: support.map(({ path, sha256: digest }) => ({ path, sha256: digest })),
+    } };
+    const material = { role: 'native-build-evidence', path: nativeEvidencePath, sha256: fullHex('f') };
+    const verify = (value = internalEvidence, expected = qualification, targets = [tool.targets[0]]) => (
+      sidecarHydration.validateInternalWindowsNativeBuildEvidence(value, lock, material, support, targets, expected)
+    );
+    assert.equal(typeof sidecarHydration.validateInternalWindowsNativeBuildEvidence, 'function');
+    assert.doesNotThrow(() => verify());
+    assert.throws(() => verify(directEvidence, null), /qualification/i);
+    assert.throws(
+      () => validateSemgrepNativeBuildEvidence(internalEvidence, lock, material, support, [tool.targets[0]]),
+      /CI identity/i,
+    );
+    for (const key of ['commit', 'runId', 'runAttempt', 'workflowRef', 'workflowSha']) {
+      const changed = { ...qualification, [key]: key === 'runAttempt' ? 2 : `${qualification[key]}1` };
+      assert.throws(() => verify(internalEvidence, changed), /CI identity|qualification/i, key);
+    }
+    for (const badRef of ['', 'x'.repeat(1025), 'owner/repo\\ci.yml', 'owner/repo ci.yml', 'owner/repo\nci.yml']) {
+      const changed = { ...qualification, workflowRef: badRef };
+      assert.throws(() => verify({ ...internalEvidence, ci: changed }, changed), /CI identity|qualification/i);
+    }
+    assert.throws(() => verify(internalEvidence, { ...qualification, extra: true }), /fields|qualification/i);
+    assert.throws(() => verify(internalEvidence, undefined, [tool.targets[0], { ...tool.targets[0], target: 'macos-aarch64' }]), /target/i);
+    const missingBuilder = structuredClone(internalEvidence);
+    missingBuilder.builders.pop();
+    assert.throws(() => verify(missingBuilder), /builder/i);
+    const duplicateCheck = structuredClone(internalEvidence);
+    duplicateCheck.smokes[0].checkRunId = duplicateCheck.builders[0].checkRunId;
+    assert.throws(() => verify(duplicateCheck), /check-run/i);
+  });
   await assert.rejects(
     () => validateLock(complete, { omitNativeEvidence: true }),
     /semgrep.*native build evidence/i,
@@ -1082,7 +1176,20 @@ test('the committed manifest and all referenced material validate', async () => 
   await validateManifestMaterials(manifest, workspace);
 });
 
-test('Semgrep records the V1 source bundle but remains disabled pending release qualification', async () => {
+test('Windows build materials reject a missing or tampered shared firewall helper', async () => {
+  const workspace = new URL('..', import.meta.url);
+  const manifest = JSON.parse(await readFile(new URL('../third_party/sidecars/manifest.v1.json', import.meta.url)));
+  const semgrep = manifest.tools.find(({ id }) => id === 'semgrep');
+  const missing = structuredClone(manifest);
+  missing.tools.find(({ id }) => id === 'semgrep').materials = semgrep.materials.filter(({ role }) => role !== 'windows-offline-firewall');
+  assert.throws(() => parseSidecarManifest(JSON.stringify(missing)), /shared firewall helper/i);
+  const helper = semgrep.materials.find(({ role }) => role === 'windows-offline-firewall');
+  assert.equal(helper.path, 'third_party/sidecars/semgrep/windows-offline-firewall.ps1');
+  helper.sha256 = fullHex('a');
+  await assert.rejects(() => validateManifestMaterials(manifest, workspace), /windows-offline-firewall SHA-256 mismatch/i);
+});
+
+test('Semgrep records two matching source builds but remains disabled pending native release qualification', async () => {
   const lockBytes = await readFile(new URL('../third_party/sidecars/semgrep/source-lock.v1.json', import.meta.url));
   const lock = JSON.parse(lockBytes);
   const bundleEvidence = JSON.parse(
@@ -1100,25 +1207,24 @@ test('Semgrep records the V1 source bundle but remains disabled pending release 
   assert.equal(lock.opam.resolvedSourceArchives.reduce((count, entry) => count + entry.extraSources.length, 0), 10);
   assert.equal(lock.missingMaterial.includes('byte-identical complete corresponding-source bundle built twice'), false);
   assert.equal(lock.missingMaterial.some((entry) => /source-archive inventory|resolved opam source/i.test(entry)), false);
-  assert.equal(bundleEvidence.byteIdentical, false);
-  assert.equal(bundleEvidence.independentBuilds, 1);
-  assert.equal(bundleEvidence.status, 'source_bundle_v1_native_builds_pending');
+  assert.equal(bundleEvidence.byteIdentical, true);
+  assert.equal(bundleEvidence.independentBuilds, 2);
+  assert.equal(bundleEvidence.status, 'source_bundle_reproducible_native_builds_pending');
   assert.equal(
     bundleEvidence.sourceAssetUrl,
     'https://github.com/Skytuhua/Context-Relay/releases/download/sidecars-semgrep-1.170.0-source.1/semgrep-1.170.0-corresponding-source.tar',
   );
   assert.equal('sourceAssetUrl' in lock, false);
   assert.equal('sourceBundleSha256' in lock, false);
-  assert.equal(bundleEvidence.bundle.sha256, 'a7367b50b602540384f2879bf31b55c15fc95c5b0ec739517795c46004bac626');
-  assert.equal(bundleEvidence.bundle.size, 1149642752);
-  assert.equal(bundleEvidence.bundle.payloadEntries, 39542);
+  assert.equal(bundleEvidence.bundle.sha256, 'e098187c665f00d5864d3b734e17f7d19f4c4077567bf49813e1691615f0f549');
+  assert.equal(bundleEvidence.bundle.size, 1149654016);
+  assert.equal(bundleEvidence.bundle.payloadEntries, 39543);
   assert.equal(bundleEvidence.bundle.recordedLinks, 222);
   assert.equal(bundleEvidence.sourceLockSha256, '0d85427b09343615126fde5ad9bd8ad7f157908692a69fea846b4d033f6cb3c0');
-  assert.equal(bundleEvidence.bundleGeneratorSha256, '092fe2855df51267ca3c8525c0b404c3ca0587470cedfc63bf1818df60e72007');
-  assert.equal(
-    sha256(await readFile(new URL('./semgrep-source-bundle.mjs', import.meta.url))),
-    '092fe2855df51267ca3c8525c0b404c3ca0587470cedfc63bf1818df60e72007',
-  );
+  assert.equal(bundleEvidence.bundleGeneratorSha256, '199b18ff2bac412ded23b036cdef86ba1ea0402f55152b2743250be39d8ab9af');
+  assert.equal(bundleEvidence.bundleGeneratorSha256, sha256(await readFile(
+    new URL('./semgrep-source-bundle.mjs', import.meta.url),
+  )));
   assert.equal(lock.researchEvidence.usableForHydration, false);
   assert.equal(lock.researchEvidence.usableForPackaging, false);
   assert.deepEqual(

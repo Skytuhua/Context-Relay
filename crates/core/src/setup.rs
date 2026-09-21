@@ -39,6 +39,9 @@ use crate::{
 
 pub const PREVIEW_TTL_MS: u64 = 15 * 60 * 1_000;
 
+mod history;
+pub use history::{harness_setup, harness_setups};
+
 /// A registered project is imported for conflict detection and binds the
 /// managed primary-memory instruction. The bridge itself remains global.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -54,6 +57,7 @@ pub struct BridgeMutationPlan {
 
 pub struct PrimaryMemoryMutationPlan {
     pub native: Vec<ApprovedMutation>,
+    pub expected_native_digests: Vec<ExpectedNativeDigest>,
     pub registrations: Vec<NativeMemoryRegistration>,
     pub semantic_changes: Vec<ClassifiedChange>,
 }
@@ -62,6 +66,7 @@ impl PrimaryMemoryMutationPlan {
     fn empty() -> Self {
         Self {
             native: vec![],
+            expected_native_digests: vec![],
             registrations: vec![],
             semantic_changes: vec![],
         }
@@ -103,6 +108,18 @@ impl BridgeExecutionError {
 /// engine. The service supplies the opened persisted plan and its exact sealed
 /// bytes; callers cannot replace any approved field.
 pub trait BridgePlanExecutor {
+    /// Re-discovers and checks an import-only registration without running a
+    /// native transaction, bridge, generator, or configuration-writing CLI.
+    fn verify_watch_only_registration(
+        &mut self,
+        _plan: &NativeTransactionPlan,
+        _now_ms: u64,
+    ) -> Result<(), BridgeExecutionError> {
+        Err(BridgeExecutionError::restored(
+            "Read-only memory registration needs live verification; request a new preview",
+        ))
+    }
+
     fn execute(
         &mut self,
         vault: &mut Vault,
@@ -298,6 +315,14 @@ pub struct PersistedBridgeInstallService<'a> {
 pub trait BridgePreviewHarness: HarnessAdapter {
     fn bridge_harness(&self) -> HarnessId;
 
+    /// Identity selected by the adapter, never a path supplied by the IPC caller.
+    /// A bound runtime must survive unchanged through preview and sealed approval.
+    fn bridge_installed_runtime(
+        &self,
+    ) -> Option<crate::native_transaction::InstalledRuntimeBinding> {
+        None
+    }
+
     /// Declares whether preview must attest the bridge before invoking any
     /// adapter probe. Import-only adapters override this so registration-only
     /// setup never resolves a bridge executable.
@@ -344,12 +369,26 @@ pub trait BridgePreviewHarness: HarnessAdapter {
         Ok(None)
     }
 
+    /// File dependencies of memory location selection. Operational locks used
+    /// for configuration writes are deliberately outside this read-only path.
+    fn watch_only_memory_digests(&self) -> Result<Vec<ExpectedNativeDigest>, ClientError> {
+        Ok(vec![])
+    }
+
     fn bridge_adapter_version(&self) -> u32 {
         1
     }
 }
 
 impl BridgePreviewHarness for ClaudeCodeAdapter {
+    fn watch_only_memory_digests(&self) -> Result<Vec<ExpectedNativeDigest>, ClientError> {
+        self.memory_settings_digests()
+    }
+
+    fn bridge_operational_digests(&self) -> Result<Vec<ExpectedNativeDigest>, ClientError> {
+        self.memory_settings_digests()
+    }
+
     fn bridge_harness(&self) -> HarnessId {
         HarnessId::ClaudeCode
     }
@@ -416,11 +455,15 @@ impl BridgePreviewHarness for ClaudeCodeAdapter {
     fn watch_only_memory_registrations(
         &self,
     ) -> Result<Option<Vec<NativeMemoryRegistration>>, ClientError> {
+        self.revalidate_memory_binding()?;
         watch_only_registrations(self.native_memory_capabilities()?)
     }
 }
 
 impl BridgePreviewHarness for CodexAdapter {
+    fn bridge_adapter_version(&self) -> u32 {
+        2
+    }
     fn bridge_harness(&self) -> HarnessId {
         HarnessId::Codex
     }
@@ -440,10 +483,10 @@ impl BridgePreviewHarness for CodexAdapter {
     fn bridge_mutations(
         &self,
         _: &DesiredState,
-        intended: &ComponentRecord,
+        _: &ComponentRecord,
     ) -> Result<BridgeMutationPlan, ClientError> {
         Ok(BridgeMutationPlan {
-            cli: Some(self.plan_bridge_cli_mutation(intended)?),
+            cli: None,
             native: vec![],
         })
     }
@@ -453,7 +496,13 @@ impl BridgePreviewHarness for CodexAdapter {
         desired: &DesiredState,
     ) -> Result<PrimaryMemoryMutationPlan, ClientError> {
         let capabilities = full_setup_memory_capabilities(self.native_memory_capabilities()?)?;
+        if !matches!(capabilities.disable, NativeMemoryDisable::Supported(_)) {
+            return Err(unsupported(
+                "Codex memory settings cannot be safely changed; check its global and project configuration before connecting",
+            ));
+        }
         let mut plan = primary_memory_registration_plan(&capabilities.sources);
+        plan.expected_native_digests = self.native_bridge_dependencies()?;
         if let Some(instruction) = desired
             .components
             .iter()
@@ -477,8 +526,38 @@ impl BridgePreviewHarness for CodexAdapter {
             );
         }
         if let NativeMemoryDisable::Supported(mutations) = capabilities.disable {
-            for mutation in mutations {
-                push_memory_mutation(&mut plan, mutation, "native-memory-disable");
+            if let Some(bridge) = desired
+                .components
+                .iter()
+                .find(|component| component.kind == ComponentKind::McpServer)
+            {
+                let combined = self.plan_native_bridge_with_memory_disable(bridge, &mutations)?;
+                let global = combined.target.clone();
+                if combined.expected == combined.intended {
+                    let NativeState::RegularFile { bytes, .. } =
+                        NativeState::decode_v1(&combined.content)
+                            .map_err(|_| invalid("Codex config snapshot is invalid"))?
+                    else {
+                        return Err(invalid("Codex config snapshot is invalid"));
+                    };
+                    plan.expected_native_digests
+                        .retain(|dependency| dependency.target != global);
+                    plan.expected_native_digests.push(ExpectedNativeDigest {
+                        target: global.clone(),
+                        expected_digest: Some(digest(&bytes)),
+                    });
+                }
+                push_memory_mutation(&mut plan, combined, "primary-memory-bridge-and-disable");
+                for mutation in mutations
+                    .into_iter()
+                    .filter(|mutation| mutation.target != global)
+                {
+                    push_memory_mutation(&mut plan, mutation, "native-memory-disable");
+                }
+            } else {
+                for mutation in mutations {
+                    push_memory_mutation(&mut plan, mutation, "native-memory-disable");
+                }
             }
         }
         Ok(plan)
@@ -487,6 +566,7 @@ impl BridgePreviewHarness for CodexAdapter {
     fn watch_only_memory_registrations(
         &self,
     ) -> Result<Option<Vec<NativeMemoryRegistration>>, ClientError> {
+        self.recheck_executable_client()?;
         watch_only_registrations(self.native_memory_capabilities()?)
     }
 }
@@ -494,6 +574,12 @@ impl BridgePreviewHarness for CodexAdapter {
 impl BridgePreviewHarness for HermesAdapter {
     fn bridge_harness(&self) -> HarnessId {
         HarnessId::Hermes
+    }
+
+    fn bridge_installed_runtime(
+        &self,
+    ) -> Option<crate::native_transaction::InstalledRuntimeBinding> {
+        crate::native_transaction::engine::NativeAdapter::installed_runtime(self).cloned()
     }
 
     fn bridge_setup_capability(&self) -> CapabilityLevel {
@@ -562,6 +648,7 @@ impl BridgePreviewHarness for HermesAdapter {
     fn watch_only_memory_registrations(
         &self,
     ) -> Result<Option<Vec<NativeMemoryRegistration>>, ClientError> {
+        self.revalidate_bound_installation()?;
         watch_only_registrations(self.native_memory_capabilities()?)
     }
 }
@@ -627,12 +714,26 @@ fn push_memory_mutation(
     if mutation.expected == mutation.intended {
         return;
     }
-    plan.native.push(mutation);
+    let path = mutation
+        .target
+        .display
+        .clone()
+        .unwrap_or_else(|| digest_text(digest(&mutation.target.bytes)));
+    let summary = match target {
+        "primary-memory-instruction" => "Add instructions for using saved context",
+        "primary-memory-hooks" => "Add session hooks for saved context",
+        "primary-memory-bridge-and-disable" => {
+            "Connect the harness and turn off its built-in memory"
+        }
+        "native-memory-disable" => "Turn off the harness's built-in memory",
+        _ => target,
+    };
     plan.semantic_changes.push(ClassifiedChange {
         class: ChangeClass::Update,
-        target: target.to_owned(),
-        summary: target.to_owned(),
+        target: path,
+        summary: summary.to_owned(),
     });
+    plan.native.push(mutation);
 }
 
 pub struct BridgeInstallService<'a, H, L> {
@@ -681,6 +782,7 @@ impl<'a> HermesMemoryExportService<'a> {
         let runtime_target = self.runtime_target.ok_or_else(|| {
             unsupported("Hermes managed memory export is unavailable on this host")
         })?;
+        let installed_runtime = adapter.bridge_installed_runtime();
         let report = adapter.probe(&ProbeContext {
             harness: HarnessId::Hermes,
             requested_profile: Some(adapter.profile_name().to_owned()),
@@ -837,12 +939,18 @@ impl<'a> HermesMemoryExportService<'a> {
             scanner_result_hash: digest(b"hermes-memory-export-scanner-v1"),
             mutations: mutation.into_iter().collect(),
             cli_mutations: vec![],
+            installed_runtime: installed_runtime.clone(),
             native_memory_registrations: vec![NativeMemoryRegistration {
                 source,
                 last_applied_digest: Some(intended_digest),
             }],
             ownership_changes: vec![],
         };
+        if adapter.bridge_installed_runtime() != installed_runtime {
+            return Err(conflict(
+                "Hermes runtime changed during memory export preview",
+            ));
+        }
         let approval_hash =
             approval_hash_v2(&plan).map_err(|_| invalid("Hermes export plan is invalid"))?;
         setup.batch_hash = approval_hash;
@@ -958,8 +1066,9 @@ impl PersistedBridgeInstallService<'_> {
     }
 
     /// Reconciles setup lifecycles after native startup recovery has made each
-    /// begun transaction terminal. A missing native row is reported without
-    /// executing; a subsequent explicit apply/rollback may safely resume it.
+    /// begun transaction terminal. A claim without a native row remains
+    /// unresolved without preventing startup or executing anything; a subsequent
+    /// explicit apply/rollback may safely resume it.
     pub fn reconcile_after_native_recovery(&mut self) -> Result<(), ClientError> {
         let incomplete = self
             .vault
@@ -994,23 +1103,17 @@ impl PersistedBridgeInstallService<'_> {
             match stored.lifecycle {
                 SetupPlanLifecycle::Applying => {
                     if is_watch_only_registration_plan(&opened.plan) {
+                        // Publication and Applied are atomic. An Applying row
+                        // therefore has no committed registration to recover.
+                        // Do not publish stale sources without a live verifier.
                         self.vault
-                            .bind_setup_plan_native_memory(
-                                &stored.plan_id,
-                                &opened.plan.native_memory_registrations,
-                            )
-                            .map_err(|_| conflict("Persisted bridge memory binding changed"))?;
-                        self.finish_applied_with_native_memory(
-                            &stored.plan_id,
-                            &opened.plan.native_memory_registrations,
-                        )?;
+                            .finish_setup_plan(&stored.plan_id, SetupPlanLifecycle::ApplyRestored)
+                            .map_err(|_| {
+                                conflict("Interrupted memory registration cannot be finalized")
+                            })?;
                         continue;
                     }
-                    if self.reconcile_apply_terminal(&stored)?.is_none() {
-                        return Err(conflict(
-                            "Bridge apply has not begun its native transaction",
-                        ));
-                    }
+                    self.reconcile_apply_terminal(&stored)?;
                 }
                 SetupPlanLifecycle::RollingBack => {
                     let (inverse, inverse_opened) = self.validated_inverse_plan(&opened)?;
@@ -1029,14 +1132,7 @@ impl PersistedBridgeInstallService<'_> {
                             })?;
                         continue;
                     }
-                    if self
-                        .reconcile_rollback_terminal(&stored, &inverse)?
-                        .is_none()
-                    {
-                        return Err(conflict(
-                            "Bridge rollback has not begun its native transaction",
-                        ));
-                    }
+                    self.reconcile_rollback_terminal(&stored, &inverse)?;
                 }
                 _ => return Err(invalid("Incomplete bridge plan lifecycle is invalid")),
             }
@@ -1097,10 +1193,9 @@ impl PersistedBridgeInstallService<'_> {
             self.vault
                 .bind_setup_plan_native_memory(plan_id, registrations)
                 .map_err(|_| conflict("Persisted bridge memory binding changed"))?;
-            if is_watch_only_registration_plan(&opened.plan) {
-                return self.finish_applied_with_native_memory(plan_id, registrations);
-            }
-            if let Some(lifecycle) = self.reconcile_apply_terminal(&stored)? {
+            if !is_watch_only_registration_plan(&opened.plan)
+                && let Some(lifecycle) = self.reconcile_apply_terminal(&stored)?
+            {
                 return apply_terminal_result(lifecycle);
             }
             if now_ms >= stored.expires_ms {
@@ -1151,10 +1246,12 @@ impl PersistedBridgeInstallService<'_> {
         self.vault
             .bind_setup_plan_native_memory(&plan.setup.plan_id, registrations)
             .map_err(|_| conflict("Persisted bridge memory binding cannot be recorded"))?;
-        if is_watch_only_registration_plan(plan) {
-            return self.finish_applied_with_native_memory(&plan.setup.plan_id, registrations);
-        }
-        match executor.execute(self.vault, plan, &stored.payload, stored.created_ms, now_ms) {
+        let result = if is_watch_only_registration_plan(plan) {
+            executor.verify_watch_only_registration(plan, now_ms)
+        } else {
+            executor.execute(self.vault, plan, &stored.payload, stored.created_ms, now_ms)
+        };
+        match result {
             Ok(()) => self.finish_applied_with_native_memory(&plan.setup.plan_id, registrations),
             Err(error) => {
                 let lifecycle = match error {
@@ -1487,6 +1584,71 @@ fn is_watch_only_registration_plan(plan: &NativeTransactionPlan) -> bool {
         })
 }
 
+/// Checks a registration against a freshly discovered harness. Implementations
+/// of `watch_only_memory_registrations` also re-attest their bound installation,
+/// so an adapter cached during preview cannot certify a replaced executable.
+pub fn verify_watch_only_registration(
+    harness: &impl BridgePreviewHarness,
+    plan: &NativeTransactionPlan,
+    now_ms: u64,
+) -> Result<(), ClientError> {
+    if plan.installed_runtime.is_some() {
+        return Err(conflict(
+            "Read-only registration cannot consume a retained runtime",
+        ));
+    }
+    if !is_watch_only_registration_plan(plan)
+        || plan
+            .setup
+            .semantic_changes
+            .iter()
+            .any(|change| change.class != ChangeClass::Create)
+        || now_ms >= plan.setup.expires_at
+        || plan.setup.harness != harness.bridge_harness()
+        || plan.setup.adapter_version != harness.bridge_adapter_version()
+        || plan.setup.harness_profile != harness.bridge_requested_profile()
+        || plan.setup.target_scopes.iter().any(|scope| match scope {
+            NativeScope::Global => false,
+            NativeScope::Project { project_id, root } => {
+                Some(*project_id) != harness.bridge_project_id()
+                    || Some(root) != harness.bridge_project_root().as_ref()
+            }
+        })
+    {
+        return Err(conflict(
+            "Read-only memory registration changed or expired; request a new preview",
+        ));
+    }
+    let report = harness.probe(&ProbeContext {
+        harness: plan.setup.harness,
+        requested_profile: plan.setup.harness_profile.clone(),
+    })?;
+    if report.capability != CapabilityLevel::ImportOnly
+        || report.executable.as_ref() != Some(&plan.setup.executable_path)
+        || report.executable_sha256 != Some(plan.setup.executable_hash)
+        || report.harness_version.as_ref() != Some(&plan.setup.harness_version)
+        || report.active_profile != plan.setup.harness_profile
+    {
+        return Err(conflict(
+            "The harness installation changed; request a new preview",
+        ));
+    }
+    let mut dependencies = vec![ExpectedNativeDigest {
+        target: plan.setup.executable_path.clone(),
+        expected_digest: Some(plan.setup.executable_hash),
+    }];
+    dependencies.extend(harness.watch_only_memory_digests()?);
+    if dependencies != plan.setup.expected_native_digests
+        || harness.watch_only_memory_registrations()?.as_ref()
+            != Some(&plan.native_memory_registrations)
+    {
+        return Err(conflict(
+            "The harness memory sources or settings changed; request a new preview",
+        ));
+    }
+    Ok(())
+}
+
 fn apply_terminal_result(lifecycle: SetupPlanLifecycle) -> Result<(), ClientError> {
     match lifecycle {
         SetupPlanLifecycle::Applied => Ok(()),
@@ -1496,6 +1658,26 @@ fn apply_terminal_result(lifecycle: SetupPlanLifecycle) -> Result<(), ClientErro
         SetupPlanLifecycle::Conflict => Err(conflict("Bridge apply ended in conflict")),
         _ => Err(invalid("Bridge apply terminal lifecycle is invalid")),
     }
+}
+
+/// A saved version remains valid only for the exact executable path and bytes
+/// approved in preview. Registration rediscovery must not launch a subprocess.
+pub(crate) fn approved_registration_version(
+    approved: &SetupPlan,
+    harness: HarnessId,
+    executable: &WireNativeValue,
+    executable_hash: Sha256Digest,
+) -> Result<String, ClientError> {
+    if approved.rulesync_version != "native-memory-watch-only-v1"
+        || approved.harness != harness
+        || approved.executable_path != *executable
+        || approved.executable_hash != executable_hash
+    {
+        return Err(conflict(
+            "The approved harness installation changed; request a new preview",
+        ));
+    }
+    Ok(approved.harness_version.clone())
 }
 
 fn rollback_terminal_result(lifecycle: SetupPlanLifecycle) -> Result<(), ClientError> {
@@ -1668,11 +1850,28 @@ where
         registered_project: Option<&RegisteredProject>,
         now_ms: u64,
     ) -> Result<SetupPlan, ClientError> {
+        self.preview_before_persist(registered_project, now_ms, || {})
+    }
+
+    /// Transfer an owned runtime only after the complete plan has been sealed,
+    /// but before the vault may commit a reference to it.
+    pub(crate) fn preview_before_persist(
+        &mut self,
+        registered_project: Option<&RegisteredProject>,
+        now_ms: u64,
+        before_persist: impl FnOnce(),
+    ) -> Result<SetupPlan, ClientError> {
         let runtime_target = self
             .runtime_target
             .ok_or_else(|| unsupported("Harness setup is unavailable on this host"))?;
         let harness = self.harness.bridge_harness();
         let setup_capability = self.harness.bridge_setup_capability();
+        let installed_runtime = self.harness.bridge_installed_runtime();
+        if installed_runtime.is_some() && setup_capability != CapabilityLevel::Full {
+            return Err(unsupported(
+                "The prepared runtime is not qualified for setup yet",
+            ));
+        }
         let located_bridge = if setup_capability == CapabilityLevel::Full {
             let located = self.bridge_locator.locate()?;
             let attested = attest_bridge_executable(&located.path)?;
@@ -1785,13 +1984,14 @@ where
             components: desired_components,
             scopes: desired_scopes,
         };
-        // CLI harnesses capture their authoritative prior declaration here.
-        // Hermes instead classifies its imported native projection first.
+        // Claude captures its live CLI declaration. Native configuration
+        // writers classify their imported projection and seal complete files.
         let captured_mutations = match harness {
-            HarnessId::ClaudeCode | HarnessId::Codex => {
+            HarnessId::ClaudeCode => Some(self.harness.bridge_mutations(&desired, &intended)?),
+            HarnessId::Codex if self.harness.bridge_adapter_version() < 2 => {
                 Some(self.harness.bridge_mutations(&desired, &intended)?)
             }
-            HarnessId::Hermes => None,
+            HarnessId::Codex | HarnessId::Hermes => None,
         };
         let change = bridge_change(
             harness,
@@ -1807,11 +2007,30 @@ where
             conflicts: vec![],
         };
 
-        // These calls are intentionally kept in preview even though the exact
-        // CLI mutation below is the authority for rollback argv.
-        let _rendered = self.harness.render(&desired)?;
+        // The generic Codex adapter retains CLI operations for arbitrary MCP
+        // edits. This fixed setup declaration is rendered by its native plan.
+        let native_codex =
+            harness == HarnessId::Codex && self.harness.bridge_adapter_version() == 2;
+        let render_desired = if native_codex {
+            DesiredState {
+                components: desired
+                    .components
+                    .iter()
+                    .filter(|component| component.kind != ComponentKind::McpServer)
+                    .cloned()
+                    .collect(),
+                scopes: desired.scopes.clone(),
+            }
+        } else {
+            desired.clone()
+        };
+        let _rendered = self.harness.render(&render_desired)?;
         let mut classified = self.harness.classify(&semantic_diff)?;
-        let adapter_operations = self.harness.plan_cli_ops(&classified)?.0;
+        let adapter_operations = if native_codex {
+            vec![]
+        } else {
+            self.harness.plan_cli_ops(&classified)?.0
+        };
         let mut mutations = if classified.0.is_empty() {
             BridgeMutationPlan {
                 cli: None,
@@ -1852,6 +2071,17 @@ where
             expected_digest: Some(bridge.digest),
         }];
         expected_native_digests.extend(self.harness.bridge_operational_digests()?);
+        expected_native_digests.extend(memory.expected_native_digests);
+        if harness == HarnessId::Codex {
+            // Native mutations already bind both whole-file states. Read-only
+            // dependencies retain their original hashes across apply and Undo.
+            expected_native_digests.retain(|dependency| {
+                !mutations
+                    .native
+                    .iter()
+                    .any(|mutation| mutation.target == dependency.target)
+            });
+        }
         let mut setup = SetupPlan {
             plan_id,
             harness,
@@ -1914,9 +2144,13 @@ where
             scanner_result_hash: digest(b"bridge-preview-scanner-v1"),
             mutations: mutations.native,
             cli_mutations: cli_mutation.into_iter().collect(),
+            installed_runtime: installed_runtime.clone(),
             native_memory_registrations: memory.registrations,
             ownership_changes: vec![],
         };
+        if self.harness.bridge_installed_runtime() != installed_runtime {
+            return Err(conflict("Harness runtime changed during setup preview"));
+        }
         let approval_hash =
             approval_hash_v2(&plan).map_err(|_| invalid("Bridge preview plan is invalid"))?;
         setup.batch_hash = approval_hash;
@@ -1936,6 +2170,7 @@ where
             )
         };
         let sealed = sealed.map_err(|_| invalid("Bridge preview plan cannot be sealed"))?;
+        before_persist();
         self.vault
             .put_setup_plan(SetupPlanWrite {
                 plan_id: &setup.plan_id,
@@ -2036,6 +2271,11 @@ where
                     .map_err(|_| invalid("Watch-only setup sidecar is invalid"))?,
             },
         }];
+        let mut expected_native_digests = vec![ExpectedNativeDigest {
+            target: executable_path.clone(),
+            expected_digest: Some(executable_hash),
+        }];
+        expected_native_digests.extend(self.harness.watch_only_memory_digests()?);
         let mut setup = SetupPlan {
             plan_id,
             harness,
@@ -2045,10 +2285,7 @@ where
             executable_hash,
             harness_version,
             target_scopes,
-            expected_native_digests: vec![ExpectedNativeDigest {
-                target: executable_path,
-                expected_digest: Some(executable_hash),
-            }],
+            expected_native_digests,
             semantic_changes,
             cli_operations: vec![],
             package_artifacts: vec![],
@@ -2081,9 +2318,17 @@ where
             scanner_result_hash: digest(b"native-memory-watch-only-scanner-v1"),
             mutations: vec![],
             cli_mutations: vec![],
+            installed_runtime: None,
             native_memory_registrations: registrations,
             ownership_changes: vec![],
         };
+        // Watch-only plans cannot authorize runtime execution. Check after all
+        // adapter callbacks so a newly selected runtime is never silently lost.
+        if self.harness.bridge_installed_runtime().is_some() {
+            return Err(conflict(
+                "Harness runtime changed during watch-only setup preview",
+            ));
+        }
         let approval_hash =
             approval_hash_v2(&plan).map_err(|_| invalid("Watch-only setup plan is invalid"))?;
         setup.batch_hash = approval_hash;
@@ -2113,7 +2358,21 @@ fn bridge_change(
     cli_mutation: Option<&ApprovedCliMutation>,
 ) -> Result<Option<ClassifiedChange>, ClientError> {
     let class = match harness {
-        HarnessId::ClaudeCode | HarnessId::Codex => bridge_cli_change(cli_mutation, intended)?,
+        HarnessId::ClaudeCode => bridge_cli_change(cli_mutation, intended)?,
+        HarnessId::Codex if cli_mutation.is_some() => bridge_cli_change(cli_mutation, intended)?,
+        HarnessId::Codex => match imported.iter().find(|component| {
+            component.kind == ComponentKind::McpServer
+                && component.scope == ScopeRef::Global
+                && component.name == BRIDGE_SERVER_NAME
+        }) {
+            None => Some(ChangeClass::Create),
+            Some(component)
+                if !component.archived && codex_native_bridge_matches(component, intended) =>
+            {
+                None
+            }
+            Some(_) => Some(ChangeClass::Update),
+        },
         HarnessId::Hermes => bridge_hermes_change(profile, imported, intended)?,
     };
     let target = match harness {
@@ -2142,6 +2401,20 @@ fn bridge_cli_change(
         Some(previous) if previous.canonical_body == intended.body_markdown => None,
         Some(_) => Some(ChangeClass::Update),
     })
+}
+
+fn codex_native_bridge_matches(imported: &ComponentRecord, intended: &ComponentRecord) -> bool {
+    let Ok(mut body) = serde_json::from_str::<serde_json::Value>(&imported.body_markdown) else {
+        return false;
+    };
+    let Some(object) = body.as_object_mut() else {
+        return false;
+    };
+    object
+        .entry("type")
+        .or_insert(serde_json::Value::String("stdio".to_owned()));
+    serde_json::from_str::<serde_json::Value>(&intended.body_markdown)
+        .is_ok_and(|expected| body == expected)
 }
 
 fn bridge_hermes_change(

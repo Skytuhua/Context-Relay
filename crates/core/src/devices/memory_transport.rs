@@ -54,6 +54,30 @@ struct ProviderState {
     entropy: ProviderEntropy,
     invites: BTreeMap<PairingId, InviteRecord>,
     sessions: BTreeMap<String, JoinSession>,
+    memberships: BTreeMap<String, MemoryMembership>,
+}
+
+struct MemoryMembership {
+    enrollment: Vec<u8>,
+    pin: Sha256Digest,
+    endpoint: super::membership_crypto::MembershipEndpoint,
+    events: Vec<super::membership_transport::MembershipEventObject>,
+}
+impl MemoryMembership {
+    fn verify(
+        &self,
+        scope: SyncScope,
+    ) -> Result<super::membership_crypto::VerifiedMembershipHistory, PairingTransportError> {
+        super::membership_crypto::verify_membership_history(
+            &self.enrollment,
+            self.pin,
+            scope,
+            &self.events.iter().map(|e| e.evidence()).collect::<Vec<_>>(),
+            self.endpoint,
+            crate::vault::pairing_v2::BUDGET,
+        )
+        .map_err(|_| PairingTransportError::Conflict)
+    }
 }
 
 enum ProviderEntropy {
@@ -84,6 +108,7 @@ enum TerminalState {
     Approved {
         canonical_approved_payload: Vec<u8>,
         receipt: PairingDecisionReceipt,
+        membership_signature: Option<context_relay_protocol::Ed25519SignatureBytes>,
     },
     Rejected(PairingDecisionReceipt),
     Canceled,
@@ -126,9 +151,73 @@ impl InMemoryPairingProvider {
                     entropy,
                     invites: BTreeMap::new(),
                     sessions: BTreeMap::new(),
+                    memberships: BTreeMap::new(),
                 }),
             }),
         }
+    }
+
+    /// Test provider equivalent of a successfully committed hosted enrollment.
+    #[cfg(feature = "test-support")]
+    pub fn register_committed_enrollment(
+        &self,
+        scope: SyncScope,
+        canonical: &[u8],
+    ) -> Result<(), PairingTransportError> {
+        let pin = Sha256Digest(Sha256::digest(canonical).into());
+        let endpoint = super::membership_transport::enrollment_endpoint(canonical, pin, scope)
+            .map_err(|_| PairingTransportError::Conflict)?;
+        let mut state = lock(&self.shared)?;
+        let key = scope.workspace_id.to_string();
+        if let Some(existing) = state.memberships.get(&key) {
+            return if existing.enrollment == canonical {
+                Ok(())
+            } else {
+                Err(PairingTransportError::Conflict)
+            };
+        }
+        state.memberships.insert(
+            key,
+            MemoryMembership {
+                enrollment: canonical.to_vec(),
+                pin,
+                endpoint,
+                events: Vec::new(),
+            },
+        );
+        Ok(())
+    }
+
+    /// Restore a test backend from exact committed public objects, never a certificate roster.
+    #[cfg(feature = "test-support")]
+    pub fn restore_committed_membership_for_test(
+        &self,
+        scope: SyncScope,
+        canonical: &[u8],
+        events: &[super::membership_transport::MembershipEventObject],
+        endpoint: super::membership_crypto::MembershipEndpoint,
+    ) -> Result<(), PairingTransportError> {
+        let candidate = MemoryMembership {
+            enrollment: canonical.to_vec(),
+            pin: Sha256Digest(Sha256::digest(canonical).into()),
+            endpoint,
+            events: events.to_vec(),
+        };
+        candidate.verify(scope)?;
+        let mut state = lock(&self.shared)?;
+        let key = scope.workspace_id.to_string();
+        if let Some(existing) = state.memberships.get(&key) {
+            return if existing.enrollment == candidate.enrollment
+                && existing.endpoint == candidate.endpoint
+                && existing.events == candidate.events
+            {
+                Ok(())
+            } else {
+                Err(PairingTransportError::Conflict)
+            };
+        }
+        state.memberships.insert(key, candidate);
+        Ok(())
     }
 
     pub fn existing_device_client(
@@ -181,6 +270,7 @@ impl InMemoryPairingProvider {
             if let TerminalState::Approved {
                 canonical_approved_payload,
                 receipt,
+                ..
             } = &invite.terminal
             {
                 capture.extend_from_slice(canonical_approved_payload);
@@ -215,6 +305,33 @@ impl PairingTransport for InMemoryPairingProvider {
 }
 
 impl PairingJoinTransport for InMemoryPairingJoinClient {
+    fn enrollment(
+        &self,
+        id: PairingId,
+        digest: Sha256Digest,
+        pin: Sha256Digest,
+        _now: u64,
+    ) -> Result<Option<Vec<u8>>, PairingTransportError> {
+        let state = lock(&self.shared)?;
+        let membership = joining_membership(&state, id, digest, &self.session_id)?;
+        Ok((membership.pin == pin).then(|| membership.enrollment.clone()))
+    }
+    fn membership_event(
+        &self,
+        id: PairingId,
+        digest: Sha256Digest,
+        address: Sha256Digest,
+        _now: u64,
+    ) -> Result<Option<super::membership_transport::MembershipEventObject>, PairingTransportError>
+    {
+        let state = lock(&self.shared)?;
+        let membership = joining_membership(&state, id, digest, &self.session_id)?;
+        Ok(membership
+            .events
+            .iter()
+            .find(|event| event.endpoints().is_ok_and(|(_, hash)| hash == address))
+            .cloned())
+    }
     fn resolve_code(
         &self,
         code: &PairingCode,
@@ -344,10 +461,17 @@ impl PairingJoinTransport for InMemoryPairingJoinClient {
             TerminalState::Approved {
                 canonical_approved_payload,
                 receipt,
-            } => Ok(PairingResult::Approved(PairingApprovedResult::new(
-                canonical_approved_payload.clone(),
-                receipt.clone(),
-            ))),
+                membership_signature,
+            } => Ok(PairingResult::Approved(match membership_signature {
+                Some(signature) => PairingApprovedResult::new_v2(
+                    canonical_approved_payload.clone(),
+                    receipt.clone(),
+                    *signature,
+                ),
+                None => {
+                    PairingApprovedResult::new(canonical_approved_payload.clone(), receipt.clone())
+                }
+            })),
             TerminalState::Rejected(receipt) => Ok(PairingResult::Rejected {
                 receipt: receipt.clone(),
             }),
@@ -361,6 +485,25 @@ impl PairingJoinTransport for InMemoryPairingJoinClient {
 }
 
 impl PairingApprovalTransport for InMemoryPairingApprovalClient {
+    fn membership_endpoint(
+        &self,
+        _now: u64,
+    ) -> Result<super::membership_crypto::MembershipEndpoint, PairingTransportError> {
+        let state = lock(&self.shared)?;
+        let membership = state
+            .memberships
+            .get(&self.scope.workspace_id.to_string())
+            .ok_or(PairingTransportError::Unauthorized)?;
+        if !membership
+            .verify(self.scope)?
+            .state()
+            .active_devices
+            .contains_key(&self.device_id)
+        {
+            return Err(PairingTransportError::Unauthorized);
+        }
+        Ok(membership.endpoint)
+    }
     fn create_invite(&self, now_ms: u64) -> Result<PairingInvite, PairingTransportError> {
         let expires_at_ms = now_ms
             .checked_add(INVITE_LIFETIME_MS)
@@ -464,8 +607,12 @@ impl PairingApprovalTransport for InMemoryPairingApprovalClient {
     ) -> Result<PairingDecisionReceipt, PairingTransportError> {
         let mut state = lock(&self.shared)?;
         prune_reported_expired(&mut state);
-        let invite = state
-            .invites
+        let ProviderState {
+            invites,
+            memberships,
+            ..
+        } = &mut *state;
+        let invite = invites
             .get_mut(&envelope.pairing_id)
             .ok_or(PairingTransportError::Invalid)?;
         require_approver(invite, self.scope, self.device_id)?;
@@ -495,11 +642,16 @@ impl PairingApprovalTransport for InMemoryPairingApprovalClient {
             TerminalState::Approved {
                 canonical_approved_payload,
                 receipt,
+                membership_signature,
             } => {
                 return match envelope.decision() {
                     PairingDecision::Approve {
                         canonical_approved_payload: retry,
-                    } if retry == canonical_approved_payload => Ok(receipt.clone()),
+                    } if retry == canonical_approved_payload
+                        && envelope.membership_signature() == *membership_signature =>
+                    {
+                        Ok(receipt.clone())
+                    }
                     _ => Err(PairingTransportError::Conflict),
                 };
             }
@@ -520,18 +672,72 @@ impl PairingApprovalTransport for InMemoryPairingApprovalClient {
             PairingDecision::Approve {
                 canonical_approved_payload,
             } => {
-                let approved_payload = validate_approved_payload(
-                    canonical_approved_payload,
-                    envelope.pairing_id,
-                    request,
-                    invite.scope,
-                    invite.creating_device_id,
-                )?;
+                let next_membership = if let Some(signature) = envelope.membership_signature() {
+                    let membership = memberships
+                        .get(&self.scope.workspace_id.to_string())
+                        .ok_or(PairingTransportError::Unauthorized)?;
+                    let history = membership.verify(self.scope)?;
+                    let parent = history
+                        .pairing_parent(self.device_id)
+                        .map_err(|_| PairingTransportError::Unauthorized)?;
+                    let signed = verify_pairing_request(
+                        &decode_pairing_request_v1(&request.canonical_bytes)
+                            .map_err(|_| PairingTransportError::Conflict)?,
+                    )
+                    .map_err(|_| PairingTransportError::Conflict)?;
+                    let statement=super::membership_crypto::DeviceMembershipAddStatementV1::from_approved_payload_v2(canonical_approved_payload).map_err(|_|PairingTransportError::Conflict)?;
+                    let next = statement
+                        .verify_and_advance(signature, &signed, canonical_approved_payload, &parent)
+                        .map_err(|_| PairingTransportError::Conflict)?;
+                    let object = super::membership_transport::MembershipEventObject::from_evidence(
+                        &super::membership_crypto::MembershipHistoryEvent::PairingAdd {
+                            statement: &statement
+                                .signing_preimage()
+                                .map_err(|_| PairingTransportError::Conflict)?,
+                            signature,
+                            request: &signed,
+                            approved_payload: canonical_approved_payload,
+                        },
+                    )
+                    .map_err(|_| PairingTransportError::Conflict)?;
+                    let endpoint = super::membership_crypto::MembershipEndpoint {
+                        state_sha256: next.state().state_sha256,
+                        ..membership.endpoint
+                    };
+                    let mut evidence = membership
+                        .events
+                        .iter()
+                        .map(|e| e.evidence())
+                        .collect::<Vec<_>>();
+                    evidence.push(object.evidence());
+                    super::membership_crypto::verify_membership_history(
+                        &membership.enrollment,
+                        membership.pin,
+                        self.scope,
+                        &evidence,
+                        endpoint,
+                        crate::vault::pairing_v2::BUDGET,
+                    )
+                    .map_err(|_| PairingTransportError::Conflict)?;
+                    Some((endpoint, object))
+                } else {
+                    if memberships.contains_key(&self.scope.workspace_id.to_string()) {
+                        return Err(PairingTransportError::Conflict);
+                    }
+                    let approved_payload = validate_approved_payload(
+                        canonical_approved_payload,
+                        envelope.pairing_id,
+                        request,
+                        invite.scope,
+                        invite.creating_device_id,
+                    )?;
+                    if approved_payload.grant.request_digest != request.request_digest {
+                        return Err(PairingTransportError::Conflict);
+                    }
+                    None
+                };
                 let approved_payload_digest =
                     Sha256Digest(Sha256::digest(canonical_approved_payload).into());
-                if approved_payload.grant.request_digest != request.request_digest {
-                    return Err(PairingTransportError::Conflict);
-                }
                 let receipt = PairingDecisionReceipt {
                     pairing_id: envelope.pairing_id,
                     request_digest: request.request_digest,
@@ -539,10 +745,18 @@ impl PairingApprovalTransport for InMemoryPairingApprovalClient {
                     approved_payload_digest: Some(approved_payload_digest),
                     decided_at_ms: now_ms,
                 };
+                if let Some((endpoint, object)) = next_membership {
+                    let membership = memberships
+                        .get_mut(&self.scope.workspace_id.to_string())
+                        .ok_or(PairingTransportError::Conflict)?;
+                    membership.endpoint = endpoint;
+                    membership.events.push(object);
+                }
                 (
                     TerminalState::Approved {
                         canonical_approved_payload: canonical_approved_payload.clone(),
                         receipt: receipt.clone(),
+                        membership_signature: envelope.membership_signature(),
                     },
                     receipt,
                 )
@@ -573,6 +787,49 @@ impl PairingApprovalTransport for InMemoryPairingApprovalClient {
         }
         Ok(())
     }
+}
+
+fn joining_membership<'a>(
+    state: &'a ProviderState,
+    id: PairingId,
+    digest: Sha256Digest,
+    session: &str,
+) -> Result<&'a MemoryMembership, PairingTransportError> {
+    let invite = state
+        .invites
+        .get(&id)
+        .ok_or(PairingTransportError::Unauthorized)?;
+    require_join_session(invite, session)?;
+    let request = invite
+        .request
+        .as_ref()
+        .ok_or(PairingTransportError::Unauthorized)?;
+    if request.request_digest != digest
+        || !matches!(
+            invite.terminal,
+            TerminalState::Approved {
+                membership_signature: Some(_),
+                ..
+            }
+        )
+    {
+        return Err(PairingTransportError::Unauthorized);
+    }
+    let membership = state
+        .memberships
+        .get(&invite.scope.workspace_id.to_string())
+        .ok_or(PairingTransportError::Unauthorized)?;
+    let request = decode_pairing_request_v1(&request.canonical_bytes)
+        .map_err(|_| PairingTransportError::Conflict)?;
+    if !membership
+        .verify(invite.scope)?
+        .state()
+        .active_devices
+        .contains_key(&request.device_id)
+    {
+        return Err(PairingTransportError::Unauthorized);
+    }
+    Ok(membership)
 }
 
 impl ProviderEntropy {

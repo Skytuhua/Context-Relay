@@ -11,7 +11,15 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     devices::{
+        membership_crypto::{
+            MembershipEndpoint, MembershipHistoryBudget, verify_membership_history,
+        },
+        membership_transport::{MembershipEventObject, enrollment_endpoint},
         recovery_crypto::decode_recovery_enrollment_record_v1,
+        recovery_restore_crypto::v2::{
+            decode_recovery_device_claim_v2, recovery_membership_successor,
+            verify_recovery_device_claim_v2,
+        },
         recovery_restore_crypto::{decode_recovery_device_claim_v1, verify_recovery_device_claim},
         recovery_restore_transport::{
             RecoveryRestoreProjection, RecoveryRestoreReceipt, RecoveryRestoreTransport,
@@ -53,7 +61,14 @@ struct AcceptedEnrollment {
     restores: BTreeMap<RecoveryRestoreId, AcceptedRestore>,
     device_ids: BTreeSet<DeviceId>,
     certificate_ids: BTreeSet<DeviceCertificateId>,
+    endpoint: MembershipEndpoint,
+    events: Vec<MembershipEventObject>,
 }
+
+const HISTORY_BUDGET: MembershipHistoryBudget = MembershipHistoryBudget {
+    max_events: 4096,
+    max_bytes: 64 * 1024 * 1024,
+};
 
 struct AcceptedRestore {
     canonical_claim: Vec<u8>,
@@ -223,7 +238,17 @@ impl InMemoryRecoveryEnrollmentProvider {
             .values()
             .flat_map(|accepted| {
                 accepted.restores.values().filter_map(|restore| {
-                    let claim = decode_recovery_device_claim_v1(&restore.canonical_claim).ok()?;
+                    let device_id = if restore.canonical_claim.starts_with(&[0xb0, 0, 2]) {
+                        decode_recovery_device_claim_v2(&restore.canonical_claim)
+                            .ok()?
+                            .certificate
+                            .device_id
+                    } else {
+                        decode_recovery_device_claim_v1(&restore.canonical_claim)
+                            .ok()?
+                            .certificate
+                            .device_id
+                    };
                     Some(RecoveryRestoreCapture {
                         account_id: restore.receipt.account_id,
                         workspace_id: restore.receipt.workspace_id,
@@ -231,7 +256,7 @@ impl InMemoryRecoveryEnrollmentProvider {
                         enrollment_id: restore.receipt.enrollment_id,
                         recovery_root_id: restore.receipt.recovery_root_id,
                         certificate_id: restore.receipt.certificate_id,
-                        device_id: claim.certificate.device_id,
+                        device_id,
                         canonical_record_sha256: restore.receipt.canonical_record_sha256,
                         canonical_claim_sha256: restore.receipt.canonical_claim_sha256,
                         canonical_claim_len: restore.canonical_claim.len(),
@@ -283,6 +308,17 @@ impl RecoveryEnrollmentTransport for InMemoryRecoveryEnrollmentTransport {
             return Err(RecoveryTransportError::Unauthorized);
         }
         let canonical_record_sha256 = Sha256Digest(Sha256::digest(canonical_record).into());
+        let endpoint = enrollment_endpoint(canonical_record, canonical_record_sha256, self.scope)
+            .map_err(|_| RecoveryTransportError::Invalid)?;
+        verify_membership_history(
+            canonical_record,
+            canonical_record_sha256,
+            self.scope,
+            &[],
+            endpoint,
+            HISTORY_BUDGET,
+        )
+        .map_err(|_| RecoveryTransportError::Invalid)?;
         let receipt = RecoveryEnrollmentReceipt {
             enrollment_id: record.enrollment_id,
             recovery_root_id: record.recovery_root_id,
@@ -314,6 +350,8 @@ impl RecoveryEnrollmentTransport for InMemoryRecoveryEnrollmentTransport {
                 restores: BTreeMap::new(),
                 device_ids: BTreeSet::from([record.genesis_certificate.device_id]),
                 certificate_ids: BTreeSet::from([record.genesis_certificate_id]),
+                endpoint,
+                events: Vec::new(),
             },
         );
         Ok(state.forged_receipt.take().unwrap_or(receipt))
@@ -346,11 +384,53 @@ impl RecoveryRestoreTransport for InMemoryRecoveryRestoreTransport {
         }))
     }
 
+    fn membership_endpoint(&self) -> Result<MembershipEndpoint, RecoveryTransportError> {
+        let mut state = lock(&self.shared)?;
+        maybe_fail(&mut state)?;
+        let accepted = state
+            .accepted
+            .get(&self.scope.account_id)
+            .ok_or(RecoveryTransportError::Unauthorized)?;
+        if accepted.receipt.workspace_id != self.scope.workspace_id {
+            return Err(RecoveryTransportError::Unauthorized);
+        }
+        Ok(accepted.endpoint)
+    }
+
+    fn membership_event(
+        &self,
+        successor: Sha256Digest,
+    ) -> Result<Option<MembershipEventObject>, RecoveryTransportError> {
+        let mut state = lock(&self.shared)?;
+        maybe_fail(&mut state)?;
+        let accepted = state
+            .accepted
+            .get(&self.scope.account_id)
+            .ok_or(RecoveryTransportError::Unauthorized)?;
+        if accepted.receipt.workspace_id != self.scope.workspace_id {
+            return Err(RecoveryTransportError::Unauthorized);
+        }
+        for event in &accepted.events {
+            if event
+                .endpoints()
+                .map_err(|_| RecoveryTransportError::Conflict)?
+                .1
+                == successor
+            {
+                return Ok(Some(event.clone()));
+            }
+        }
+        Ok(None)
+    }
+
     fn submit_restore(
         &self,
         canonical_claim: &[u8],
         now_ms: u64,
     ) -> Result<RecoveryRestoreReceipt, RecoveryTransportError> {
+        if canonical_claim.starts_with(&[0xb0, 0, 2]) {
+            return self.submit_v2(canonical_claim, now_ms);
+        }
         let claim = decode_recovery_device_claim_v1(canonical_claim)
             .map_err(|_| RecoveryTransportError::Invalid)?;
         if claim.account_id != self.scope.account_id
@@ -445,6 +525,157 @@ impl RecoveryRestoreTransport for InMemoryRecoveryRestoreTransport {
                 canonical_claim: restore.canonical_claim.clone(),
                 receipt: restore.receipt.clone(),
             }))
+    }
+}
+
+impl InMemoryRecoveryRestoreTransport {
+    fn submit_v2(
+        &self,
+        canonical: &[u8],
+        now_ms: u64,
+    ) -> Result<RecoveryRestoreReceipt, RecoveryTransportError> {
+        let claim = decode_recovery_device_claim_v2(canonical)
+            .map_err(|_| RecoveryTransportError::Invalid)?;
+        if claim.account_id != self.scope.account_id
+            || claim.workspace_id != self.scope.workspace_id
+        {
+            return Err(RecoveryTransportError::Unauthorized);
+        }
+        let mut state = lock(&self.shared)?;
+        maybe_fail(&mut state)?;
+        let accepted = state
+            .accepted
+            .get_mut(&self.scope.account_id)
+            .ok_or(RecoveryTransportError::Unauthorized)?;
+        if accepted.receipt.workspace_id != self.scope.workspace_id {
+            return Err(RecoveryTransportError::Unauthorized);
+        }
+        let history = verify_membership_history(
+            &accepted.canonical_record,
+            accepted.receipt.canonical_record_sha256,
+            self.scope,
+            &accepted
+                .events
+                .iter()
+                .map(MembershipEventObject::evidence)
+                .collect::<Vec<_>>(),
+            accepted.endpoint,
+            HISTORY_BUDGET,
+        )
+        .map_err(|_| RecoveryTransportError::Conflict)?;
+        if let Some(existing) = accepted.restores.get(&claim.restore_id) {
+            if existing.canonical_claim != canonical
+                || history
+                    .state()
+                    .active_devices
+                    .get(&claim.certificate.device_id)
+                    != Some(&claim.certificate)
+            {
+                return Err(RecoveryTransportError::Conflict);
+            }
+            let receipt = existing.receipt.clone();
+            return Ok(state.forged_restore_receipt.take().unwrap_or(receipt));
+        }
+        // Authenticate this exact claim against its original parent before classifying
+        // a current-head race. Local malformed input is never a publication rejection.
+        let mut parent_events = Vec::new();
+        let mut parent_endpoint = crate::devices::membership_transport::enrollment_endpoint(
+            &accepted.canonical_record,
+            accepted.receipt.canonical_record_sha256,
+            self.scope,
+        )
+        .map_err(|_| RecoveryTransportError::Conflict)?;
+        for event in &accepted.events {
+            if parent_endpoint.state_sha256 == claim.previous_state_sha256 {
+                break;
+            }
+            parent_events.push(event.evidence());
+            let (_, successor) = event
+                .endpoints()
+                .map_err(|_| RecoveryTransportError::Conflict)?;
+            parent_endpoint.state_sha256 = successor;
+        }
+        parent_endpoint.control_epoch = claim.certificate.control_epoch;
+        parent_endpoint.key_epoch = claim.key_epoch;
+        let parent = verify_membership_history(
+            &accepted.canonical_record,
+            accepted.receipt.canonical_record_sha256,
+            self.scope,
+            &parent_events,
+            parent_endpoint,
+            HISTORY_BUDGET,
+        )
+        .map_err(|_| RecoveryTransportError::Invalid)?;
+        let record = decode_recovery_enrollment_record_v1(&accepted.canonical_record)
+            .map_err(|_| RecoveryTransportError::Conflict)?;
+        verify_recovery_device_claim_v2(&record, &claim, &parent)
+            .map_err(|_| RecoveryTransportError::Invalid)?;
+        if claim.previous_state_sha256 != accepted.endpoint.state_sha256
+            || claim.expected_recovery_generation != accepted.recovery_generation
+        {
+            return Err(RecoveryTransportError::PublicationRejected);
+        }
+        if accepted.recovery_generation >= i64::MAX as u64
+            || accepted.device_ids.contains(&claim.certificate.device_id)
+            || accepted.certificate_ids.contains(&claim.certificate_id)
+        {
+            return Err(RecoveryTransportError::Conflict);
+        }
+        let record = decode_recovery_enrollment_record_v1(&accepted.canonical_record)
+            .map_err(|_| RecoveryTransportError::Conflict)?;
+        verify_recovery_device_claim_v2(&record, &claim, &history)
+            .map_err(|_| RecoveryTransportError::Invalid)?;
+        let object = MembershipEventObject::from_evidence(
+            &crate::devices::membership_crypto::MembershipHistoryEvent::RecoveryAdd {
+                canonical_claim: canonical,
+            },
+        )
+        .map_err(|_| RecoveryTransportError::Invalid)?;
+        let endpoint = MembershipEndpoint {
+            state_sha256: recovery_membership_successor(&claim)
+                .map_err(|_| RecoveryTransportError::Invalid)?,
+            control_epoch: claim.certificate.control_epoch,
+            key_epoch: claim.key_epoch,
+        };
+        let mut events = accepted.events.clone();
+        events.push(object);
+        verify_membership_history(
+            &accepted.canonical_record,
+            accepted.receipt.canonical_record_sha256,
+            self.scope,
+            &events
+                .iter()
+                .map(MembershipEventObject::evidence)
+                .collect::<Vec<_>>(),
+            endpoint,
+            HISTORY_BUDGET,
+        )
+        .map_err(|_| RecoveryTransportError::Invalid)?;
+        let receipt = RecoveryRestoreReceipt {
+            restore_id: claim.restore_id,
+            enrollment_id: claim.enrollment_id,
+            recovery_root_id: claim.recovery_root_id,
+            account_id: claim.account_id,
+            workspace_id: claim.workspace_id,
+            certificate_id: claim.certificate_id,
+            canonical_record_sha256: claim.canonical_record_sha256,
+            canonical_claim_sha256: Sha256Digest(Sha256::digest(canonical).into()),
+            accepted_generation: accepted.recovery_generation + 1,
+            accepted_at_ms: now_ms,
+        };
+        accepted.device_ids.insert(claim.certificate.device_id);
+        accepted.certificate_ids.insert(claim.certificate_id);
+        accepted.restores.insert(
+            claim.restore_id,
+            AcceptedRestore {
+                canonical_claim: canonical.to_vec(),
+                receipt: receipt.clone(),
+            },
+        );
+        accepted.events = events;
+        accepted.endpoint = endpoint;
+        accepted.recovery_generation = receipt.accepted_generation;
+        Ok(state.forged_restore_receipt.take().unwrap_or(receipt))
     }
 }
 

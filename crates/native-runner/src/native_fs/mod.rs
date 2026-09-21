@@ -559,10 +559,84 @@ pub struct PinnedNativeDirectory {
     path: PathBuf,
     #[cfg(any(windows, target_os = "macos"))]
     directory: File,
+    #[cfg(windows)]
+    _creation_ancestors: Vec<File>,
+}
+
+/// Owns a private descendant read handle and its no-delete ancestor handles.
+/// Existing file writes/replacement are excluded until drop. This does not
+/// freeze directory namespaces or confer process execution authority.
+#[cfg(windows)]
+#[derive(Debug)]
+pub struct NativeReadLease {
+    _file: File,
+    _ancestors: Vec<File>,
 }
 
 #[cfg(any(windows, target_os = "macos"))]
 impl PinnedNativeDirectory {
+    #[cfg(windows)]
+    pub fn verify_private(&self) -> Result<(), RunnerError> {
+        self.verify_path()?;
+        windows::verify_private_directory(&self.directory)
+    }
+
+    /// Hashes a regular descendant through held, no-reparse ancestors. When
+    /// requested, flushes the same writer-excluding handle before returning.
+    /// Requires private security descriptors on the file and its ancestors.
+    #[cfg(windows)]
+    pub fn hash_regular_file(
+        &self,
+        path: &StagePath,
+        max_bytes: u64,
+        synchronize: bool,
+    ) -> Result<(u64, [u8; 32]), RunnerError> {
+        self.verify_path()?;
+        windows::hash_relative_file(&self.directory, &self.path, path, max_bytes, synchronize)
+    }
+
+    /// Hashes and retains the same writer-excluding file handle. No write or
+    /// delete sharing is granted, and all traversed ancestors stay held.
+    #[cfg(windows)]
+    pub fn lock_regular_file(
+        &self,
+        path: &StagePath,
+        max_bytes: u64,
+    ) -> Result<(NativeReadLease, u64, [u8; 32]), RunnerError> {
+        self.verify_path()?;
+        windows::lock_relative_file(&self.directory, &self.path, path, max_bytes, false)
+    }
+
+    /// Holds a verified private directory, including empty directories.
+    #[cfg(windows)]
+    pub fn lock_relative_directory(
+        &self,
+        path: &StagePath,
+    ) -> Result<NativeReadLease, RunnerError> {
+        self.verify_path()?;
+        windows::lock_relative_directory(&self.directory, &self.path, path, false)
+    }
+
+    /// Checks a private descendant directory, including empty directories.
+    #[cfg(windows)]
+    pub fn verify_relative_directory(&self, path: &StagePath) -> Result<(), RunnerError> {
+        self.verify_path()?;
+        windows::verify_relative_directory(&self.directory, &self.path, path, false)
+    }
+
+    #[cfg(windows)]
+    pub fn synchronize_relative_directory(&self, path: &StagePath) -> Result<(), RunnerError> {
+        self.verify_path()?;
+        windows::flush_relative_directory(&self.directory, &self.path, path)
+    }
+
+    /// Requires a write-capable private creation/reopen pin.
+    #[cfg(windows)]
+    pub fn synchronize(&self) -> Result<(), RunnerError> {
+        self.verify_path()?;
+        windows::synchronize_pinned_directory(&self.directory)
+    }
+
     pub fn open(path: &Path) -> Result<Self, RunnerError> {
         #[cfg(target_os = "macos")]
         let directory = macos::open_pinned_directory(path)?;
@@ -572,6 +646,8 @@ impl PinnedNativeDirectory {
         Ok(Self {
             path: path.to_path_buf(),
             directory,
+            #[cfg(windows)]
+            _creation_ancestors: Vec::new(),
         })
     }
 
@@ -648,6 +724,41 @@ fn validate_pinned_child_name(name: &str) -> Result<(), RunnerError> {
 impl OsNativeFileSystem {
     pub const fn new() -> Self {
         Self
+    }
+
+    /// Reopens an existing owner-only private directory without repairing its
+    /// permissions. Retains the same writer/rename exclusions as creation.
+    #[cfg(windows)]
+    pub fn open_private_directory(
+        &self,
+        path: &Path,
+    ) -> Result<PinnedNativeDirectory, RunnerError> {
+        let (directory, ancestors) = windows::open_private_directory(path)?;
+        Ok(PinnedNativeDirectory {
+            path: path.to_owned(),
+            directory,
+            _creation_ancestors: ancestors,
+        })
+    }
+
+    #[cfg(windows)]
+    pub fn synchronize_directory(&self, path: &Path) -> Result<(), RunnerError> {
+        windows::synchronize_directory(path)
+    }
+
+    /// Atomically creates an absent Windows directory with a protected,
+    /// inheritable current-user-only DACL and pins its ancestor topology.
+    #[cfg(windows)]
+    pub fn create_private_directory(
+        &self,
+        path: &Path,
+    ) -> Result<PinnedNativeDirectory, RunnerError> {
+        let (directory, ancestors) = windows::create_private_directory(path)?;
+        Ok(PinnedNativeDirectory {
+            path: path.to_owned(),
+            directory,
+            _creation_ancestors: ancestors,
+        })
     }
 
     pub fn snapshot(&self, path: &Path) -> Result<NativeSnapshot, RunnerError> {

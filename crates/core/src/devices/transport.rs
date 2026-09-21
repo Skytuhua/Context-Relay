@@ -1,6 +1,9 @@
 use std::{error::Error, fmt};
 
-use context_relay_protocol::{DeviceId, PairingCode, PairingId, Sha256Digest};
+use super::{membership_crypto::MembershipEndpoint, membership_transport::MembershipEventObject};
+use context_relay_protocol::{
+    DeviceId, Ed25519SignatureBytes, OperationId, PairingCode, PairingId, Sha256Digest,
+};
 
 use crate::sync::SyncScope;
 
@@ -81,6 +84,25 @@ pub enum PairingInviteState {
     Canceled,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MembershipObjectKind {
+    Enrollment,
+    Event,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeviceOperationHead {
+    pub sequence: u64,
+    pub canonical_sha256: Sha256Digest,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeviceRevocationContext {
+    pub endpoint: MembershipEndpoint,
+    pub target_device_id: DeviceId,
+    pub head: DeviceOperationHead,
+}
+
 #[derive(Clone, Eq, PartialEq)]
 pub struct StoredPairingRequest {
     pub pairing_id: PairingId,
@@ -130,6 +152,8 @@ pub struct PairingDecisionEnvelope {
     pub pairing_id: PairingId,
     pub request_digest: Sha256Digest,
     decision: PairingDecision,
+    canonical_request: Option<Vec<u8>>,
+    membership_signature: Option<Ed25519SignatureBytes>,
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -150,7 +174,40 @@ impl PairingDecisionEnvelope {
             decision: PairingDecision::Approve {
                 canonical_approved_payload,
             },
+            canonical_request: None,
+            membership_signature: None,
         }
+    }
+
+    pub fn approve_request(
+        request: &super::crypto::SignedPairingRequest,
+        canonical_approved_payload: Vec<u8>,
+    ) -> Self {
+        let mut envelope = Self::approve(
+            request.request().pairing_id,
+            request.digest(),
+            canonical_approved_payload,
+        );
+        envelope.canonical_request = Some(request.canonical_bytes().to_vec());
+        envelope
+    }
+
+    pub(crate) fn canonical_request(&self) -> Option<&[u8]> {
+        self.canonical_request.as_deref()
+    }
+
+    pub fn approve_request_v2(
+        request: &super::crypto::SignedPairingRequest,
+        canonical: Vec<u8>,
+        signature: Ed25519SignatureBytes,
+    ) -> Self {
+        let mut envelope = Self::approve_request(request, canonical);
+        envelope.membership_signature = Some(signature);
+        envelope
+    }
+
+    pub(crate) fn membership_signature(&self) -> Option<Ed25519SignatureBytes> {
+        self.membership_signature
     }
 
     pub const fn reject(pairing_id: PairingId, request_digest: Sha256Digest) -> Self {
@@ -158,6 +215,8 @@ impl PairingDecisionEnvelope {
             pairing_id,
             request_digest,
             decision: PairingDecision::Reject,
+            canonical_request: None,
+            membership_signature: None,
         }
     }
 
@@ -199,6 +258,7 @@ impl fmt::Debug for PairingDecisionEnvelope {
 pub struct PairingApprovedResult {
     canonical_approved_payload: Vec<u8>,
     receipt: PairingDecisionReceipt,
+    membership_signature: Option<Ed25519SignatureBytes>,
 }
 
 impl PairingApprovedResult {
@@ -206,7 +266,23 @@ impl PairingApprovedResult {
         Self {
             canonical_approved_payload,
             receipt,
+            membership_signature: None,
         }
+    }
+
+    pub fn new_v2(
+        canonical: Vec<u8>,
+        receipt: PairingDecisionReceipt,
+        signature: Ed25519SignatureBytes,
+    ) -> Self {
+        Self {
+            canonical_approved_payload: canonical,
+            receipt,
+            membership_signature: Some(signature),
+        }
+    }
+    pub(crate) fn membership_signature(&self) -> Option<Ed25519SignatureBytes> {
+        self.membership_signature
     }
 
     pub(crate) fn canonical_approved_payload(&self) -> &[u8] {
@@ -257,6 +333,28 @@ impl fmt::Debug for PairingResult {
 }
 
 pub trait PairingJoinTransport: Send + Sync {
+    /// Bound by the provider to this original pairing session and request.
+    fn enrollment(
+        &self,
+        _pairing_id: PairingId,
+        _request: Sha256Digest,
+        _pin: Sha256Digest,
+        _now_ms: u64,
+    ) -> Result<Option<Vec<u8>>, PairingTransportError> {
+        Err(PairingTransportError::Unauthorized)
+    }
+    fn membership_event(
+        &self,
+        _pairing_id: PairingId,
+        _request: Sha256Digest,
+        _address: Sha256Digest,
+        _now_ms: u64,
+    ) -> Result<Option<MembershipEventObject>, PairingTransportError> {
+        Err(PairingTransportError::Unauthorized)
+    }
+    fn hosted_intent(&self) -> Option<crate::vault::HostedPairingIntent> {
+        None
+    }
     fn resolve_code(
         &self,
         code: &PairingCode,
@@ -279,6 +377,46 @@ pub trait PairingJoinTransport: Send + Sync {
 }
 
 pub trait PairingApprovalTransport: Send + Sync {
+    /// Initializes from committed enrollment on the server, never uploaded roster data.
+    fn membership_endpoint(
+        &self,
+        _now_ms: u64,
+    ) -> Result<MembershipEndpoint, PairingTransportError> {
+        Err(PairingTransportError::Unauthorized)
+    }
+    fn membership_object(
+        &self,
+        _kind: MembershipObjectKind,
+        _address: Sha256Digest,
+        _now_ms: u64,
+    ) -> Result<Option<Vec<u8>>, PairingTransportError> {
+        Err(PairingTransportError::Unauthorized)
+    }
+    fn revocation_context(
+        &self,
+        _target: DeviceId,
+        _now_ms: u64,
+    ) -> Result<DeviceRevocationContext, PairingTransportError> {
+        Err(PairingTransportError::Unauthorized)
+    }
+    fn revocation_result(
+        &self,
+        _operation_id: OperationId,
+        _object_sha256: Sha256Digest,
+        _now_ms: u64,
+    ) -> Result<Option<crate::vault::DeviceRevocationReceipt>, PairingTransportError> {
+        Err(PairingTransportError::Unauthorized)
+    }
+    fn publish_revocation(
+        &self,
+        _object: &MembershipEventObject,
+        _now_ms: u64,
+    ) -> Result<crate::vault::DeviceRevocationReceipt, PairingTransportError> {
+        Err(PairingTransportError::Unauthorized)
+    }
+    fn hosted_intent(&self) -> Option<crate::vault::HostedPairingIntent> {
+        None
+    }
     fn create_invite(&self, now_ms: u64) -> Result<PairingInvite, PairingTransportError>;
 
     fn invite_status(
@@ -300,6 +438,97 @@ pub trait PairingApprovalTransport: Send + Sync {
     ) -> Result<PairingDecisionReceipt, PairingTransportError>;
 
     fn cancel(&self, pairing_id: PairingId, now_ms: u64) -> Result<(), PairingTransportError>;
+}
+
+/// Fresh joining devices have no approval authority or scoped approval client.
+impl<T: PairingApprovalTransport> PairingApprovalTransport for Option<T> {
+    fn membership_endpoint(
+        &self,
+        now_ms: u64,
+    ) -> Result<MembershipEndpoint, PairingTransportError> {
+        self.as_ref()
+            .ok_or(PairingTransportError::Unauthorized)?
+            .membership_endpoint(now_ms)
+    }
+    fn hosted_intent(&self) -> Option<crate::vault::HostedPairingIntent> {
+        self.as_ref()
+            .and_then(PairingApprovalTransport::hosted_intent)
+    }
+    fn membership_object(
+        &self,
+        kind: MembershipObjectKind,
+        address: Sha256Digest,
+        now_ms: u64,
+    ) -> Result<Option<Vec<u8>>, PairingTransportError> {
+        self.as_ref()
+            .ok_or(PairingTransportError::Unauthorized)?
+            .membership_object(kind, address, now_ms)
+    }
+    fn revocation_context(
+        &self,
+        target: DeviceId,
+        now_ms: u64,
+    ) -> Result<DeviceRevocationContext, PairingTransportError> {
+        self.as_ref()
+            .ok_or(PairingTransportError::Unauthorized)?
+            .revocation_context(target, now_ms)
+    }
+    fn revocation_result(
+        &self,
+        operation_id: OperationId,
+        object_sha256: Sha256Digest,
+        now_ms: u64,
+    ) -> Result<Option<crate::vault::DeviceRevocationReceipt>, PairingTransportError> {
+        self.as_ref()
+            .ok_or(PairingTransportError::Unauthorized)?
+            .revocation_result(operation_id, object_sha256, now_ms)
+    }
+    fn publish_revocation(
+        &self,
+        object: &MembershipEventObject,
+        now_ms: u64,
+    ) -> Result<crate::vault::DeviceRevocationReceipt, PairingTransportError> {
+        self.as_ref()
+            .ok_or(PairingTransportError::Unauthorized)?
+            .publish_revocation(object, now_ms)
+    }
+    fn create_invite(&self, now_ms: u64) -> Result<PairingInvite, PairingTransportError> {
+        self.as_ref()
+            .ok_or(PairingTransportError::Unauthorized)?
+            .create_invite(now_ms)
+    }
+    fn invite_status(
+        &self,
+        id: PairingId,
+        now_ms: u64,
+    ) -> Result<PairingInviteStatus, PairingTransportError> {
+        self.as_ref()
+            .ok_or(PairingTransportError::Unauthorized)?
+            .invite_status(id, now_ms)
+    }
+    fn request(
+        &self,
+        id: PairingId,
+        now_ms: u64,
+    ) -> Result<Option<StoredPairingRequest>, PairingTransportError> {
+        self.as_ref()
+            .ok_or(PairingTransportError::Unauthorized)?
+            .request(id, now_ms)
+    }
+    fn decide(
+        &self,
+        envelope: PairingDecisionEnvelope,
+        now_ms: u64,
+    ) -> Result<PairingDecisionReceipt, PairingTransportError> {
+        self.as_ref()
+            .ok_or(PairingTransportError::Unauthorized)?
+            .decide(envelope, now_ms)
+    }
+    fn cancel(&self, id: PairingId, now_ms: u64) -> Result<(), PairingTransportError> {
+        self.as_ref()
+            .ok_or(PairingTransportError::Unauthorized)?
+            .cancel(id, now_ms)
+    }
 }
 
 pub trait PairingTransport: Send + Sync {

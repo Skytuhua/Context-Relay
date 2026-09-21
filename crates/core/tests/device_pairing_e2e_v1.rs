@@ -147,9 +147,13 @@ impl PairingJoinTransport for FailSubmitOnce {
 struct FailDecisionOnce {
     inner: context_relay_core::devices::memory_transport::InMemoryPairingApprovalClient,
     fail: Arc<AtomicBool>,
+    intent: Option<context_relay_core::vault::HostedPairingIntent>,
 }
 
 impl PairingApprovalTransport for FailDecisionOnce {
+    fn hosted_intent(&self) -> Option<context_relay_core::vault::HostedPairingIntent> {
+        self.intent.clone()
+    }
     fn create_invite(&self, now_ms: u64) -> Result<PairingInvite, PairingTransportError> {
         self.inner.create_invite(now_ms)
     }
@@ -352,6 +356,98 @@ fn two_replicas_pair_through_the_resumable_coordinator() {
 }
 
 #[test]
+fn targeted_approval_resume_requires_the_original_hosted_identity_before_submission() {
+    use context_relay_core::vault::{HostedPairingIntent, HostedPairingRole};
+    let scenario = coordinator_scenario(5_800, 0x58);
+    let intent = HostedPairingIntent {
+        project_url: "https://example.supabase.co/".into(),
+        user_id: "550e8400-e29b-41d4-a716-446655440000".parse().unwrap(),
+        session_id: "550e8400-e29b-41d4-a716-446655440001".parse().unwrap(),
+        role: HostedPairingRole::Approve,
+    };
+    let make = |intent, fail| {
+        PairingCoordinator::new(
+            scenario.clock.clone(),
+            TestMaterialSource::from_material(&scenario.material),
+            scenario
+                .provider
+                .join_session_client("unused-hosted-resume")
+                .unwrap(),
+            FailDecisionOnce {
+                inner: scenario
+                    .provider
+                    .existing_device_client(scope(), id(APPROVER_DEVICE_ID)),
+                fail,
+                intent,
+            },
+        )
+    };
+    let original = make(Some(intent.clone()), Arc::new(AtomicBool::new(true)));
+    let mut vault = Vault::open(
+        scenario.approver_path.path(),
+        APPROVER_CREDENTIAL,
+        &scenario.approver_store,
+    )
+    .unwrap();
+    assert_eq!(
+        original
+            .decide(
+                &mut vault,
+                scenario.invite.pairing_id,
+                scenario.review.request_digest,
+                PairingDecisionInput::Approve(scenario.authority()),
+            )
+            .unwrap_err(),
+        PairingCycleError::Transient
+    );
+    drop(vault);
+    let mut vault = Vault::open(
+        scenario.approver_path.path(),
+        APPROVER_CREDENTIAL,
+        &scenario.approver_store,
+    )
+    .unwrap();
+    for changed in [
+        None,
+        Some(HostedPairingIntent {
+            project_url: "https://other.supabase.co/".into(),
+            ..intent.clone()
+        }),
+        Some(HostedPairingIntent {
+            user_id: intent.session_id,
+            ..intent.clone()
+        }),
+        Some(HostedPairingIntent {
+            session_id: intent.user_id,
+            ..intent.clone()
+        }),
+        Some(HostedPairingIntent {
+            role: HostedPairingRole::Join,
+            ..intent
+        }),
+    ] {
+        let untouched = Arc::new(AtomicBool::new(true));
+        assert_eq!(
+            make(changed, untouched.clone())
+                .resume_prepared_decision(&mut vault, scenario.invite.pairing_id)
+                .unwrap_err(),
+            PairingCycleError::Conflict
+        );
+        assert!(
+            untouched.load(Ordering::SeqCst),
+            "changed identity reached provider submission"
+        );
+        assert_eq!(vault.pending_pairing_approvals().unwrap().len(), 1);
+    }
+    assert!(
+        original
+            .resume_prepared_decision(&mut vault, scenario.invite.pairing_id)
+            .unwrap()
+    );
+    assert!(vault.pending_pairing_approvals().unwrap().is_empty());
+}
+
+#[test]
 fn locally_persisted_join_request_resumes_after_transient_submission_failure() {
     let joiner_path = TempVault::new("pairing-e2e-submit-resume");
     let joiner_store = MemoryKeyStore::default();
@@ -434,6 +530,7 @@ fn prepared_approval_resumes_after_transient_provider_failure() {
     let failing = FailDecisionOnce {
         inner: owner.clone(),
         fail: Arc::new(AtomicBool::new(true)),
+        intent: None,
     };
     let failing_coordinator = PairingCoordinator::new(
         scenario.clock.clone(),
@@ -525,12 +622,24 @@ fn provider_acceptance_followed_by_local_failure_resumes_exactly_after_reopen() 
         &scenario.approver_store,
     )
     .unwrap();
-    assert_eq!(
+    assert!(
+        !scenario
+            .coordinator
+            .resume_prepared_decision(&mut reopened, id("018f22e2-79b0-7cc8-98c4-dc0c0c074099"))
+            .unwrap()
+    );
+    assert_eq!(reopened.pending_pairing_approvals().unwrap().len(), 1);
+    assert!(
         scenario
             .coordinator
-            .resume_prepared_decisions(&mut reopened)
-            .unwrap(),
-        1
+            .resume_prepared_decision(&mut reopened, scenario.invite.pairing_id)
+            .unwrap()
+    );
+    assert!(
+        !scenario
+            .coordinator
+            .resume_prepared_decision(&mut reopened, scenario.invite.pairing_id)
+            .unwrap()
     );
     let accepted = reopened
         .accepted_pairing_approval(scenario.invite.pairing_id)
@@ -666,6 +775,7 @@ fn prepared_approval_cannot_be_rejected_after_the_local_decision_is_bound() {
     let failing = FailDecisionOnce {
         inner: owner.clone(),
         fail: Arc::new(AtomicBool::new(true)),
+        intent: None,
     };
     let failing_coordinator = PairingCoordinator::new(
         scenario.clock.clone(),

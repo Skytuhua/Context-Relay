@@ -98,7 +98,7 @@
   "memoryCreateRequest": {
     "jsonrpc": "2.0",
     "id": "018f22e2-79b0-7cc8-98c4-dc0c0c07398f",
-    "protocol": {"major": 1, "minor": 4},
+    "protocol": {"major": 1, "minor": 17},
     "daemonInstanceNonce": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
     "method": "memory_create",
     "params": {
@@ -134,6 +134,56 @@
     "checkpointSigningPreimage": {
       "file": "checkpoint-signing-preimage-v1.hex",
       "sha256": "82a027960bf6f821079eba6206327f9c396e381bb0d4c494e7335f0b7148dfd5"
+    }
+  },
+  "recoveryHistoryCandidatesPage": {
+    "acceptedEndpoint": {
+      "controlEpoch": 2,
+      "keyEpoch": 2,
+      "stateSha256": "1111111111111111111111111111111111111111111111111111111111111111"
+    },
+    "candidates": [
+      {
+        "authorDeviceId": "018f22e2-79b0-7cc8-98c4-dc0c0c073903",
+        "checkpointSha256": "2222222222222222222222222222222222222222222222222222222222222222",
+        "createdHlc": {
+          "logical": 0,
+          "node": "018f22e2-79b0-7cc8-98c4-dc0c0c073903",
+          "physicalMs": "1002"
+        },
+        "extent": {
+          "operationCount": 1,
+          "state": "supported"
+        },
+        "frontierDeviceCount": 1,
+        "keyEpoch": 1
+      }
+    ],
+    "nextCursor": {
+      "acceptedEndpointSha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "canonicalHash": "2222222222222222222222222222222222222222222222222222222222222222",
+      "receivedAt": "2026-09-14T00:00:00Z",
+      "restoreId": "018f22e2-79b0-7cc8-98c4-dc0c0c073914"
+    },
+    "restoreId": "018f22e2-79b0-7cc8-98c4-dc0c0c073914"
+  },
+  "recoveryHistoryCandidatesPageSha256": "be267334036dfb649b8dd2f13a05187873347d8d5915198423287fcb5d2525f6",
+  "recoveryHistoryStatus": {
+    "state": "restoring_history",
+    "restoreId": "018f22e2-79b0-7cc8-98c4-dc0c0c073914",
+    "acceptedEndpoint": {
+      "stateSha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "controlEpoch": 2,
+      "keyEpoch": 2
+    },
+    "history": {
+      "state": "historical_keys_needed",
+      "selectedEndpoint": {
+        "stateSha256": "1111111111111111111111111111111111111111111111111111111111111111",
+        "controlEpoch": 2,
+        "keyEpoch": 2
+      },
+      "checkpointSha256": "2222222222222222222222222222222222222222222222222222222222222222"
     }
   }
 }

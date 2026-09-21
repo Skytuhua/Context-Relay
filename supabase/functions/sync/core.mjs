@@ -21,6 +21,8 @@ const RECORD_KINDS = Object.freeze([
 ]);
 const MUTATION_KINDS = Object.freeze(["upsert", "tombstone"]);
 const textDecoder = new TextDecoder("utf-8", { fatal: true });
+// CBOR text is signed data: preserve U+FEFF instead of consuming it as a BOM.
+const canonicalTextDecoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 const textEncoder = new TextEncoder();
 const CERTIFICATE_DOMAIN = textEncoder.encode("context-relay/device-certificate/v1\0");
 
@@ -32,7 +34,7 @@ class SyncEdgeError extends Error {
   }
 }
 
-class CanonicalReader {
+export class CanonicalReader {
   constructor(bytes) {
     this.bytes = bytes;
     this.position = 0;
@@ -134,12 +136,13 @@ class CanonicalReader {
     if (end > this.bytes.length) throw invalidEnvelope();
     let value;
     try {
-      value = textDecoder.decode(this.bytes.subarray(this.position, end));
+      value = canonicalTextDecoder.decode(this.bytes.subarray(this.position, end));
     } catch {
       throw invalidEnvelope();
     }
     this.position = end;
-    if (value.trim().length === 0) throw invalidEnvelope();
+    // Rust str::trim uses Unicode White_Space (includes U+0085, excludes U+FEFF).
+    if (/^\p{White_Space}*$/u.test(value)) throw invalidEnvelope();
     return value;
   }
 
@@ -645,7 +648,6 @@ async function verifyCertificateChain(context) {
     leaf.accountId !== context.accountId ||
     leaf.workspaceId !== context.workspaceId ||
     leaf.deviceId !== context.deviceId ||
-    leaf.controlEpoch !== context.controlEpoch ||
     !equalBytes(leaf.deviceSigningPublicKeyBytes, context.signingPublicKey)
   ) {
     throw invalidEnvelope();
@@ -657,7 +659,9 @@ async function verifyCertificateChain(context) {
     if (
       certificate.accountId !== context.accountId ||
       certificate.workspaceId !== context.workspaceId ||
-      certificate.controlEpoch !== context.controlEpoch ||
+      !Number.isInteger(certificate.controlEpoch) ||
+      certificate.controlEpoch < 1 ||
+      certificate.controlEpoch > context.controlEpoch ||
       seenDevices.has(certificate.deviceId)
     ) {
       throw invalidEnvelope();
@@ -682,6 +686,7 @@ async function verifyCertificateChain(context) {
       const issuer = certificates[index + 1];
       if (
         issuer === undefined ||
+        issuer.controlEpoch > certificate.controlEpoch ||
         certificate.issuerDeviceIdBytes === null ||
         certificate.issuerRecoveryPublicKeyBytes !== null ||
         certificate.issuerDeviceId !== issuer.deviceId ||

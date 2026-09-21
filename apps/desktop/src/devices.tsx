@@ -2,7 +2,11 @@ import { type FormEvent, useCallback, useEffect, useRef, useState } from 'react'
 
 import type {
   ClientError,
+  DeviceId,
+  DeviceRevocationSummary,
+  DeviceRevocationStatus,
   DeviceSummary,
+  OperationId,
   PairingApprovalInfo,
   PairingCode,
   PairingId,
@@ -15,6 +19,8 @@ import type {
   RecoveryEnrollmentStatus,
 } from './bindings';
 import type { DeviceGateway, PairingStatusResult } from './workspace';
+import { RecoveryRestorePanel } from './recovery-restore';
+import { uuidV7 } from './uuid';
 
 const PAIRING_CODE_PATTERN = /^[0-9A-HJKMNP-TV-Z]{5}-[0-9A-HJKMNP-TV-Z]{5}$/;
 const SAFETY_NUMBER_PATTERN = /^[0-9A-F]{4}(?:-[0-9A-F]{4}){4}$/;
@@ -46,8 +52,14 @@ export function DevicesScreen({
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [nowMs, setNowMs] = useState(() => Date.now());
+  const [revocationTarget, setRevocationTarget] = useState<DeviceSummary | null>(null);
+  const [revocationOperationId, setRevocationOperationId] = useState<OperationId | null>(null);
+  const [revocationStatus, setRevocationStatus] = useState<DeviceRevocationStatus | null>(null);
+  const [revocationIntents, setRevocationIntents] = useState<DeviceRevocationSummary[]>([]);
   const reviewDialogRef = useRef<HTMLDialogElement>(null);
   const reviewTriggerRef = useRef<HTMLButtonElement>(null);
+  const revocationDialogRef = useRef<HTMLDialogElement>(null);
+  const revocationTriggerRef = useRef<HTMLButtonElement>(null);
 
   const loadDevices = useCallback(async () => {
     try {
@@ -57,9 +69,29 @@ export function DevicesScreen({
     }
   }, [gateway]);
 
+  const loadRevocationIntents = useCallback(async () => {
+    try {
+      const intents: DeviceRevocationSummary[] = [];
+      let after: OperationId | null = null;
+      for (;;) {
+        const page = await gateway.deviceRevocationIntents(after);
+        if (page.length === 0) break;
+        if (intents.length + page.length > 4_096) {
+          throw new Error('device revocation intent limit exceeded');
+        }
+        intents.push(...page);
+        after = page[page.length - 1].operationId;
+      }
+      setRevocationIntents(intents);
+    } catch {
+      setError('Saved revocation attempts could not be loaded.');
+    }
+  }, [gateway]);
+
   useEffect(() => {
     void loadDevices();
-  }, [loadDevices]);
+    void loadRevocationIntents();
+  }, [loadDevices, loadRevocationIntents]);
 
   useEffect(() => {
     if (!invite) return;
@@ -352,6 +384,83 @@ export function DevicesScreen({
     }
   }
 
+  function openRevocation(device: DeviceSummary, trigger: HTMLButtonElement) {
+    revocationTriggerRef.current = trigger;
+    setRevocationTarget(device);
+    setRevocationOperationId(null);
+    setRevocationStatus(null);
+    setError(null);
+    revocationDialogRef.current?.showModal();
+  }
+
+  function openSavedRevocation(intent: DeviceRevocationSummary, trigger: HTMLButtonElement) {
+    revocationTriggerRef.current = trigger;
+    setRevocationTarget(devices.find((device) => device.deviceId === intent.deviceId) ?? null);
+    setRevocationOperationId(intent.operationId);
+    setRevocationStatus(intent);
+    setError(null);
+    revocationDialogRef.current?.showModal();
+  }
+
+  async function applyRevocationStatus(status: DeviceRevocationStatus) {
+    setRevocationStatus(status);
+    setRevocationIntents((current) => {
+      const existing = current.findIndex((intent) => intent.operationId === status.operationId);
+      if (existing < 0) {
+        return [...current, status].sort((left, right) =>
+          left.operationId.localeCompare(right.operationId),
+        );
+      }
+      return current.map((intent, index) => index === existing ? status : intent);
+    });
+    if (status.outcome.state === 'accepted') {
+      await loadDevices();
+    }
+  }
+
+  async function revokeDevice() {
+    if (!revocationTarget) return;
+    const operationId = revocationOperationId ?? uuidV7() as OperationId;
+    setRevocationOperationId(operationId);
+    setWorking(true);
+    setError(null);
+    try {
+      await applyRevocationStatus(
+        await gateway.revokeDevice(operationId, revocationTarget.deviceId as DeviceId),
+      );
+    } catch (cause) {
+      setError(safePairingError(cause, 'The revocation request could not be confirmed.'));
+    } finally {
+      setWorking(false);
+    }
+  }
+
+  async function refreshRevocation() {
+    if (!revocationOperationId) return;
+    setWorking(true);
+    setError(null);
+    try {
+      await applyRevocationStatus(await gateway.deviceRevocationStatus(revocationOperationId));
+    } catch (cause) {
+      setError(safePairingError(cause, 'The revocation status could not be refreshed.'));
+    } finally {
+      setWorking(false);
+    }
+  }
+
+  async function cancelRevocation() {
+    if (!revocationOperationId) return;
+    setWorking(true);
+    setError(null);
+    try {
+      await applyRevocationStatus(await gateway.cancelDeviceRevocation(revocationOperationId));
+    } catch (cause) {
+      setError(safePairingError(cause, 'Future revocation sends could not be stopped.'));
+    } finally {
+      setWorking(false);
+    }
+  }
+
   return (
     <section className="screen-content devices-screen" aria-labelledby="trusted-devices-title">
       <section className="trusted-devices" aria-labelledby="trusted-devices-title">
@@ -368,18 +477,59 @@ export function DevicesScreen({
                     {platformName(device.platform)} · {device.state === 'active' ? 'Trusted' : 'Revoked'}
                   </p>
                 </div>
-                {device.isCurrent && <span className="device-tag">Current device</span>}
+                <div>
+                  {device.isCurrent && <span className="device-tag">Current device</span>}
+                  {device.state === 'active' && (
+                    <button
+                      aria-label={`Revoke ${device.name}`}
+                      className="secondary-action"
+                      onClick={(event) => openRevocation(device, event.currentTarget)}
+                      type="button"
+                    >
+                      Revoke
+                    </button>
+                  )}
+                </div>
               </li>
             ))}
           </ul>
         )}
       </section>
 
+      {revocationIntents.length > 0 && (
+        <section className="trusted-devices" aria-labelledby="saved-revocations-title">
+          <h2 id="saved-revocations-title">Saved revocation attempts</h2>
+          <ul className="device-list">
+            {revocationIntents.map((intent) => {
+              const device = devices.find((candidate) => candidate.deviceId === intent.deviceId);
+              const deviceName = device?.name ?? intent.deviceId;
+              return (
+                <li className="device-row" key={intent.operationId}>
+                  <div>
+                    <h3>{deviceName}</h3>
+                    <p className="device-meta">{revocationStatusMessage(intent)}</p>
+                  </div>
+                  <button
+                    aria-label={`Review saved revocation for ${deviceName}`}
+                    className="secondary-action"
+                    onClick={(event) => openSavedRevocation(intent, event.currentTarget)}
+                    type="button"
+                  >
+                    Review
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        </section>
+      )}
+
       <RecoveryEnrollmentPanel
         gateway={gateway}
         onComplete={loadDevices}
         pollIntervalMs={pollIntervalMs}
       />
+      <RecoveryRestorePanel gateway={gateway} onComplete={loadDevices} />
 
       <section className="pairing-workspace" aria-labelledby="pair-device-title">
         <div>
@@ -599,8 +749,86 @@ export function DevicesScreen({
           </button>
         </div>
       </dialog>
+
+      <dialog
+        aria-labelledby="device-revocation-title"
+        onClose={() => revocationTriggerRef.current?.focus()}
+        ref={revocationDialogRef}
+      >
+        <h2 id="device-revocation-title">Revoke device</h2>
+        {revocationTarget && (
+          <>
+            <p>{revocationTarget.name} will lose access to this account and future workspace keys.</p>
+            {revocationTarget.isCurrent && (
+              <p>The current device will immediately lose access after the revocation is accepted.</p>
+            )}
+            {devices.filter((device) => device.state === 'active').length === 1 && (
+              <p>This is the last trusted device. Recovery will be required to regain access.</p>
+            )}
+          </>
+        )}
+        {revocationStatus && (
+          <p aria-live="polite" role="status">{revocationStatusMessage(revocationStatus)}</p>
+        )}
+        <div className="pairing-dialog-actions">
+          {revocationStatus?.outcome.state !== 'accepted' &&
+            revocationStatus?.outcome.state !== 'conflict' &&
+            revocationStatus?.outcome.state !== 'canceled_before_send' && (
+            <button
+              className="primary-action"
+              disabled={working || revocationStatus?.sendCanceled}
+              onClick={() => void revokeDevice()}
+              type="button"
+            >
+              {revocationOperationId ? 'Retry revocation' : 'Revoke device'}
+            </button>
+          )}
+          {revocationOperationId && (
+            <button
+              className="secondary-action"
+              disabled={working}
+              onClick={() => void refreshRevocation()}
+              type="button"
+            >
+              Check revocation status
+            </button>
+          )}
+          {revocationOperationId && !revocationStatus?.sendCanceled &&
+            revocationStatus?.outcome.state !== 'accepted' &&
+            revocationStatus?.outcome.state !== 'conflict' &&
+            revocationStatus?.outcome.state !== 'canceled_before_send' && (
+            <button
+              className="secondary-action"
+              disabled={working}
+              onClick={() => void cancelRevocation()}
+              type="button"
+            >
+              Stop future sends
+            </button>
+          )}
+          <button
+            className="secondary-action"
+            disabled={working}
+            onClick={() => revocationDialogRef.current?.close()}
+            type="button"
+          >
+            Close
+          </button>
+        </div>
+      </dialog>
     </section>
   );
+}
+
+function revocationStatusMessage(status: DeviceRevocationStatus) {
+  switch (status.outcome.state) {
+    case 'prepared': return 'The revocation is prepared and has not been submitted.';
+    case 'submitting': return 'The revocation is being submitted.';
+    case 'unconfirmed': return 'The revocation outcome is not confirmed.';
+    case 'accepted': return 'Revocation accepted.';
+    case 'conflict': return 'The revocation conflicted with a newer membership change.';
+    case 'canceled_before_send': return 'The revocation was canceled before it was sent.';
+  }
 }
 
 function RecoveryEnrollmentPanel({
@@ -618,6 +846,7 @@ function RecoveryEnrollmentPanel({
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [working, setWorking] = useState(false);
   const [unavailable, setUnavailable] = useState(false);
+  const [statusRetryNeeded, setStatusRetryNeeded] = useState(false);
   const [lostChallengeCleanupFailed, setLostChallengeCleanupFailed] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -634,6 +863,7 @@ function RecoveryEnrollmentPanel({
   const applyRecoveryStatus = useCallback(
     async (nextStatus: RecoveryEnrollmentStatus) => {
       if (!mountedRef.current) return;
+      setStatusRetryNeeded(false);
       setStatus(nextStatus);
       switch (nextStatus.state) {
         case 'idle':
@@ -702,23 +932,29 @@ function RecoveryEnrollmentPanel({
     [clearChallenge, gateway, onComplete],
   );
 
+  const refreshRecoveryStatus = useCallback(async () => {
+    try {
+      const nextStatus = await gateway.recoveryEnrollmentOverview();
+      if (!mountedRef.current) return null;
+      await applyRecoveryStatus(nextStatus);
+      return nextStatus;
+    } catch (cause) {
+      if (!mountedRef.current) return null;
+      if (isClientError(cause, 'harness_unsupported')) {
+        setUnavailable(true);
+        setStatus(null);
+        setError(null);
+      } else {
+        setStatusRetryNeeded(true);
+        setError('Recovery status could not be loaded. Retry to check the saved setup.');
+      }
+      return null;
+    }
+  }, [applyRecoveryStatus, gateway]);
+
   useEffect(() => {
     mountedRef.current = true;
-    void gateway
-      .recoveryEnrollmentOverview()
-      .then((nextStatus) => {
-        if (mountedRef.current) void applyRecoveryStatus(nextStatus);
-      })
-      .catch((cause) => {
-        if (!mountedRef.current) return;
-        if (isClientError(cause, 'harness_unsupported')) {
-          setUnavailable(true);
-          setStatus(null);
-          setError(null);
-        } else {
-          setError('Recovery status could not be loaded.');
-        }
-      });
+    void refreshRecoveryStatus();
 
     return () => {
       mountedRef.current = false;
@@ -728,7 +964,7 @@ function RecoveryEnrollmentPanel({
         void gateway.recoveryEnrollmentCancel(activeChallenge.enrollmentId).catch(() => undefined);
       }
     };
-  }, [applyRecoveryStatus, gateway]);
+  }, [refreshRecoveryStatus, gateway]);
 
   useEffect(() => {
     if (!challenge) return;
@@ -757,7 +993,10 @@ function RecoveryEnrollmentPanel({
           if (!stopped) void applyRecoveryStatus(nextStatus);
         })
         .catch(() => {
-          if (!stopped) setError('Recovery status could not be refreshed.');
+          if (!stopped) {
+            setStatusRetryNeeded(true);
+            setError('Recovery status could not be refreshed.');
+          }
         });
     }, pollIntervalMs);
     return () => {
@@ -805,6 +1044,15 @@ function RecoveryEnrollmentPanel({
         return;
       }
       setError(safeRecoveryError(cause, 'Recovery setup could not begin.'));
+    } finally {
+      if (mountedRef.current) setWorking(false);
+    }
+  }
+
+  async function retryRecoveryStatus() {
+    setWorking(true);
+    try {
+      await refreshRecoveryStatus();
     } finally {
       if (mountedRef.current) setWorking(false);
     }
@@ -858,9 +1106,12 @@ function RecoveryEnrollmentPanel({
     } catch (cause) {
       if (!mountedRef.current) return;
       clearChallenge();
-      setStatus(idleRecoveryStatus());
+      setStatus(null);
       setMessage(null);
-      setError(safeRecoveryError(cause, 'Recovery confirmation failed. Start setup again.'));
+      const refreshed = await refreshRecoveryStatus();
+      if (mountedRef.current && refreshed?.state === 'idle') {
+        setError(safeRecoveryError(cause, 'Recovery confirmation failed. Start setup again.'));
+      }
     } finally {
       if (mountedRef.current) setWorking(false);
     }
@@ -902,6 +1153,17 @@ function RecoveryEnrollmentPanel({
           type="button"
         >
           Set up recovery
+        </button>
+      )}
+
+      {!unavailable && statusRetryNeeded && (
+        <button
+          className="secondary-action"
+          disabled={working}
+          onClick={() => void retryRecoveryStatus()}
+          type="button"
+        >
+          Retry recovery status
         </button>
       )}
 

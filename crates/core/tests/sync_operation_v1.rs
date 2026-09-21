@@ -439,6 +439,7 @@ fn signed_tombstone_fixture_unchecked(
 
 fn identity<'a>(keys: &'a DeviceKeys, content_key: &'a ContentKey) -> SyncIdentity<'a> {
     SyncIdentity {
+        membership_endpoint: None,
         account_id: id(PRIMARY_ID),
         workspace_id: id(OTHER_ID),
         device_id: id(PRIMARY_ID),

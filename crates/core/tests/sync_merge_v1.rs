@@ -596,6 +596,7 @@ fn exact_replay_advances_only_the_monotonic_cursor() {
             "memory",
             "2026-08-06T02:00:00Z",
             admitted.operation().operation_id,
+            None,
         )
         .unwrap();
 
@@ -910,6 +911,7 @@ fn build(
 ) -> context_relay_core::sync::BuiltOperation {
     let key = ContentKey::from_bytes(CONTENT_KEY);
     OperationBuilder::new(SyncIdentity {
+        membership_endpoint: None,
         account_id: id(ID_1),
         workspace_id: id(ID_2),
         device_id: device.certificate.device_id,

@@ -1,0 +1,37 @@
+name: Windows firewall diagnostic
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/windows-firewall-diagnostic.yml'
+      - 'third_party/sidecars/semgrep/diagnose-windows-firewall.ps1'
+      - 'third_party/sidecars/semgrep/windows-offline-firewall.ps1'
+      - 'third_party/sidecars/semgrep/build-public-source-windows.ps1'
+      - 'scripts/windows-firewall-diagnostic.test.mjs'
+permissions:
+  contents: read
+jobs:
+  diagnostic:
+    runs-on: windows-2022
+    timeout-minutes: 10
+    env:
+      CONTEXT_RELAY_RUNNER_IMAGE: windows-2022
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version-file: .node-version
+      - name: Check bounded diagnostic metadata
+        shell: pwsh
+        run: node --test scripts/windows-firewall-diagnostic.test.mjs
+      - name: Observe short isolated window and restore policies
+        shell: pwsh
+        run: ./third_party/sidecars/semgrep/diagnose-windows-firewall.ps1 -OutputRoot "$env:RUNNER_TEMP/firewall-diagnostic"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: windows-firewall-diagnostic
+          path: ${{ runner.temp }}/firewall-diagnostic/firewall-diagnostic.v1.json
+          if-no-files-found: warn
+          retention-days: 7

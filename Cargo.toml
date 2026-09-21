@@ -12,7 +12,7 @@ resolver = "3"
 
 [workspace.package]
 edition = "2024"
-version = "0.1.0"
+version = "0.1.1"
 license = "Apache-2.0"
 repository = "https://github.com/Skytuhua/Context-Relay"
 rust-version = "1.97"
@@ -25,6 +25,7 @@ chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 dirs = "6.0.0"
 ed25519-dalek = { version = "2.2.0", features = ["zeroize"] }
 fastembed = { version = "=5.17.3", default-features = false, features = ["ort-load-dynamic"] }
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic"] }
 hkdf = "0.12.4"
 hmac = "0.12.1"
 keyring = { version = "=4.1.5", default-features = false, features = ["v1"] }
@@ -46,4 +47,5 @@ unicode-casefold = "0.2.0"
 uuid = { version = "1.18.1", features = ["serde", "std", "v7"] }
 windows-sys = "0.61.2"
 x25519-dalek = { version = "2.0.1", features = ["static_secrets", "zeroize"] }
+zip = { version = "=8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 zeroize = "1.8.2"
