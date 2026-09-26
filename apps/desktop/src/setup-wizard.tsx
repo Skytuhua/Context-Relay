@@ -34,6 +34,9 @@ export function SetupWizard({ gateway, projects, progress, onChange, onProjectSa
   const [projectBusy, setProjectBusy] = useState(false);
   const [activeHarness, setActiveHarness] = useState<HarnessId>('codex');
   const [setupStates, setSetupStates] = useState<Partial<Record<HarnessId, string>>>({});
+  // Tracked separately from the label because the label is presentational text and
+  // the wizard's gate needs the actual saved state.
+  const [appliedHarnesses, setAppliedHarnesses] = useState<Partial<Record<HarnessId, boolean>>>({});
   const heading = useRef<HTMLHeadingElement>(null);
   const index = STEPS.findIndex(step => step.id === progress.step);
   useEffect(() => {
@@ -41,15 +44,19 @@ export function SetupWizard({ gateway, projects, progress, onChange, onProjectSa
     let active = true;
     const controller = new AbortController();
     setSetupStates({});
+    setAppliedHarnesses({});
     void projectHarnessSetups(gateway, progress.projectId, controller.signal).then(records => {
       if (!active) return;
       const next: Partial<Record<HarnessId, string>> = {};
+      const applied: Partial<Record<HarnessId, boolean>> = {};
       for (const record of records) {
         if (record.harness === 'hermes' && record.harnessProfile !== progress.hermesProfile) continue;
         next[record.harness] = record.state === 'applied' ? 'Settings saved · test next' : record.state === 'previewed' ? 'Review ready · save next' : record.state === 'rolled_back' ? 'Setup undone' : 'Needs review';
+        applied[record.harness] = record.state === 'applied';
       }
       setSetupStates(next);
-    }).catch(() => { if (active) setSetupStates({}); });
+      setAppliedHarnesses(applied);
+    }).catch(() => { if (active) { setSetupStates({}); setAppliedHarnesses({}); } });
     return () => { active = false; controller.abort(); };
   }, [gateway, progress.step, progress.projectId, progress.hermesProfile, operationBusy]);
   const project = projects.find(item => item.projectId === progress.projectId);
@@ -70,9 +77,15 @@ export function SetupWizard({ gateway, projects, progress, onChange, onProjectSa
 
   function update(patch: Partial<SetupProgress>) { onChange({ ...progress, ...patch, status: 'in_progress' }); }
   function step(id: SetupStep) { update({ step: id }); }
+  // Leaving this step requires settings actually saved for a selected harness.
+  // Advancing without saving reaches the test step, where Continue depends on a
+  // verified read that no connected harness can produce, leaving the wizard
+  // permanently blocked with no explanation.
+  const connected = progress.harnesses.some(id => appliedHarnesses[id]);
   const canContinue = !projectBusy && (progress.step === 'harnesses' ? progress.harnesses.length > 0
-    : progress.step === 'project' || progress.step === 'connect' ? !!project && progress.harnesses.length > 0
-      : progress.step === 'test' ? testComplete : true);
+    : progress.step === 'project' ? !!project
+      : progress.step === 'connect' ? !!project && connected
+        : progress.step === 'test' ? testComplete : true);
 
   return <div className="onboarding-shell">
     <aside className="onboarding-rail">
