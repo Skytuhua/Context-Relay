@@ -1,13 +1,17 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { access, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import test from 'node:test';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createRequire } from 'node:module';
 
 const desktopRequire = createRequire(new URL('../apps/desktop/package.json', import.meta.url));
-const { load: parseYaml } = createRequire(desktopRequire.resolve('eslint'))('js-yaml');
+// Resolve js-yaml from the package that declares it. Resolving it through
+// eslint's directory relied on a transitive edge that pnpm's isolated layout
+// does not provide, so this module failed to load and the gate never ran.
+const { load: parseYaml } = desktopRequire('js-yaml');
 
 const workflowDirectoryUrl = new URL('../.github/workflows/', import.meta.url);
 const ciWorkflowUrl = new URL('../.github/workflows/ci.yml', import.meta.url);
@@ -82,8 +86,22 @@ function git(workspace, ...args) {
   return execFileSync('git', args, { cwd: workspace, encoding: 'utf8' }).trim();
 }
 
+// The workflow this test inspects runs its whitespace gate under bash. CI is
+// Linux, where /bin/bash always exists; developers on Windows need Git Bash so
+// the gate can be reproduced locally before pushing.
+function posixBash() {
+  if (process.platform !== 'win32') return '/bin/bash';
+  for (const candidate of [
+    'C:/Program Files/Git/bin/bash.exe',
+    'C:/Program Files (x86)/Git/bin/bash.exe',
+  ]) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return '/bin/bash';
+}
+
 function runWhitespaceCheck(script, workspace, event) {
-  return spawnSync('/bin/bash', ['--noprofile', '--norc', '-c', script], {
+  return spawnSync(posixBash(), ['--noprofile', '--norc', '-c', script], {
     cwd: workspace,
     encoding: 'utf8',
     env: {
