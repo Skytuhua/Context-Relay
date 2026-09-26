@@ -390,6 +390,7 @@ export function DevicesScreen({
     setRevocationOperationId(null);
     setRevocationStatus(null);
     setError(null);
+    setDialogError(null);
     revocationDialogRef.current?.showModal();
   }
 
@@ -399,6 +400,7 @@ export function DevicesScreen({
     setRevocationOperationId(intent.operationId);
     setRevocationStatus(intent);
     setError(null);
+    setDialogError(null);
     revocationDialogRef.current?.showModal();
   }
 
@@ -418,18 +420,24 @@ export function DevicesScreen({
     }
   }
 
+  // Revocation and pairing-decision failures happen inside a modal. The
+  // workspace-level error renders above the dialog, so a rejected request left
+  // the dialog unchanged with no visible feedback and invited a second attempt.
+  const [dialogError, setDialogError] = useState<string | null>(null);
+
   async function revokeDevice() {
     if (!revocationTarget) return;
     const operationId = revocationOperationId ?? uuidV7() as OperationId;
     setRevocationOperationId(operationId);
     setWorking(true);
     setError(null);
+    setDialogError(null);
     try {
       await applyRevocationStatus(
         await gateway.revokeDevice(operationId, revocationTarget.deviceId as DeviceId),
       );
     } catch (cause) {
-      setError(safePairingError(cause, 'The revocation request could not be confirmed.'));
+      setDialogError(safePairingError(cause, 'The revocation request could not be confirmed.'));
     } finally {
       setWorking(false);
     }
@@ -439,10 +447,11 @@ export function DevicesScreen({
     if (!revocationOperationId) return;
     setWorking(true);
     setError(null);
+    setDialogError(null);
     try {
       await applyRevocationStatus(await gateway.deviceRevocationStatus(revocationOperationId));
     } catch (cause) {
-      setError(safePairingError(cause, 'The revocation status could not be refreshed.'));
+      setDialogError(safePairingError(cause, 'The revocation status could not be refreshed.'));
     } finally {
       setWorking(false);
     }
@@ -452,10 +461,11 @@ export function DevicesScreen({
     if (!revocationOperationId) return;
     setWorking(true);
     setError(null);
+    setDialogError(null);
     try {
       await applyRevocationStatus(await gateway.cancelDeviceRevocation(revocationOperationId));
     } catch (cause) {
-      setError(safePairingError(cause, 'Future revocation sends could not be stopped.'));
+      setDialogError(safePairingError(cause, 'Future revocation sends could not be stopped.'));
     } finally {
       setWorking(false);
     }
@@ -770,6 +780,7 @@ export function DevicesScreen({
         {revocationStatus && (
           <p aria-live="polite" role="status">{revocationStatusMessage(revocationStatus)}</p>
         )}
+        {dialogError && <p className="form-error" role="alert">{dialogError}</p>}
         <div className="pairing-dialog-actions">
           {revocationStatus?.outcome.state !== 'accepted' &&
             revocationStatus?.outcome.state !== 'conflict' &&
