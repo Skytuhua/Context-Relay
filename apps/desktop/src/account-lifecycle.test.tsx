@@ -88,7 +88,8 @@ it('pages history explicitly without sending any mutation', async () => {
   api.accountDeletionIntents.mockResolvedValueOnce(page).mockResolvedValue([]);
   render(<AccountLifecyclePanel gateway={api} />);
   fireEvent.click(await screen.findByRole('button', { name: 'Next requests' }));
-  await screen.findByText('No previous requests on this page.');
+  // Matches as a prefix: the empty state may add a hint about earlier pages.
+  await screen.findByText(/^No previous requests on this page\./);
   expect(api.accountDeletionIntents).toHaveBeenLastCalledWith(page[49].operationId);
   expect(api.accountDeletionBegin).not.toHaveBeenCalled();
   expect(api.accountDeletionCancel).not.toHaveBeenCalled();
