@@ -7,9 +7,17 @@ type Gateway = Pick<WorkspaceGateway, 'accountDeletionStatus' | 'accountDeletion
 type Status = Extract<LocalResult, { kind: 'account_deletion' }>['data'];
 type Selection = { action: AccountLifecycleIntentAction; operationId?: OperationId };
 
+// The daemon returns a bare list with no continuation cursor, so a page shorter
+// than this is the only available signal that the history is exhausted.
+const HISTORY_PAGE_SIZE = 50;
+
 export function AccountLifecyclePanel({ gateway }: { gateway: Gateway }) {
   const [status, setStatus] = useState<Status | null>(null);
   const [intents, setIntents] = useState<AccountDeletionIntentSummary[]>([]);
+  // Cursors of the pages already visited, oldest first. Without this the only
+  // navigation is forward: read() replaces the list, so the request the user
+  // came here to retry is gone the moment they page past it.
+  const [pageCursors, setPageCursors] = useState<(OperationId | null)[]>([]);
   const [historyReady, setHistoryReady] = useState(false);
   const [selection, setSelection] = useState<Selection | null>(null);
   const [confirmation, setConfirmation] = useState('');
@@ -37,7 +45,10 @@ export function AccountLifecyclePanel({ gateway }: { gateway: Gateway }) {
       if (epoch.current !== current) return;
       setStatus(remote.status === 'fulfilled' ? remote.value : null);
       setHistoryReady(history.status === 'fulfilled');
-      if (history.status === 'fulfilled') setIntents(history.value);
+      if (history.status === 'fulfilled') {
+        setIntents(history.value);
+        setPageCursors(pages => (after === null ? [null] : pages.includes(after) ? pages : [...pages, after]));
+      }
       if (remote.status === 'rejected') {
         const cause: unknown = remote.reason;
         setError(cause && typeof cause === 'object' && 'code' in cause && cause.code === 'harness_unsupported'
@@ -54,7 +65,7 @@ export function AccountLifecyclePanel({ gateway }: { gateway: Gateway }) {
   useEffect(() => {
     epoch.current += 1;
     working.current = false;
-    setStatus(null); setIntents([]); setHistoryReady(false); setSelection(null); setConfirmation('');
+    setStatus(null); setIntents([]); setPageCursors([]); setHistoryReady(false); setSelection(null); setConfirmation('');
     void read(null);
     return () => { epoch.current += 1; working.current = false; };
   }, [read]);
@@ -104,8 +115,14 @@ export function AccountLifecyclePanel({ gateway }: { gateway: Gateway }) {
     </fieldset>}
     <h3>Previous requests</h3>
     <p>These show what you requested, not whether the provider completed it. Refresh reads current status without retrying a request.</p>
-    {historyReady && intents.length === 0 && <p>No previous requests on this page.</p>}
+    {historyReady && intents.length === 0 && <p>No previous requests on this page.{pageCursors.length > 1 ? ' Go back to see earlier ones.' : ''}</p>}
     <ul>{intents.map(intent => <li key={intent.operationId}><button type="button" disabled={busy} onClick={() => review(intent)}>Review {intent.action === 'beginDeletion' ? 'deletion' : 'cancel'} request {intent.operationId}</button></li>)}</ul>
-    {historyReady && intents.length === 50 && <button type="button" disabled={busy} onClick={() => void read(intents[intents.length - 1].operationId)}>Next requests</button>}
+    {historyReady && (
+      <div className="pagination">
+        {pageCursors.length > 1 && <button type="button" disabled={busy} onClick={() => void read(pageCursors[pageCursors.length - 2])}>Previous requests</button>}
+        {intents.length === HISTORY_PAGE_SIZE && <button type="button" disabled={busy} onClick={() => void read(intents[intents.length - 1].operationId)}>Next requests</button>}
+        {pageCursors.length > 1 && <span>Showing page {pageCursors.length}</span>}
+      </div>
+    )}
   </section>;
 }
