@@ -26,6 +26,7 @@ import { useSearchProgress } from './use-search-progress';
 import { useScopedEditor } from './use-scoped-editor';
 import { isServiceVersionMismatch, SERVICE_UPDATE_GUIDANCE } from './service-error';
 import { LocalWorkspaceGateway, RecoveryStorageFullError, type WorkspaceGateway } from './workspace';
+import { ErrorBoundary } from './error-boundary';
 
 type ScreenId =
   | 'home'
@@ -756,16 +757,16 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
           </div>}
           {saving && SAVE_MESSAGES[saving] && <p role="status">{SAVE_MESSAGES[saving]}</p>}
           {recordsLoading && <p role="status">Loading your saved records…</p>}
-          {renderScreen(activeScreen)}
-          {recoveryStorageFull && activeScreen !== 'home' && <WriteRecovery gateway={gateway} projects={projects} onBusy={recoveryBusy} onConfirmed={() => {
+          <ErrorBoundary label={currentScreen.label}>{renderScreen(activeScreen)}</ErrorBoundary>
+          {recoveryStorageFull && activeScreen !== 'home' && <ErrorBoundary label="Write recovery"><WriteRecovery gateway={gateway} projects={projects} onBusy={recoveryBusy} onConfirmed={() => {
             if (activeScreen === 'memory' || activeScreen === 'tasks') refreshSavedRecords(activeScreen === 'memory' ? 'memory' : 'task', activeProject?.projectId ?? null);
             else if (activeScreen === 'review') refreshSavedRecords('review', activeProject?.projectId ?? null);
-          }} />}
+          }} /></ErrorBoundary>}
           <div hidden={activeScreen !== 'harnesses'}>
-            <HarnessesScreen gateway={gateway} projects={projects} preferredProjectId={activeProject?.projectId} onProjectChange={(id) => {
+            <ErrorBoundary label="Harnesses"><HarnessesScreen gateway={gateway} projects={projects} preferredProjectId={activeProject?.projectId} onProjectChange={(id) => {
               const project = projects.find((item) => item.projectId === id);
               if (project) selectProject(project);
-            }} onAddProject={() => void selectScreen('projects')} onSaveContext={() => { setCreatingContext(true); setEditingMemory(null); void selectScreen('memory'); }} active={activeScreen === 'harnesses'} />
+            }} onAddProject={() => void selectScreen('projects')} onSaveContext={() => { setCreatingContext(true); setEditingMemory(null); void selectScreen('memory'); }} active={activeScreen === 'harnesses'} /></ErrorBoundary>
           </div>
           </div>
         </main>
