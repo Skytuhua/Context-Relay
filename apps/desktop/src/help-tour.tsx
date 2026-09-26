@@ -36,7 +36,7 @@ export function DashboardTour({ step, onStep, onClose, onNavigate }: {
     <div className="form-actions">
       <button onClick={() => onNavigate(part.screen)}>{part.action}</button>
       <button disabled={index === 0} onClick={() => onStep(index - 1)}>Back</button>
-      {index < 4 ? <button className="primary" onClick={() => onStep(index + 1)}>Next</button> : <button className="primary" onClick={onClose}>Finish tour</button>}
+      {index < 4 ? <button className="primary-action" onClick={() => onStep(index + 1)}>Next</button> : <button className="primary-action" onClick={onClose}>Finish tour</button>}
       <button onClick={onClose}>Skip tour</button>
     </div>
   </aside>;
