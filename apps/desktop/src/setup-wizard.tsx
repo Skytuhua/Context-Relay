@@ -6,6 +6,16 @@ import type { WorkspaceGateway } from './workspace';
 import { HARNESS_NAMES } from './harness-names';
 import { projectHarnessSetups } from './harness-history';
 
+// A disabled Continue tells a first-time user nothing about what to do next, and
+// the three blocked steps need different instructions.
+const BLOCKED_REASON: Record<SetupStep, string> = {
+  harnesses: 'Choose at least one harness to continue.',
+  project: 'Choose the folder you work in to continue.',
+  connect: 'Review and save settings for at least one harness to continue.',
+  test: 'Continue unlocks once your harness reads the test note. Open the harness, send the test prompt, then return here.',
+  tour: '',
+};
+
 const STEPS: { id: SetupStep; label: string }[] = [
   { id: 'harnesses', label: 'Choose harnesses' }, { id: 'project', label: 'Choose a project' },
   { id: 'connect', label: 'Connect harnesses' }, { id: 'test', label: 'Try saved context' },
@@ -78,9 +88,16 @@ export function SetupWizard({ gateway, projects, progress, onChange, onProjectSa
     <aside className="onboarding-rail">
       <p className="brand-name">Context Relay</p>
       <p>Context that follows your work.</p>
-      <ol aria-label="Setup progress">{STEPS.map((item, stepIndex) => <li key={item.id} aria-current={progress.step === item.id ? 'step' : undefined}>
-        <span aria-hidden="true">{stepIndex + 1}</span><span>{item.label}</span>
-      </li>)}</ol>
+      <ol aria-label="Setup progress">{STEPS.map((item, stepIndex) => {
+        // A user who left setup part way through needs to see which earlier steps
+        // are already done. styles.css styles [data-complete='true'], but
+        // nothing produced it, so every step rendered identically.
+        const complete = stepIndex < index || progress.status === 'complete';
+        return <li key={item.id} aria-current={progress.step === item.id ? 'step' : undefined} data-complete={complete}>
+          <span aria-hidden="true">{stepIndex + 1}</span><span>{item.label}</span>
+          {complete && <span className="visually-hidden"> (done)</span>}
+        </li>;
+      })}</ol>
       <p className="help-text">You can finish later. Your choices will be here when you return.</p>
     </aside>
     <main className="onboarding-content">
@@ -114,7 +131,7 @@ export function SetupWizard({ gateway, projects, progress, onChange, onProjectSa
         <p>Choose a project to continue. Your previous selection may no longer be available.</p><button type="button" onClick={() => step(progress.harnesses.length ? 'project' : 'harnesses')}>Choose a project</button>
       </section> : progress.step === 'connect' ? <section>
         <p>Connect each harness to <strong>{project.name}</strong>. Review the changes before saving. Approvals in the harness may still be required afterward.</p>
-        <div className="context-tabs" aria-label="Selected harnesses">{progress.harnesses.map(id => <button type="button" disabled={operationBusy} key={id} aria-pressed={harness === id} onClick={() => setActiveHarness(id)}><span>{HARNESS_NAMES[id]}</span><small>{setupStates[id] ?? 'Review setup'}</small></button>)}</div>
+        <div className="context-tabs" aria-label="Selected harnesses">{progress.harnesses.map(id => <button type="button" disabled={operationBusy} key={id} aria-pressed={harness === id} onClick={() => setActiveHarness(id)}><span>{HARNESS_NAMES[id]}</span><small>{setupStates[id] ?? 'Not connected yet'}</small></button>)}</div>
         {renderConnection(project, harness)}
       </section> : renderTest(project, progress.harnesses))}
       {progress.step === 'tour' && <section className="help-content">
@@ -125,6 +142,7 @@ export function SetupWizard({ gateway, projects, progress, onChange, onProjectSa
         <p className="help-text">You can replay the tour from Help at any time.</p>
       </section>}
       <footer className="onboarding-footer">
+        {!canContinue && !operationBusy && <p className="continue-hint" role="status">{BLOCKED_REASON[progress.step]}</p>}
         <button className="secondary-action" type="button" disabled={index === 0 || projectBusy || operationBusy} onClick={() => step(STEPS[index - 1].id)}>Back</button>
         <button className="secondary-action" type="button" disabled={projectBusy || operationBusy} onClick={onFinishLater}>Finish later</button>
         {index < STEPS.length - 1 && <button className="primary-action" type="button" disabled={!canContinue || operationBusy} onClick={() => step(STEPS[index + 1].id)}>Continue</button>}
