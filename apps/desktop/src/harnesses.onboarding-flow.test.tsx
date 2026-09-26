@@ -37,7 +37,20 @@ function fixture() {
       return current;
     }),
     harnessSetupGet: vi.fn(async () => record),
-    harnessSetupsList: vi.fn(async () => ({ setups: [], nextAfter: null })),
+    // Reflects the record the way the daemon does, so the wizard's connect gate
+    // sees the saved state after an apply.
+    harnessSetupsList: vi.fn(async () => ({
+      setups: [{
+        planId: record.plan.planId,
+        harness: record.plan.harness,
+        harnessProfile: record.plan.harnessProfile,
+        targetScopes: record.plan.targetScopes,
+        state: record.state,
+        createdAt: record.createdAt,
+        expiresAt: '1900003600000',
+      }],
+      nextAfter: null,
+    })),
     harnessProbe: vi.fn(async () => report),
     harnessPreview: vi.fn(async () => plan),
     createMemory: vi.fn(), createProject: vi.fn(), harnessApply: vi.fn(),
