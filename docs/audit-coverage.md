@@ -194,6 +194,31 @@ action's own text reaches 7.1:1 on its fill in dark and 6.0:1 in light. The acti
 boundary against the canvas clears the 3:1 requirement at 6.7:1 and 5.7:1. Every
 text-on-surface pairing required to clear 4.5:1 does.
 
+## Windows process management
+
+`crates/native-runner` had not been exercised at all before now. Running its
+suite turned up a real defect, in the tests rather than the runner: the
+`windows_management` assertions checked that a job object had already terminated
+a grandchild by sampling `WaitForSingleObject` with a zero timeout. Termination
+is asynchronous, so the sample raced it and failed about one run in ten.
+
+Two problems were fixed together in #41. The assertion now waits on the handle
+for up to ten seconds. And because `SERIAL.lock().unwrap()` poisons the shared
+mutex on panic, a single real failure was being reported as three; the guards now
+recover from poisoning so a panic fails only its own test.
+
+Measured over 30 consecutive runs each, on the same machine: 3 failing runs
+before, 0 after. No production code changed. I could not force the race on
+demand, so the comparison is the evidence rather than any single run.
+
+The rest of the crate is sound as written. `path_policy` rejects traversal,
+absolute paths, control characters, over-long components, Windows reserved names
+and trailing dots, and resolves collisions with platform-correct semantics: NFKC
+plus `CompareStringOrdinal` on Windows, NFD plus lowercase on macOS, failing
+closed if the comparison errors. `report_validation` checks scanner output with
+exact-key and closed-enum matching rather than allowlists of expected values, and
+all three of its public validators have dedicated tests.
+
 ## Not yet reviewed
 
 Nothing in the audit scope is still unreviewed. What remains is narrower than the
