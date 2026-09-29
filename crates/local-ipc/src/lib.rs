@@ -1,6 +1,10 @@
 mod auth;
 mod connection;
 mod frame;
+#[cfg(any(windows, test))]
+mod pipe_connect;
+#[cfg(windows)]
+mod shutdown;
 mod transport;
 
 #[cfg(test)]
@@ -17,6 +21,8 @@ pub use connection::{
 };
 pub use context_relay_protocol::MAX_IPC_FRAME_BYTES;
 pub use frame::{read_frame, read_json, write_frame, write_json};
+#[cfg(windows)]
+pub use shutdown::shutdown_running_daemon;
 pub use transport::{ConnectedStream, InstanceGuard, Listener, RuntimeConfig, connect};
 
 #[derive(Debug, thiserror::Error)]
@@ -51,11 +57,25 @@ pub enum IpcError {
     ProtocolVersionUnsupported,
     #[error("IPC request is invalid")]
     InvalidRequest,
+    #[error("Context Relay shutdown timed out")]
+    ShutdownTimeout,
 }
 
-pub const CONNECTION_LIMIT: usize = 32;
+// One connection per maximum MCP call and cancellation, plus a narrow control reserve.
+pub const CONNECTION_LIMIT: usize = 131;
 pub const REQUEST_QUEUE_CAPACITY: usize = 64;
 pub const RESPONSE_QUEUE_CAPACITY: usize = 64;
 pub const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 pub const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+const MCP_DISPATCHER_CONNECTION_BUDGET: usize = 64;
+const MCP_CANCELLATION_CONNECTION_BUDGET: usize = 64;
+// Desktop's ordinary and immediate-control channels, plus its recovery host.
+const CONTROL_CONNECTION_RESERVE: usize = 3;
+const _: () = assert!(
+    CONNECTION_LIMIT
+        >= MCP_DISPATCHER_CONNECTION_BUDGET
+            + MCP_CANCELLATION_CONNECTION_BUDGET
+            + CONTROL_CONNECTION_RESERVE
+);

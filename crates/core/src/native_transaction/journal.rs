@@ -8,13 +8,13 @@ use context_relay_protocol::PlanId;
 use super::{
     engine::{BeforeImage, BoundaryError, MutationOutcome, NativeJournal},
     model::{
-        ApprovedMutation, NativeApplyReceipt, NativeObjectToken, NativeTransactionPlan,
-        TransactionStep,
+        ApprovedCliMutation, ApprovedMutation, NativeApplyReceipt, NativeObjectToken,
+        NativeTransactionPlan, TransactionStep,
     },
 };
 use crate::vault::{
-    BeforeImagePolicy, BeforeImageWrite, NativePlanWrite, NativeSandboxIdentity, NativeWalState,
-    NativeWalWrite, Vault, VaultError,
+    BeforeImagePolicy, BeforeImageWrite, NativeCliWalState, NativeCliWalWrite, NativePlanWrite,
+    NativeSandboxIdentity, NativeWalState, NativeWalWrite, Vault, VaultError,
 };
 
 pub struct VaultNativeJournal<'a> {
@@ -28,6 +28,7 @@ pub struct VaultNativeJournal<'a> {
     before_image_policy: BeforeImagePolicy,
     plan_id: Option<PlanId>,
     before_images: Vec<BeforeImage>,
+    cli_no_write_sequences: Vec<u32>,
 }
 
 impl<'a> VaultNativeJournal<'a> {
@@ -51,6 +52,7 @@ impl<'a> VaultNativeJournal<'a> {
             before_image_policy,
             plan_id: None,
             before_images: Vec::new(),
+            cli_no_write_sequences: Vec::new(),
         }
     }
 
@@ -584,6 +586,138 @@ impl NativeJournal for VaultNativeJournal<'_> {
         ))
     }
 
+    fn prepare_cli_mutation(
+        &mut self,
+        index: usize,
+        mutation: &ApprovedCliMutation,
+    ) -> Result<(), BoundaryError> {
+        self.require_profile_lock()?;
+        let target = mutation
+            .expected
+            .as_ref()
+            .or(mutation.intended.as_ref())
+            .ok_or_else(|| BoundaryError::new("native CLI mutation has no declaration"))?;
+        let sequence = u32::try_from(index)
+            .map_err(|_| BoundaryError::new("native CLI mutation index exceeds u32"))?;
+        let forward = serde_json::to_vec(&mutation.forward)
+            .map_err(|error| BoundaryError::new(error.to_string()))?;
+        let rollback = serde_json::to_vec(&mutation.rollback)
+            .map_err(|error| BoundaryError::new(error.to_string()))?;
+        Self::boundary(
+            self.vault.prepare_native_cli_wal(
+                &self.transaction_id,
+                &NativeCliWalWrite {
+                    sequence,
+                    stable_id: &mutation.stable_id,
+                    harness: target.harness,
+                    server_name: &target.server_name,
+                    expected_declaration: mutation
+                        .expected
+                        .as_ref()
+                        .map(|declaration| declaration.canonical_body.as_bytes()),
+                    expected_fingerprint: mutation
+                        .expected
+                        .as_ref()
+                        .map(|declaration| &declaration.fingerprint),
+                    intended_declaration: mutation
+                        .intended
+                        .as_ref()
+                        .map(|declaration| declaration.canonical_body.as_bytes()),
+                    intended_fingerprint: mutation
+                        .intended
+                        .as_ref()
+                        .map(|declaration| &declaration.fingerprint),
+                    forward_operations: &forward,
+                    rollback_operations: &rollback,
+                },
+            ),
+        )
+    }
+
+    fn mark_cli_mutation_applied(
+        &mut self,
+        index: usize,
+        _mutation: &ApprovedCliMutation,
+    ) -> Result<(), BoundaryError> {
+        self.require_profile_lock()?;
+        let sequence = u32::try_from(index)
+            .map_err(|_| BoundaryError::new("native CLI mutation index exceeds u32"))?;
+        Self::boundary(self.vault.transition_native_cli_wal(
+            &self.transaction_id,
+            sequence,
+            NativeCliWalState::Applied,
+        ))
+    }
+
+    fn mark_cli_mutation_no_write(
+        &mut self,
+        index: usize,
+        mutation: &ApprovedCliMutation,
+    ) -> Result<(), BoundaryError> {
+        self.require_profile_lock()?;
+        let sequence = u32::try_from(index)
+            .map_err(|_| BoundaryError::new("native CLI mutation index exceeds u32"))?;
+        self.prepare_cli_mutation(index, mutation)?;
+        let record = Self::boundary(self.vault.native_cli_wal(&self.transaction_id))?
+            .into_iter()
+            .find(|record| record.sequence == sequence)
+            .ok_or_else(|| BoundaryError::new("native CLI no-write WAL row is missing"))?;
+        if record.state != NativeCliWalState::Prepared {
+            return Err(BoundaryError::new(
+                "native CLI no-write WAL row is not prepared",
+            ));
+        }
+        if !self.cli_no_write_sequences.contains(&sequence) {
+            self.cli_no_write_sequences.push(sequence);
+        }
+        Ok(())
+    }
+
+    fn prepare_cli_restore(
+        &mut self,
+        index: usize,
+        _mutation: &ApprovedCliMutation,
+    ) -> Result<(), BoundaryError> {
+        self.require_profile_lock()?;
+        let sequence = u32::try_from(index)
+            .map_err(|_| BoundaryError::new("native CLI mutation index exceeds u32"))?;
+        Self::boundary(self.vault.transition_native_cli_wal(
+            &self.transaction_id,
+            sequence,
+            NativeCliWalState::RestorePrepared,
+        ))
+    }
+
+    fn mark_cli_mutation_restored(
+        &mut self,
+        index: usize,
+        _mutation: &ApprovedCliMutation,
+    ) -> Result<(), BoundaryError> {
+        self.require_profile_lock()?;
+        let sequence = u32::try_from(index)
+            .map_err(|_| BoundaryError::new("native CLI mutation index exceeds u32"))?;
+        Self::boundary(self.vault.transition_native_cli_wal(
+            &self.transaction_id,
+            sequence,
+            NativeCliWalState::Restored,
+        ))
+    }
+
+    fn mark_cli_mutation_conflict(
+        &mut self,
+        index: usize,
+        _mutation: &ApprovedCliMutation,
+    ) -> Result<(), BoundaryError> {
+        self.require_profile_lock()?;
+        let sequence = u32::try_from(index)
+            .map_err(|_| BoundaryError::new("native CLI mutation index exceeds u32"))?;
+        Self::boundary(self.vault.transition_native_cli_wal(
+            &self.transaction_id,
+            sequence,
+            NativeCliWalState::Conflict,
+        ))
+    }
+
     fn prepare_compensation(&mut self) -> Result<(), BoundaryError> {
         self.require_profile_lock()?;
         Self::boundary(self.vault.begin_native_recovery(&self.transaction_id))?;
@@ -669,11 +803,38 @@ impl NativeJournal for VaultNativeJournal<'_> {
                 NativeWalState::Conflict => conflict = true,
             }
         }
-        Self::boundary(
-            self.vault
-                .finish_native_recovery(&self.transaction_id, conflict),
-        )?;
+        let mut cli_conflict = false;
+        for record in Self::boundary(self.vault.native_cli_wal(&self.transaction_id))? {
+            match record.state {
+                NativeCliWalState::Prepared
+                    if self.cli_no_write_sequences.contains(&record.sequence) => {}
+                NativeCliWalState::Prepared
+                | NativeCliWalState::Applied
+                | NativeCliWalState::RestorePrepared => {
+                    Self::boundary(self.vault.transition_native_cli_wal(
+                        &self.transaction_id,
+                        record.sequence,
+                        NativeCliWalState::Conflict,
+                    ))?;
+                    cli_conflict = true;
+                }
+                NativeCliWalState::Restored => {}
+                NativeCliWalState::Conflict => cli_conflict = true,
+            }
+        }
+        conflict |= cli_conflict;
+        Self::boundary(self.vault.finish_native_recovery_with_cli_no_write(
+            &self.transaction_id,
+            conflict,
+            &self.cli_no_write_sequences,
+        ))?;
         Self::boundary(self.vault.finish_native_cleanup(&self.transaction_id))?;
-        self.release_profile_lock()
+        self.release_profile_lock()?;
+        if cli_conflict {
+            return Err(BoundaryError::new(
+                "native CLI compensation encountered live divergence",
+            ));
+        }
+        Ok(())
     }
 }

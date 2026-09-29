@@ -7,7 +7,32 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+test-support = [
+  "context-relay-local-ipc/test-support",
+  "dep:context-relay-contextd",
+  "context-relay-contextd/test-support",
+]
+
 [dependencies]
+context-relay-contextd = { version = "0.1.0", path = "../contextd", optional = true }
 context-relay-local-ipc = { version = "0.1.0", path = "../local-ipc" }
 context-relay-protocol = { version = "0.1.0", path = "../protocol" }
-tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["io-std"] }
+uuid.workspace = true
+
+[dev-dependencies]
+sha2.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util", "process"] }
+
+[[example]]
+name = "codex-bridge-fixture"
+path = "tests/fixtures/codex-bridge-fixture.rs"
+required-features = ["test-support"]
+
+[target.'cfg(windows)'.dev-dependencies]
+dunce = "1.0.5"
+windows-sys = { workspace = true, features = ["Win32_Security", "Win32_System_JobObjects"] }

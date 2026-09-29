@@ -16,9 +16,6 @@ const PROBE_PORTS: [u16; 8] = [42831, 43197, 43921, 44777, 45263, 46183, 47221, 
 #[cfg(target_os = "macos")]
 const OUTSIDE_CLOSURE_CANARY: &str = ".context-relay-outside-closure-canary";
 #[cfg(target_os = "macos")]
-const EXPECTED_PROOF: &str = "ARGV_EXACT=1\nENV_EXACT=1\nFAKE_HOME_WRITE=1\nREAL_HOME_DENIED=1\nLOOPBACK_DENIED=1\nCLOSURE_DENIED=1\n";
-
-#[cfg(target_os = "macos")]
 #[allow(clippy::zombie_processes)] // The launcher under test must kill this inherited group child.
 fn main() {
     if env::args().nth(1).as_deref() == Some("--ordinary-child") {
@@ -45,16 +42,33 @@ fn main() {
         ];
     let root = env::current_dir().unwrap();
     let mode = fs::read_to_string(root.join("input/.rulesync/rules/probe.md")).unwrap();
-    assert!(argv_exact);
     if mode == "ESCAPE_HANG" {
-        assert!(unsafe { libc::setsid() } > 0);
+        let session = unsafe { libc::setsid() };
+        let session_errno = if session <= 0 {
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+        } else {
+            0
+        };
         let pid = unsafe { libc::getpid() };
         let pgid = unsafe { libc::getpgrp() };
-        fs::write(
+        let home_write = fs::write(
             PathBuf::from(env::var_os("HOME").unwrap()).join("ordinary-child.pid"),
             format!("{pid}\n{pgid}\n"),
         )
-        .unwrap();
+        .is_ok();
+        if session <= 0 || !home_write {
+            let output_path = root.join("output/.claude/rules/probe.md");
+            fs::create_dir_all(output_path.parent().unwrap()).unwrap();
+            fs::write(
+                output_path,
+                format!(
+                    "ESCAPE_SETSID={session}\nESCAPE_ERRNO={session_errno}\nESCAPE_HOME_WRITE={}\n",
+                    u8::from(home_write)
+                ),
+            )
+            .unwrap();
+            return;
+        }
         loop {
             std::thread::sleep(Duration::from_secs(60));
         }
@@ -112,9 +126,6 @@ fn main() {
         u8::from(loopback_denied),
         u8::from(closure_denied),
     );
-    if proof != EXPECTED_PROOF {
-        std::process::exit(3);
-    }
     let output_path = root.join("output/.claude/rules/probe.md");
     fs::create_dir_all(output_path.parent().unwrap()).unwrap();
     let output = creation_probe.map_or(proof.clone(), |creation_probe| {

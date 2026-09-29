@@ -243,6 +243,15 @@ fn verify_server_proof(
 
 #[test]
 fn challenged_hmac_matches_frozen_vector() {
+    // The protocol bytes are part of the authenticated transcript. These 1.17
+    // client/server vectors were independently checked with Python stdlib HMAC-SHA256.
+    assert_eq!(
+        PROTOCOL_VERSION,
+        ProtocolVersion {
+            major: 1,
+            minor: 17
+        }
+    );
     let (token, client_nonce, daemon_nonce, challenge) = auth_fixture();
     let proof = create_proof(
         &token,
@@ -255,7 +264,7 @@ fn challenged_hmac_matches_frozen_vector() {
 
     assert_eq!(
         serde_json::to_string(&proof).unwrap(),
-        r#""oisDq7GfjpXM9mivLFsEyrKgQglZHJF0dKLmTyQ1V8c""#
+        r#""1qXKEY6LA-7UsGcapNvVRKClen4p-XfxBd6BjBqRrR4""#
     );
     assert!(
         verify_proof(
@@ -439,6 +448,13 @@ fn auth_server_hello_is_strict_and_requires_a_32_byte_challenge() {
 
 #[test]
 fn server_auth_requires_the_installation_token_and_binds_the_client_proof() {
+    assert_eq!(
+        PROTOCOL_VERSION,
+        ProtocolVersion {
+            major: 1,
+            minor: 17
+        }
+    );
     let (token, client_nonce, daemon_nonce, challenge) = auth_fixture();
     let client_proof = create_proof(
         &token,
@@ -460,7 +476,7 @@ fn server_auth_requires_the_installation_token_and_binds_the_client_proof() {
 
     assert_eq!(
         serde_json::to_string(&server_proof).unwrap(),
-        r#""d6FWrHsVsBWAQH3RDwcC-cR0X_NOnvyYOzRcGVwo1yo""#
+        r#""QrC7s-X8532Ul_P4D3WOZz4HjVMbBJkcJBW23gzTrGY""#
     );
     assert!(
         verify_server_proof(
@@ -668,9 +684,32 @@ fn all_request_fixtures() -> Vec<(&'static str, LocalRequest)> {
     let bytes32 = URL_SAFE_NO_PAD.encode([0x11; 32]);
     let digest = "11".repeat(32);
     let empty = || serde_json::json!({});
-    let harness = || serde_json::json!({"harness": "codex", "projectId": null});
+    let harness =
+        || serde_json::json!({"harness": "codex", "projectId": null, "hermesProfile": null});
 
     vec![
+        (
+            "DesktopWritesList",
+            request_fixture("desktop_writes_list", serde_json::json!({"after": null})),
+        ),
+        (
+            "DesktopWriteGet",
+            request_fixture("desktop_write_get", serde_json::json!({"operationId": ID})),
+        ),
+        (
+            "DesktopWriteForget",
+            request_fixture(
+                "desktop_write_forget",
+                serde_json::json!({"operationId": ID}),
+            ),
+        ),
+        (
+            "DesktopWritePrepare",
+            request_fixture(
+                "desktop_write_prepare",
+                serde_json::json!({"write": {"method":"memory_archive","params":{"operationId": ID,"memoryId": ID,"expectedRevision": ID}}}),
+            ),
+        ),
         (
             "Hello",
             request_fixture(
@@ -688,8 +727,58 @@ fn all_request_fixtures() -> Vec<(&'static str, LocalRequest)> {
         ),
         ("Shutdown", request_fixture("shutdown", empty())),
         ("Health", request_fixture("health", empty())),
+        (
+            "McpCall",
+            request_fixture(
+                "mcp_call",
+                serde_json::json!({
+                    "binding": {
+                        "harness": "codex",
+                        "workingDirectory": {
+                            "platform": "macos",
+                            "bytes": "L3dvcmtzcGFjZQ",
+                            "display": "/workspace",
+                        },
+                    },
+                    "name": "context_relay_status",
+                    "arguments": {},
+                }),
+            ),
+        ),
+        (
+            "NativeHookEvent",
+            request_fixture(
+                "native_hook_event",
+                serde_json::json!({
+                    "binding": {
+                        "harness": "codex",
+                        "workingDirectory": {
+                            "platform": "macos",
+                            "bytes": "L3dvcmtzcGFjZQ",
+                            "display": "/workspace",
+                        },
+                    },
+                    "event": {"kind": "session_start", "session_id": "session-1"},
+                    "occurredAtMs": "1700000000123",
+                }),
+            ),
+        ),
         ("Unlock", request_fixture("unlock", empty())),
         ("ProjectsList", request_fixture("projects_list", empty())),
+        (
+            "ProjectUpsert",
+            request_fixture(
+                "project_upsert",
+                serde_json::json!({"project": {"projectId": ID, "githubRepositoryId": null, "gitRemoteFingerprint": null, "monorepoSubdirectory": null, "name": "Context Relay"}}),
+            ),
+        ),
+        (
+            "ProjectRegister",
+            request_fixture(
+                "project_register",
+                serde_json::json!({"project": {"projectId": ID, "githubRepositoryId": null, "gitRemoteFingerprint": null, "monorepoSubdirectory": null, "name": "Context Relay"}, "path": {"platform": "windows", "bytes": "", "display": null}}),
+            ),
+        ),
         (
             "ProjectPathSet",
             request_fixture(
@@ -703,6 +792,13 @@ fn all_request_fixtures() -> Vec<(&'static str, LocalRequest)> {
         (
             "MemoryGet",
             request_fixture("memory_get", serde_json::json!({"memoryId": ID})),
+        ),
+        (
+            "MemoryList",
+            request_fixture(
+                "memory_list",
+                serde_json::json!({"projectId": null, "includeArchived": false}),
+            ),
         ),
         (
             "MemorySearch",
@@ -831,6 +927,32 @@ fn all_request_fixtures() -> Vec<(&'static str, LocalRequest)> {
         ),
         ("HarnessProbe", request_fixture("harness_probe", harness())),
         (
+            "HarnessExecutionStart",
+            request_fixture(
+                "harness_execution_start",
+                serde_json::json!({"planId": ID, "action": "apply"}),
+            ),
+        ),
+        (
+            "HarnessExecutionStatus",
+            request_fixture(
+                "harness_execution_status",
+                serde_json::json!({"planId": ID, "action": "rollback"}),
+            ),
+        ),
+        (
+            "HarnessExecutionCurrent",
+            request_fixture("harness_execution_current", empty()),
+        ),
+        (
+            "HarnessSetupsList",
+            request_fixture("harness_setups_list", serde_json::json!({"after": null})),
+        ),
+        (
+            "HarnessSetupGet",
+            request_fixture("harness_setup_get", serde_json::json!({"planId": ID})),
+        ),
+        (
             "HarnessPreview",
             request_fixture("harness_preview", harness()),
         ),
@@ -875,7 +997,31 @@ fn all_request_fixtures() -> Vec<(&'static str, LocalRequest)> {
         ),
         (
             "DeviceRevoke",
-            request_fixture("device_revoke", serde_json::json!({"deviceId": ID})),
+            request_fixture(
+                "device_revoke",
+                serde_json::json!({"operationId": ID, "deviceId": ID}),
+            ),
+        ),
+        (
+            "DeviceRevocationStatus",
+            request_fixture(
+                "device_revocation_status",
+                serde_json::json!({"operationId": ID}),
+            ),
+        ),
+        (
+            "DeviceRevocationCancel",
+            request_fixture(
+                "device_revocation_cancel",
+                serde_json::json!({"operationId": ID}),
+            ),
+        ),
+        (
+            "DeviceRevocationIntents",
+            request_fixture(
+                "device_revocation_intents",
+                serde_json::json!({"after": null}),
+            ),
         ),
         ("PairingCreate", request_fixture("pairing_create", empty())),
         (
@@ -884,12 +1030,7 @@ fn all_request_fixtures() -> Vec<(&'static str, LocalRequest)> {
                 "pairing_join",
                 serde_json::json!({
                     "code": "01234-ABCDE",
-                    "deviceId": ID,
                     "deviceName": "device",
-                    "platform": "windows",
-                    "requestNonce": bytes32,
-                    "signingPublicKey": bytes32,
-                    "wrappingPublicKey": bytes32,
                 }),
             ),
         ),
@@ -909,15 +1050,94 @@ fn all_request_fixtures() -> Vec<(&'static str, LocalRequest)> {
             ),
         ),
         (
+            "PairingConfirm",
+            request_fixture(
+                "pairing_confirm",
+                serde_json::json!({
+                    "pairingId": ID,
+                    "safetyNumber": "0123-4567-89AB-CDEF-0123",
+                }),
+            ),
+        ),
+        (
             "PairingCancel",
             request_fixture("pairing_cancel", serde_json::json!({"pairingId": ID})),
         ),
-        ("RecoveryBegin", request_fixture("recovery_begin", empty())),
         (
-            "RecoveryComplete",
+            "RecoveryHistoryCandidates",
             request_fixture(
-                "recovery_complete",
-                serde_json::json!({"recoveryPhraseWords": vec!["word"; 24]}),
+                "recovery_history_candidates",
+                serde_json::json!({"restoreId":ID,"acceptedEndpointSha256":"11".repeat(32),"cursor":null}),
+            ),
+        ),
+        (
+            "RecoveryHistorySelect",
+            request_fixture(
+                "recovery_history_select",
+                serde_json::json!({"restoreId":ID,"acceptedEndpointSha256":"11".repeat(32),"checkpointSha256":"22".repeat(32)}),
+            ),
+        ),
+        (
+            "RecoveryHistoryUnlock",
+            request_fixture(
+                "recovery_history_unlock",
+                serde_json::json!({"restoreId":ID,"acceptedEndpointSha256":"11".repeat(32),"checkpointSha256":"22".repeat(32),"recoveryPhraseWords":vec!["abandon";24]}),
+            ),
+        ),
+        (
+            "RecoveryRestoreBegin",
+            request_fixture(
+                "recovery_restore_begin",
+                serde_json::json!({"recoveryPhraseWords":vec!["abandon";24]}),
+            ),
+        ),
+        (
+            "RecoveryRestoreOverview",
+            request_fixture("recovery_restore_overview", empty()),
+        ),
+        (
+            "RecoveryRestoreCancel",
+            request_fixture("recovery_restore_cancel", empty()),
+        ),
+        (
+            "RecoveryRestoreResume",
+            request_fixture("recovery_restore_resume", empty()),
+        ),
+        (
+            "RecoveryEnrollmentBegin",
+            request_fixture("recovery_enrollment_begin", empty()),
+        ),
+        (
+            "RecoveryEnrollmentOverview",
+            request_fixture("recovery_enrollment_overview", empty()),
+        ),
+        (
+            "RecoveryEnrollmentConfirm",
+            request_fixture(
+                "recovery_enrollment_confirm",
+                serde_json::json!({
+                    "enrollmentId": ID,
+                    "confirmations": [
+                        {"position": 2, "word": "abandon"},
+                        {"position": 7, "word": "ability"},
+                        {"position": 13, "word": "able"},
+                        {"position": 24, "word": "about"},
+                    ],
+                }),
+            ),
+        ),
+        (
+            "RecoveryEnrollmentStatus",
+            request_fixture(
+                "recovery_enrollment_status",
+                serde_json::json!({"enrollmentId": ID}),
+            ),
+        ),
+        (
+            "RecoveryEnrollmentCancel",
+            request_fixture(
+                "recovery_enrollment_cancel",
+                serde_json::json!({"enrollmentId": ID}),
             ),
         ),
         (
@@ -938,7 +1158,14 @@ fn all_request_fixtures() -> Vec<(&'static str, LocalRequest)> {
             "AccountDeletionBegin",
             request_fixture(
                 "account_deletion_begin",
-                serde_json::json!({"confirmation": "delete"}),
+                serde_json::json!({"operationId": ID, "confirmation": "delete"}),
+            ),
+        ),
+        (
+            "AccountDeletionIntents",
+            request_fixture(
+                "account_deletion_intents",
+                serde_json::json!({"after":null}),
             ),
         ),
         (
@@ -947,31 +1174,22 @@ fn all_request_fixtures() -> Vec<(&'static str, LocalRequest)> {
         ),
         (
             "AccountDeletionCancel",
-            request_fixture("account_deletion_cancel", empty()),
+            request_fixture(
+                "account_deletion_cancel",
+                serde_json::json!({"operationId": ID}),
+            ),
         ),
     ]
 }
 
 #[test]
-fn role_allowlist_covers_all_45_requests() {
+fn role_allowlist_covers_core_and_tracked_setup_requests() {
     let fixtures = all_request_fixtures();
-    assert_eq!(fixtures.len(), 45);
+    assert_eq!(fixtures.len(), 74);
 
     for (name, request) in &fixtures {
         let common = matches!(*name, "Cancel" | "Health");
-        let mcp_domain = matches!(
-            *name,
-            "MemorySearch"
-                | "MemoryGet"
-                | "MemoryCreate"
-                | "MemoryUpdate"
-                | "MemoryArchive"
-                | "TasksList"
-                | "TaskUpsert"
-                | "TaskComplete"
-                | "HandoffCreate"
-                | "SyncStatus"
-        );
+        let mcp_domain = matches!(*name, "McpCall" | "NativeHookEvent");
         let installer_setup = matches!(
             *name,
             "AccessGet"
@@ -987,8 +1205,31 @@ fn role_allowlist_covers_all_45_requests() {
 
         assert_eq!(
             role_allows(ClientRole::Desktop, request),
-            *name != "Hello",
+            !matches!(
+                *name,
+                "Hello"
+                    | "RecoveryEnrollmentBegin"
+                    | "RecoveryEnrollmentConfirm"
+                    | "RecoveryRestoreBegin"
+                    | "RecoveryHistoryUnlock"
+            ),
             "Desktop matrix mismatch for {name}"
+        );
+        assert_eq!(
+            role_allows(ClientRole::DesktopRecoveryHost, request),
+            matches!(
+                *name,
+                "Cancel"
+                    | "RecoveryRestoreBegin"
+                    | "RecoveryHistoryUnlock"
+                    | "RecoveryRestoreOverview"
+                    | "RecoveryRestoreResume"
+                    | "RecoveryRestoreCancel"
+                    | "RecoveryEnrollmentBegin"
+                    | "RecoveryEnrollmentConfirm"
+                    | "RecoveryEnrollmentCancel"
+            ),
+            "recovery host matrix mismatch for {name}"
         );
         assert_eq!(
             role_allows(ClientRole::McpBridge, request),
@@ -1007,14 +1248,21 @@ fn role_allowlist_covers_all_45_requests() {
             .iter()
             .filter(|(_, request)| role_allows(ClientRole::Desktop, request))
             .count(),
-        44
+        69
+    );
+    assert_eq!(
+        fixtures
+            .iter()
+            .filter(|(_, request)| role_allows(ClientRole::DesktopRecoveryHost, request))
+            .count(),
+        9
     );
     assert_eq!(
         fixtures
             .iter()
             .filter(|(_, request)| role_allows(ClientRole::McpBridge, request))
             .count(),
-        12
+        4
     );
     assert_eq!(
         fixtures
@@ -1023,6 +1271,52 @@ fn role_allowlist_covers_all_45_requests() {
             .count(),
         11
     );
+}
+
+#[test]
+fn recovery_enrollment_requests_are_role_separated() {
+    let recovery = all_request_fixtures()
+        .into_iter()
+        .filter(|(name, _)| name.starts_with("RecoveryEnrollment"))
+        .collect::<Vec<_>>();
+    assert_eq!(recovery.len(), 5);
+
+    for (name, request) in recovery {
+        let ordinary_desktop = matches!(
+            name,
+            "RecoveryEnrollmentOverview" | "RecoveryEnrollmentStatus" | "RecoveryEnrollmentCancel"
+        );
+        let recovery_host = matches!(
+            name,
+            "RecoveryEnrollmentBegin" | "RecoveryEnrollmentConfirm" | "RecoveryEnrollmentCancel"
+        );
+        assert_eq!(
+            role_allows(ClientRole::Desktop, &request),
+            ordinary_desktop,
+            "{name}"
+        );
+        assert_eq!(
+            role_allows(ClientRole::DesktopRecoveryHost, &request),
+            recovery_host,
+            "{name}"
+        );
+        assert!(!role_allows(ClientRole::McpBridge, &request), "{name}");
+        assert!(!role_allows(ClientRole::Installer, &request), "{name}");
+    }
+}
+
+#[test]
+fn pairing_requests_are_desktop_only() {
+    let pairing = all_request_fixtures()
+        .into_iter()
+        .filter(|(name, _)| name.starts_with("Pairing"))
+        .collect::<Vec<_>>();
+    assert_eq!(pairing.len(), 6);
+    for (name, request) in pairing {
+        assert!(role_allows(ClientRole::Desktop, &request), "{name}");
+        assert!(!role_allows(ClientRole::McpBridge, &request), "{name}");
+        assert!(!role_allows(ClientRole::Installer, &request), "{name}");
+    }
 }
 
 #[test]
@@ -1322,6 +1616,37 @@ mod windows_transport_tests {
     }
 
     #[tokio::test]
+    async fn windows_transport_busy_instance_waits_for_the_next_accept() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let runtime = runtime();
+        let mut instance = InstanceGuard::acquire(&runtime).unwrap();
+        let mut listener = Listener::bind(&runtime, &mut instance).unwrap();
+        let _first = connect(&runtime).await.unwrap();
+
+        // The single published instance is occupied. A second connection must
+        // yield until accept publishes its replacement, not report permanent IO.
+        let second = connect(&runtime);
+        tokio::pin!(second);
+        assert!(
+            timeout(Duration::from_millis(20), &mut second)
+                .await
+                .is_err()
+        );
+        let _accepted_first = listener.accept().await.unwrap();
+        let mut second = timeout(Duration::from_secs(5), second)
+            .await
+            .expect("replacement listener should become available")
+            .unwrap();
+        let mut accepted_second = listener.accept().await.unwrap();
+        second.write_all(b"next").await.unwrap();
+        let mut bytes = [0; 4];
+        accepted_second.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"next");
+    }
+
+    #[tokio::test]
     async fn windows_transport_round_trip_has_sid_name_and_protected_dacl() {
         let runtime = runtime();
         let endpoint = runtime.endpoint_name().unwrap();
@@ -1387,7 +1712,8 @@ mod macos_transport_tests {
 
     impl TestRoot {
         fn new() -> Self {
-            Self(std::env::temp_dir().join(format!("context-relay-ipc-test-{}", Uuid::now_v7())))
+            let unique = Uuid::now_v7().simple().to_string();
+            Self(PathBuf::from("/tmp").join(format!("cr-ipc-{}", &unique[16..])))
         }
 
         fn path(&self) -> &Path {
@@ -1404,10 +1730,12 @@ mod macos_transport_tests {
 
     impl Drop for TestRoot {
         fn drop(&mut self) {
-            if self.0.file_name().is_some_and(|name| {
-                name.to_string_lossy()
-                    .starts_with("context-relay-ipc-test-")
-            }) {
+            if self.0.parent() == Some(Path::new("/tmp"))
+                && self
+                    .0
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("cr-ipc-"))
+            {
                 let _ = fs::remove_dir_all(&self.0);
             }
         }
@@ -1454,9 +1782,9 @@ mod macos_transport_tests {
             .create(unsafe_root.path())
             .unwrap();
         fs::set_permissions(unsafe_root.path(), fs::Permissions::from_mode(0o755)).unwrap();
-        let (_, runtime) = runtime(&unsafe_root);
+        let (_, unsafe_runtime) = runtime(&unsafe_root);
         assert!(matches!(
-            InstanceGuard::acquire(&runtime),
+            InstanceGuard::acquire(&unsafe_runtime),
             Err(IpcError::InvalidRuntime)
         ));
 
@@ -1599,5 +1927,31 @@ mod macos_transport_tests {
             runtime.endpoint_name(),
             Err(IpcError::InvalidRuntime)
         ));
+    }
+}
+
+#[test]
+fn guided_connection_and_launch_interfaces_are_desktop_only() {
+    let id = "018f22e2-79b0-7cc8-98c4-dc0c0c07398f";
+    let selection = serde_json::json!({"harness":"codex","projectId":id,"hermesProfile":null});
+    for (method, params) in [
+        ("harness_launch_info", selection.clone()),
+        (
+            "connection_check_start",
+            serde_json::json!({"selection":selection,"memoryId":id,"expectedRevision":id}),
+        ),
+        ("connection_check_status", serde_json::json!({"checkId":id})),
+        ("connection_check_cancel", serde_json::json!({"checkId":id})),
+    ] {
+        let request: LocalRequest =
+            serde_json::from_value(serde_json::json!({"method":method,"params":params})).unwrap();
+        assert!(role_allows(ClientRole::Desktop, &request));
+        for role in [
+            ClientRole::McpBridge,
+            ClientRole::Installer,
+            ClientRole::DesktopRecoveryHost,
+        ] {
+            assert!(!role_allows(role, &request), "{method}: {role:?}");
+        }
     }
 }

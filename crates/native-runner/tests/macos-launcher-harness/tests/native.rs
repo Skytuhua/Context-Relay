@@ -10,7 +10,10 @@ use std::{
     },
     path::{Path, PathBuf},
     process::Command,
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -40,6 +43,16 @@ fn signed_generation_inspects_the_actual_inside_out_macho_closure() {
         &root_identity(prepared.bundle_path())
     );
     assert_eq!(prepared.inspections().len(), 2);
+    assert_eq!(prepared.runtime_materials().len(), 1);
+    let runtime_material = &prepared.runtime_materials()[0];
+    let runtime_child = prepared
+        .bundle_path()
+        .join("Contents/Helpers/runtime/probe-child");
+    assert_eq!(runtime_material.relative_path(), "probe-child");
+    assert_eq!(runtime_material.size(), fs::metadata(&runtime_child).unwrap().len());
+    assert_eq!(runtime_material.sha256(), &digest(&runtime_child));
+    assert_ne!(runtime_material.sha256(), &digest(&fixture.child));
+    assert!(runtime_material.executable());
     assert!(prepared.inspections().iter().any(|item| {
         item.subject == EntitlementSubject::Helper
             && item.entitlements
@@ -49,7 +62,18 @@ fn signed_generation_inspects_the_actual_inside_out_macho_closure() {
                 )]
     }));
     assert!(prepared.inspections().iter().any(|item| {
-        item.subject == EntitlementSubject::Sidecar && item.entitlements.is_empty()
+        item.subject == EntitlementSubject::Sidecar
+            && item.entitlements
+                == [
+                    (
+                        "com.apple.security.app-sandbox".into(),
+                        EntitlementValue::Boolean(true),
+                    ),
+                    (
+                        "com.apple.security.inherit".into(),
+                        EntitlementValue::Boolean(true),
+                    ),
+                ]
     }));
 }
 
@@ -62,7 +86,9 @@ fn launch_rejects_a_same_name_bundle_replacement_before_code_or_input() {
     let signed = prepared.signed_generation().clone();
     let bundle = prepared.bundle_path().to_path_buf();
     let moved = fixture.root.join("approved-moved.app");
+    fs::set_permissions(&bundle, fs::Permissions::from_mode(0o700)).unwrap();
     fs::rename(&bundle, &moved).unwrap();
+    assert_eq!(root_identity(&moved), *signed.bundle_identity());
     let marker = bundle.join("replacement-ran");
 
     let replacement_helper = bundle.join("Contents/MacOS/context-relay-native-helper");
@@ -347,7 +373,6 @@ fn recovery_observes_a_live_or_reused_group_without_signaling_it() {
     let container_identity = root_identity(&container);
 
     let group = unsafe { libc::fork() };
-    assert!(group > 0);
     if group == 0 {
         unsafe {
             if libc::setpgid(0, 0) != 0 {
@@ -358,6 +383,7 @@ fn recovery_observes_a_live_or_reused_group_without_signaling_it() {
             }
         }
     }
+    assert!(group > 0);
     let ready_deadline = Instant::now() + Duration::from_secs(2);
     while unsafe { libc::getpgid(group) } != group {
         assert!(Instant::now() < ready_deadline);
@@ -771,6 +797,7 @@ impl Fixture {
             self.child.clone(),
             child_metadata.len(),
             digest(&self.child),
+            true,
         )
         .unwrap();
         MacGenerationSpec::new(
@@ -888,8 +915,11 @@ impl GenerationJournal for MemoryJournal {
 }
 
 fn prove_case_sensitive(root: &Path) {
-    let lower = root.join(format!("case-check-{}", std::process::id()));
-    let upper = root.join(format!("CASE-CHECK-{}", std::process::id()));
+    static NONCE: AtomicU64 = AtomicU64::new(0);
+
+    let nonce = NONCE.fetch_add(1, Ordering::Relaxed);
+    let lower = root.join(format!("case-check-{}-{nonce}", std::process::id()));
+    let upper = root.join(format!("CASE-CHECK-{}-{nonce}", std::process::id()));
     fs::write(&lower, b"lower").unwrap();
     fs::write(&upper, b"upper").unwrap();
     assert_eq!(fs::read(&lower).unwrap(), b"lower");

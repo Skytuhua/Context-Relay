@@ -33,13 +33,26 @@ fn gitleaks_finding() -> Value {
 }
 
 fn semgrep_report(results: Vec<Value>, scanned: Vec<&str>) -> Value {
+    let targets = scanned
+        .iter()
+        .map(|path| {
+            json!({
+                "path": path,
+                "num_bytes": 11,
+                "match_times": [0.0],
+                "parse_times": [0.0],
+                "run_time": 0.0
+            })
+        })
+        .collect::<Vec<_>>();
+    let total_bytes = scanned.len() * 11;
     json!({
         "version": "1.170.0",
         "results": results,
         "errors": [],
         "paths": { "scanned": scanned },
         "time": {
-            "rules": [],
+            "rules": ["config.semgrep.context-relay-no-python-runtime"],
             "rules_parse_time": 0.0,
             "profiling_times": {},
             "parsing_time": {
@@ -74,8 +87,8 @@ fn semgrep_report(results: Vec<Value>, scanned: Vec<&str>) -> Value {
                 "rules_selected_ratio": 1.0,
                 "rules_matched_ratio": 0.0
             },
-            "targets": [],
-            "total_bytes": 11,
+            "targets": targets,
+            "total_bytes": total_bytes,
             "max_memory_bytes": 0,
             "fixpoint_timeouts": []
         },
@@ -85,8 +98,136 @@ fn semgrep_report(results: Vec<Value>, scanned: Vec<&str>) -> Value {
     })
 }
 
-fn semgrep_warning() -> &'static [u8] {
-    b"[00.10][WARNING]: !!! You're using one or more options starting with '--x-'. These options are not part of the semgrep API. They will change or will be removed without notice !!! \n"
+fn semgrep_core_result(rule: &str, severity: &str, message: &str, end: u64) -> Value {
+    json!({
+        "check_id": rule,
+        "path": "input/semgrep-target/METADATA",
+        "start": { "line": 1, "col": 1, "offset": 0 },
+        "end": { "line": 1, "col": end + 1, "offset": end },
+        "extra": {
+            "metavars": {},
+            "engine_kind": "OSS",
+            "is_ignored": false,
+            "message": message,
+            "metadata": {},
+            "severity": severity,
+            "validation_state": "NO_VALIDATOR"
+        }
+    })
+}
+
+fn semgrep_core_report(results: Vec<Value>) -> Value {
+    let mut report = semgrep_report(results, vec!["input/semgrep-target/METADATA"]);
+    report["rules_by_engine"] = json!([
+        ["config.semgrep.context-relay-scan-canary", "OSS"],
+        ["config.semgrep.context-relay-no-python-runtime", "OSS"]
+    ]);
+    report["interfile_languages_used"] = json!([]);
+    report
+}
+
+#[test]
+fn semgrep_core_accepts_exit_zero_with_empty_stderr_and_strips_the_canary() {
+    let inputs = vec![frame("input/semgrep-target/METADATA", b"hello world")];
+    let canary = semgrep_core_result(
+        "config.semgrep.context-relay-scan-canary",
+        "INFO",
+        "Context Relay scan coverage canary.",
+        1,
+    );
+    let finding = semgrep_core_result(
+        "config.semgrep.context-relay-no-python-runtime",
+        "ERROR",
+        "Native Semgrep packages must not contain Pysemgrep or a Python runtime.",
+        6,
+    );
+
+    let (clean, normalized) = validate_semgrep_report(
+        0,
+        &serde_json::to_vec(&semgrep_core_report(vec![canary.clone()])).unwrap(),
+        b"",
+        &inputs,
+    )
+    .unwrap();
+    assert_eq!(clean, RunDisposition::Clean);
+    assert!(
+        serde_json::from_slice::<Value>(&normalized).unwrap()["results"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    assert_eq!(
+        validate_semgrep_report(
+            0,
+            &serde_json::to_vec(&semgrep_core_report(vec![canary, finding])).unwrap(),
+            b"",
+            &inputs,
+        )
+        .unwrap()
+        .0,
+        RunDisposition::Findings(1)
+    );
+}
+
+#[test]
+fn semgrep_core_accepts_omitted_optional_rule_metadata() {
+    let inputs = vec![frame("input/semgrep-target/METADATA", b"hello world")];
+    let mut canary = semgrep_core_result(
+        "config.semgrep.context-relay-scan-canary",
+        "INFO",
+        "Context Relay scan coverage canary.",
+        1,
+    );
+    canary["extra"].as_object_mut().unwrap().remove("metadata");
+
+    assert_eq!(
+        validate_semgrep_report(
+            0,
+            &serde_json::to_vec(&semgrep_core_report(vec![canary])).unwrap(),
+            b"",
+            &inputs,
+        )
+        .unwrap()
+        .0,
+        RunDisposition::Clean
+    );
+}
+
+#[test]
+fn semgrep_core_accepts_and_strips_the_closed_regex_capture() {
+    let inputs = vec![frame("input/semgrep-target/METADATA", b"python.exe\n")];
+    let canary = semgrep_core_result(
+        "config.semgrep.context-relay-scan-canary",
+        "INFO",
+        "Context Relay scan coverage canary.",
+        1,
+    );
+    let mut finding = semgrep_core_result(
+        "config.semgrep.context-relay-no-python-runtime",
+        "ERROR",
+        "Native Semgrep packages must not contain Pysemgrep or a Python runtime.",
+        10,
+    );
+    finding["extra"]["metavars"] = json!({
+        "$1": {
+            "start": { "line": 1, "col": 1, "offset": 0 },
+            "end": { "line": 1, "col": 11, "offset": 10 },
+            "abstract_content": "python.exe"
+        }
+    });
+
+    let (_, report) = validate_semgrep_report(
+        0,
+        &serde_json::to_vec(&semgrep_core_report(vec![canary, finding])).unwrap(),
+        b"",
+        &inputs,
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&report).unwrap()["results"][0]["extra"]["metavars"],
+        json!({})
+    );
 }
 
 #[test]
@@ -168,92 +309,6 @@ fn gitleaks_normalizes_only_the_exact_scan_root_prefix() {
     );
     let stdout = serde_json::to_vec(&vec![lookalike]).unwrap();
     assert!(validate_gitleaks_report(10, &stdout, stderr, &inputs).is_err());
-}
-
-#[test]
-fn semgrep_requires_exact_schema_unique_paths_and_source_free_results() {
-    let inputs = vec![frame("input/semgrep-target/METADATA", b"hello world")];
-    let clean = serde_json::to_vec(&semgrep_report(
-        vec![],
-        vec!["input\\semgrep-target\\METADATA"],
-    ))
-    .unwrap();
-    assert_eq!(
-        validate_semgrep_report(0, &clean, semgrep_warning(), &inputs)
-            .unwrap()
-            .0,
-        RunDisposition::Clean
-    );
-
-    let result = json!({
-        "check_id": "context-relay-no-python-runtime",
-        "path": "input\\semgrep-target\\METADATA",
-        "start": { "line": 1, "col": 1, "offset": 0 },
-        "end": { "line": 1, "col": 7, "offset": 6 },
-        "extra": {
-            "message": "Native Semgrep packages must not contain Pysemgrep or a Python runtime.",
-            "metadata": {},
-            "severity": "ERROR",
-            "fingerprint": "requires login",
-            "lines": "requires login",
-            "validation_state": "NO_VALIDATOR",
-            "engine_kind": "OSS"
-        }
-    });
-    let finding = serde_json::to_vec(&semgrep_report(
-        vec![result.clone()],
-        vec!["input/semgrep-target/METADATA"],
-    ))
-    .unwrap();
-    assert_eq!(
-        validate_semgrep_report(1, &finding, semgrep_warning(), &inputs)
-            .unwrap()
-            .0,
-        RunDisposition::Findings(1)
-    );
-
-    let mut extra_field =
-        semgrep_report(vec![result.clone()], vec!["input/semgrep-target/METADATA"]);
-    extra_field
-        .as_object_mut()
-        .unwrap()
-        .insert("fallback".into(), json!("python"));
-    assert!(
-        validate_semgrep_report(
-            1,
-            &serde_json::to_vec(&extra_field).unwrap(),
-            semgrep_warning(),
-            &inputs,
-        )
-        .is_err()
-    );
-
-    let duplicate = serde_json::to_vec(&semgrep_report(
-        vec![result.clone()],
-        vec![
-            "input/semgrep-target/METADATA",
-            "input/semgrep-target/METADATA",
-        ],
-    ))
-    .unwrap();
-    assert!(validate_semgrep_report(1, &duplicate, semgrep_warning(), &inputs).is_err());
-
-    let mut source_bearing = result;
-    source_bearing
-        .get_mut("extra")
-        .unwrap()
-        .as_object_mut()
-        .unwrap()
-        .insert(
-            "metavars".into(),
-            json!({ "$X": { "abstract_content": "secret" } }),
-        );
-    let source_bearing = serde_json::to_vec(&semgrep_report(
-        vec![source_bearing],
-        vec!["input/semgrep-target/METADATA"],
-    ))
-    .unwrap();
-    assert!(validate_semgrep_report(1, &source_bearing, semgrep_warning(), &inputs).is_err());
 }
 
 #[test]

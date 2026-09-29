@@ -56,8 +56,9 @@ fn production_adapter_applies_and_restores_an_absent_target() {
     let template_path = root.join("template.json");
     fs::write(&template_path, b"template\n").unwrap();
     let native = OsNativeFileSystem::new();
-    let absent = native.snapshot(&path).unwrap();
     let template = native.snapshot(&template_path).unwrap();
+    fs::remove_file(&template_path).unwrap();
+    let absent = native.snapshot(&path).unwrap();
     let intended =
         NativeState::regular_file(b"created\n".to_vec(), template.metadata().unwrap().clone());
     let mutation = mutation(&path, *absent.fingerprint(), &intended);
@@ -176,8 +177,9 @@ fn absent_parent_symlink_swap_after_preflight_leaves_outside_canary_untouched() 
     let template_path = approved.join("template.json");
     fs::write(&template_path, b"template\n").unwrap();
     let native = OsNativeFileSystem::new();
-    let absent = native.snapshot(&path).unwrap();
     let template = native.snapshot(&template_path).unwrap();
+    fs::remove_file(&template_path).unwrap();
+    let absent = native.snapshot(&path).unwrap();
     let intended =
         NativeState::regular_file(b"approved\n".to_vec(), template.metadata().unwrap().clone());
     let mutation = mutation(&path, *absent.fingerprint(), &intended);
@@ -209,8 +211,9 @@ fn concurrent_identical_install_is_not_attributed_to_the_failed_transaction() {
     let template_path = root.join("template.json");
     fs::write(&template_path, b"template\n").unwrap();
     let native = OsNativeFileSystem::new();
-    let absent = native.snapshot(&path).unwrap();
     let template = native.snapshot(&template_path).unwrap();
+    fs::remove_file(&template_path).unwrap();
+    let absent = native.snapshot(&path).unwrap();
     let intended =
         NativeState::regular_file(b"intended\n".to_vec(), template.metadata().unwrap().clone());
     let mutation = mutation(&path, *absent.fingerprint(), &intended);
@@ -374,21 +377,27 @@ fn recreate_then_delete_aba_breaks_the_same_parent_delete_chain() {
 }
 
 #[test]
-fn committed_delete_removes_only_its_exact_retained_backup_idempotently() {
+fn committed_deletes_remove_only_their_exact_retained_backups_idempotently() {
     let root = scratch("macos-committed-delete-cleanup");
-    let path = root.join("settings.json");
-    fs::write(&path, b"before\n").unwrap();
+    let paths = [root.join("first.json"), root.join("second.json")];
+    fs::write(&paths[0], b"first-before\n").unwrap();
+    fs::write(&paths[1], b"second-before\n").unwrap();
     let native = OsNativeFileSystem::new();
-    let before = native.snapshot(&path).unwrap();
-    let delete = mutation(&path, *before.fingerprint(), &before.absent_state());
+    let before = paths
+        .iter()
+        .map(|path| native.snapshot(path).unwrap())
+        .collect::<Vec<_>>();
+    let deletes = paths
+        .iter()
+        .zip(&before)
+        .map(|(path, before)| mutation(path, *before.fingerprint(), &before.absent_state()))
+        .collect::<Vec<_>>();
     let mut filesystem = OsNativeTransactionFileSystem::new(NONCE);
-    filesystem
-        .create_before_images(std::slice::from_ref(&delete))
-        .unwrap();
-    filesystem
-        .compare_and_swap_targets(std::slice::from_ref(&delete))
-        .unwrap();
-    filesystem.apply_mutation(&NONCE, &delete).unwrap();
+    filesystem.create_before_images(&deletes).unwrap();
+    filesystem.compare_and_swap_targets(&deletes).unwrap();
+    for delete in &deletes {
+        filesystem.apply_mutation(&NONCE, delete).unwrap();
+    }
     let backups = || {
         fs::read_dir(&root)
             .unwrap()
@@ -396,12 +405,12 @@ fn committed_delete_removes_only_its_exact_retained_backup_idempotently() {
             .filter(|entry| entry.file_name().to_string_lossy().ends_with(".backup"))
             .count()
     };
-    assert_eq!(backups(), 1);
+    assert_eq!(backups(), 2);
 
     filesystem.finish_committed_targets(&NONCE).unwrap();
     filesystem.finish_committed_targets(&NONCE).unwrap();
 
-    assert!(!path.exists());
+    assert!(paths.iter().all(|path| !path.exists()));
     assert_eq!(backups(), 0);
     cleanup(&root);
 }

@@ -36,7 +36,7 @@ fn pending_semgrep_candidate_is_test_only_and_exactly_bound() {
         "productionManifestSha256": hex_hash(&manifest_bytes),
         "sourceLockSha256": hex_hash(&source_lock),
         "bundleEvidenceSha256": hex_hash(&bundle_evidence),
-        "bundleEvidenceStatus": "source_bundle_reproducible_native_builds_pending",
+        "bundleEvidenceStatus": "source_bundle_v1_native_builds_pending",
         "archive": {
             "format": "tar.gz",
             "size": 1234,
@@ -182,7 +182,16 @@ impl CandidateFixture {
             .finalize();
         let hydrated_root = root.join(format!("{digest:x}")).join("semgrep");
         fs::create_dir_all(&hydrated_root).unwrap();
-        fs::write(hydrated_root.join("osemgrep.exe"), executable).unwrap();
+        let executable_path = hydrated_root.join("osemgrep.exe");
+        fs::write(&executable_path, executable).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let mut permissions = fs::metadata(&executable_path).unwrap().permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(&executable_path, permissions).unwrap();
+        }
         Self {
             root,
             hydrated_root,

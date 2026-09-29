@@ -1,19 +1,42 @@
 import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import type {
   Base64Url,
+  ClientRole,
   CompletionEvidenceInput,
   DecimalU64,
+  DeviceCertificateId,
+  DeviceId,
   Ed25519PublicKeyBytes,
   GetOutput,
   HandoffPayload,
   ListTasksInput,
   MemoryRecord,
+  LocalResult,
+  LocalRequest,
   OperationId,
+  PairingApprovalInfo,
+  PairingCompletionInfo,
+  PairingConfirmParams,
   PairingId,
+  PairingInviteInfo,
+  PairingInviteStatusInfo,
+  PairingJoinParams,
+  PairingRequestInfo,
+  PairingSafetyNumber,
   RecordId,
+  RecoveryEnrollmentChallenge,
+  RecoveryEnrollmentConfirmParams,
+  RecoveryEnrollmentHostBeginResult,
+  RecoveryEnrollmentHostConfirmResult,
+  RecoveryEnrollmentId,
+  RecoveryEnrollmentPhrase,
+  RecoveryEnrollmentStatus,
+  RecoveryRootId,
+  RecoveryWordConfirmation,
   SearchInput,
   SetupPlan,
   Sha256Hex,
@@ -24,7 +47,27 @@ import type {
   WireNativeValue,
   X25519PublicKeyBytes,
 } from './bindings';
+import { PROTOCOL_VERSION } from './bindings';
 import * as protocolValidation from './protocol-validation';
+
+it('accepts only bounded hosted auth control status without credentials', () => {
+  const generation = '019924bb-5300-7000-8000-000000000001';
+  const validate = protocolValidation.validateHostedAuthStatus;
+  for (const state of [
+    ...['disabled', 'signing_in', 'restoring', 'connected', 'signing_out'].map((phase) => ({ phase })),
+    { phase: 'signed_out', remoteRevoked: null },
+    { phase: 'signed_out', remoteRevoked: false },
+    { phase: 'signed_out', remoteRevoked: true },
+    ...['unavailable', 'denied', 'expired', 'credential_store'].map((reason) => ({ phase: 'failed', reason })),
+  ]) {
+    expect(validate({ generation, state })).toEqual({ generation, state });
+    expect(() => validate({ generation, state: { ...state, accessToken: 'forbidden' } })).toThrow();
+  }
+  for (const state of [{ phase: 'signed_out' }, { phase: 'failed', reason: 'provider-secret' }, { phase: 'unknown' }, null]) {
+    expect(() => validate({ generation, state })).toThrow();
+  }
+  expect(() => validate({ generation: 'bad', state: { phase: 'disabled' } })).toThrow();
+});
 
 const { createProtocolSchemaValidator } = protocolValidation;
 type Assert<T extends true> = T;
@@ -84,6 +127,55 @@ function assertPairingIdSeparation(pairingId: PairingId) {
   void recordId;
 }
 void assertPairingIdSeparation;
+function assertDeviceCertificateIdSeparation(certificateId: DeviceCertificateId) {
+  // @ts-expect-error Certificate IDs cannot be used as device IDs.
+  const deviceId: DeviceId = certificateId;
+  void deviceId;
+}
+void assertDeviceCertificateIdSeparation;
+type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends (<T>() => T extends B ? 1 : 2) ? true : false;
+type PairingInviteResult = Extract<LocalResult, { kind: 'pairing_invite' }>;
+type PairingInviteStatusResult = Extract<LocalResult, { kind: 'pairing_invite_status' }>;
+type PairingRequestResult = Extract<LocalResult, { kind: 'pairing_request' }>;
+type PairingApprovalResult = Extract<LocalResult, { kind: 'pairing_approval' }>;
+type PairingCompletionResult = Extract<LocalResult, { kind: 'pairing_completion' }>;
+const pairingPhaseBindingAssertions: [
+  Assert<Equal<keyof PairingJoinParams, 'code' | 'deviceName'>>,
+  Assert<Equal<keyof PairingConfirmParams, 'pairingId' | 'safetyNumber'>>,
+  Assert<Equal<PairingConfirmParams['safetyNumber'], PairingSafetyNumber>>,
+  Assert<Equal<PairingInviteResult['data']['invite'], PairingInviteInfo>>,
+  Assert<Equal<PairingInviteStatusResult['data']['invite'], PairingInviteStatusInfo>>,
+  Assert<Equal<PairingRequestResult['data']['request'], PairingRequestInfo>>,
+  Assert<Equal<PairingApprovalResult['data']['approval'], PairingApprovalInfo>>,
+  Assert<Equal<PairingCompletionResult['data']['completion'], PairingCompletionInfo>>,
+  Assert<'code' extends keyof PairingRequestInfo ? false : true>,
+  Assert<'code' extends keyof PairingInviteStatusInfo ? false : true>,
+] = [true, true, true, true, true, true, true, true, true, true];
+void pairingPhaseBindingAssertions;
+
+type RecoveryConfirmRequest = Extract<LocalRequest, { method: 'recovery_enrollment_confirm' }>;
+type RecoveryPhraseResult = Extract<LocalResult, { kind: 'recovery_enrollment_phrase' }>;
+type RecoveryStatusResult = Extract<LocalResult, { kind: 'recovery_enrollment_status' }>;
+type HostPhraseResult = Extract<RecoveryEnrollmentHostBeginResult, { kind: 'phrase' }>;
+const recoveryEnrollmentBindingAssertions: [
+  Assert<'desktop_recovery_host' extends ClientRole ? true : false>,
+  Assert<Equal<RecoveryConfirmRequest['params'], RecoveryEnrollmentConfirmParams>>,
+  Assert<Equal<keyof RecoveryWordConfirmation, 'position' | 'word'>>,
+  Assert<Equal<RecoveryPhraseResult['data']['phrase'], RecoveryEnrollmentPhrase>>,
+  Assert<Equal<RecoveryStatusResult['data']['status'], RecoveryEnrollmentStatus>>,
+  Assert<'recoveryPhraseWords' extends keyof RecoveryEnrollmentChallenge ? false : true>,
+  Assert<HostPhraseResult extends never ? true : false>,
+  Assert<Extract<RecoveryEnrollmentHostConfirmResult, { kind: 'complete' }> extends never ? false : true>,
+] = [true, true, true, true, true, true, true, true];
+void recoveryEnrollmentBindingAssertions;
+function assertRecoveryIdentifierSeparation(enrollmentId: RecoveryEnrollmentId, rootId: RecoveryRootId) {
+  // @ts-expect-error Enrollment IDs cannot be used as recovery-root IDs.
+  const wrongRoot: RecoveryRootId = enrollmentId;
+  // @ts-expect-error Recovery-root IDs cannot be used as enrollment IDs.
+  const wrongEnrollment: RecoveryEnrollmentId = rootId;
+  void [wrongRoot, wrongEnrollment];
+}
+void assertRecoveryIdentifierSeparation;
 
 const workspace = resolve(import.meta.dirname, '../../..');
 const load = (path: string) => JSON.parse(readFileSync(resolve(workspace, path), 'utf8'));
@@ -114,6 +206,12 @@ const nullAtPath = (value: unknown, path: readonly PropertyKey[]) => {
   parentAtPath(copy, path)[path.at(-1)!] = null;
   return copy;
 };
+
+describe('generated protocol version', () => {
+  it('advertises the background search status contract as v1.11', () => {
+    expect(PROTOCOL_VERSION).toEqual({ major: 1, minor: 17 });
+  });
+});
 
 describe('protocol schemas', () => {
   it('validates every MCP input and output fixture with Draft 2020-12', () => {
@@ -228,14 +326,15 @@ describe('protocol schemas', () => {
     }
   });
 
-  it('accepts only status protocol ranges containing v1.0', () => {
+  it('accepts only the exact status protocol range for v1.17', () => {
     const ajv = createProtocolSchemaValidator();
     const validate = ajv.compile(load('schemas/context_relay_status-output-v1.json'));
     const fixture = load('crates/protocol/tests/fixtures/mcp-output-valid.json').context_relay_status;
     expect(validate(fixture), ajv.errorsText(validate.errors)).toBe(true);
     for (const protocol of [
       { min: { major: 2, minor: 0 }, max: { major: 2, minor: 0 } },
-      { min: { major: 1, minor: 1 }, max: { major: 1, minor: 2 } },
+      { min: { major: 1, minor: 0 }, max: { major: 1, minor: 0 } },
+      { min: { major: 1, minor: 6 }, max: { major: 1, minor: 17 } },
       { min: { major: 1, minor: 1 }, max: { major: 1, minor: 0 } },
     ]) {
       expect(validate({ ...fixture, protocol }), JSON.stringify(protocol)).toBe(false);
@@ -423,4 +522,11 @@ describe('protocol schemas', () => {
       expect(validateExport(omitted), `omitted export provenance ${field}`).toBe(false);
     }
   });
+});
+
+it('validates the frozen recovery history page, exact status and canonical fixture digest', () => {
+  const fixture = load('crates/protocol/tests/fixtures/runtime-contracts-v1.json');
+  expect(protocolValidation.validateRecoveryHistoryCandidates(fixture.recoveryHistoryCandidatesPage)).toEqual(fixture.recoveryHistoryCandidatesPage);
+  expect(protocolValidation.validateRecoveryRestoreStatus(fixture.recoveryHistoryStatus)).toEqual(fixture.recoveryHistoryStatus);
+  expect(createHash('sha256').update(JSON.stringify(fixture.recoveryHistoryCandidatesPage)).digest('hex')).toBe(fixture.recoveryHistoryCandidatesPageSha256);
 });

@@ -36,6 +36,18 @@ fn encoded_request() -> Vec<u8> {
 }
 
 #[test]
+fn semgrep_has_a_bounded_startup_envelope_beyond_the_other_sidecars() {
+    assert_eq!(
+        RunLimits::for_command(&SidecarCommand::GitleaksScanPackage).timeout_ms(),
+        30_000
+    );
+    assert_eq!(
+        RunLimits::for_command(&SidecarCommand::OsemgrepScanPackage).timeout_ms(),
+        90_000
+    );
+}
+
+#[test]
 fn request_round_trip_handles_partial_reads_and_writes() {
     let expected = request();
     let encoded = encoded_request();
@@ -218,6 +230,36 @@ fn helper_request_binds_a_bounded_multifile_runtime_closure() {
 }
 
 #[test]
+fn helper_request_separately_binds_a_resigned_runtime_to_the_source_request() {
+    let source = vec![ClosureMaterial::new(path("bin/rulesync"), 3, [0x31; 32], true).unwrap()];
+    let runtime = vec![ClosureMaterial::new(path("bin/rulesync"), 5, [0x32; 32], true).unwrap()];
+    let request = RunRequest::new(
+        [0x41; 16],
+        closure_material_digest(&source).unwrap(),
+        SidecarCommand::RuleSyncGenerate {
+            target: context_relay_native_runner::RuleSyncTarget::ClaudeCode,
+            features: context_relay_native_runner::RuleSyncFeatures::new(&[
+                context_relay_native_runner::RuleSyncFeature::Rules,
+            ])
+            .unwrap(),
+        },
+        vec![ContentFrame::new(path("input/.rulesync/rules/probe.md"), b"safe".to_vec()).unwrap()],
+    )
+    .unwrap();
+    let expected = HelperRunRequest::for_resigned_runtime(request, runtime).unwrap();
+    assert_ne!(
+        expected.runtime_closure_sha256(),
+        expected.request().expected_closure_sha256()
+    );
+    let mut encoded = Vec::new();
+    write_helper_request(&mut encoded, &expected).unwrap();
+    assert_eq!(
+        read_helper_request(&mut OneByteReader(Cursor::new(encoded))).unwrap(),
+        expected
+    );
+}
+
+#[test]
 fn helper_request_rejects_unbound_or_python_semgrep_closure_members() {
     let native = ClosureMaterial::new(path("bin/osemgrep.exe"), 3, [0x31; 32], true).unwrap();
     let python = ClosureMaterial::new(
@@ -245,6 +287,37 @@ fn helper_request_rejects_unbound_or_python_semgrep_closure_members() {
             )
             .unwrap(),
             vec![native],
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn helper_request_accepts_only_the_staged_semgrep_core_executable_alias() {
+    let source = vec![
+        ClosureMaterial::new(path("bin/osemgrep.exe"), 3, [0x31; 32], true).unwrap(),
+        ClosureMaterial::new(path("bin/runtime.dll"), 5, [0x32; 32], false).unwrap(),
+    ];
+    let request = RunRequest::new(
+        [0x41; 16],
+        closure_material_digest(&source).unwrap(),
+        SidecarCommand::OsemgrepScanPackage,
+        vec![ContentFrame::new(path("input/semgrep-target/METADATA"), b"safe".to_vec()).unwrap()],
+    )
+    .unwrap();
+    let runtime = vec![
+        ClosureMaterial::new(path("bin/semgrep-core.exe"), 3, [0x31; 32], true).unwrap(),
+        ClosureMaterial::new(path("bin/runtime.dll"), 5, [0x32; 32], false).unwrap(),
+    ];
+
+    assert!(HelperRunRequest::for_resigned_runtime(request.clone(), runtime).is_ok());
+    assert!(
+        HelperRunRequest::for_resigned_runtime(
+            request,
+            vec![
+                ClosureMaterial::new(path("bin/osemgrep.exe"), 3, [0x31; 32], true).unwrap(),
+                ClosureMaterial::new(path("bin/semgrep-core.dll"), 5, [0x32; 32], false).unwrap(),
+            ],
         )
         .is_err()
     );

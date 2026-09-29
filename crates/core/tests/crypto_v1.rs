@@ -1,21 +1,77 @@
 use std::str::FromStr;
 
 use context_relay_core::crypto::{
-    CertificateFieldsV1, CertificateIssuerV1, ContentKey, DeviceCertificateV1, DeviceKeys,
-    RecoveryKeys, RecoveryPhrase, verify_signature, wrap_secret,
+    CertificateFieldsV1, CertificateIssuerV1, ContentKey, CryptoError, DeviceCertificateV1,
+    DeviceKeys, RecoveryKeys, RecoveryPhrase, WrappedKeyEnvelope, verify_signature, wrap_secret,
 };
 use context_relay_protocol::{
     AccountId, BlobRef, BoundedCiphertext, CheckpointV1, DeviceId, DeviceSequence,
-    Ed25519SignatureBytes, HybridLogicalClock, MutationKind, OperationId, PairingRequestNonce,
-    ProjectId, RecordId, RecordKind, RecoveryPhraseWords, Sha256Digest, SyncOperationV1,
-    WorkspaceId, XChaChaNonce, encode_checkpoint_signing_preimage_v1,
-    encode_sync_operation_signing_preimage_v1,
+    Ed25519PublicKeyBytes, Ed25519SignatureBytes, HybridLogicalClock, MutationKind, OperationId,
+    PairingRequestNonce, ProjectId, RecordId, RecordKind, RecoveryPhraseWords, Sha256Digest,
+    SyncOperationV1, WorkspaceId, X25519PublicKeyBytes, XChaChaNonce,
+    encode_checkpoint_signing_preimage_v1, encode_sync_operation_signing_preimage_v1,
 };
 use zeroize::Zeroizing;
 
 const ID: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c07398f";
 const OTHER_ID: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c07398e";
 const PLAINTEXT_CANARY: &[u8] = b"plaintext-canary-47c3";
+
+#[test]
+fn rejects_malformed_or_weak_ed25519_verification_keys() {
+    assert_eq!(
+        verify_signature(
+            Ed25519PublicKeyBytes([0xff; 32]),
+            b"message",
+            Ed25519SignatureBytes([0; 64]),
+        )
+        .unwrap_err(),
+        CryptoError::InvalidKey
+    );
+
+    let mut identity = [0; 32];
+    identity[0] = 1;
+    assert_eq!(
+        verify_signature(
+            Ed25519PublicKeyBytes(identity),
+            b"message",
+            Ed25519SignatureBytes([0; 64]),
+        )
+        .unwrap_err(),
+        CryptoError::InvalidKey
+    );
+}
+
+#[test]
+fn rejects_low_order_x25519_keys_on_both_sides_of_wrapping() {
+    let recipient = DeviceKeys::generate().unwrap();
+    for low_order in [
+        X25519PublicKeyBytes([0; 32]),
+        X25519PublicKeyBytes({
+            let mut one = [0; 32];
+            one[0] = 1;
+            one
+        }),
+    ] {
+        assert_eq!(
+            wrap_secret(low_order, b"secret", b"aad").unwrap_err(),
+            CryptoError::InvalidKey
+        );
+        assert_eq!(
+            recipient
+                .unwrap_secret(
+                    &WrappedKeyEnvelope {
+                        ephemeral_public_key: low_order,
+                        nonce: XChaChaNonce([0; 24]),
+                        ciphertext: vec![0; 16],
+                    },
+                    b"aad",
+                )
+                .unwrap_err(),
+            CryptoError::InvalidKey
+        );
+    }
+}
 
 #[test]
 fn recovery_is_bip39_domain_separated_and_redacted() {
@@ -306,7 +362,9 @@ fn sync_operation() -> SyncOperationV1 {
 
 fn checkpoint() -> CheckpointV1 {
     CheckpointV1 {
-        schema_version: 1,
+        schema_version: context_relay_protocol::CHECKPOINT_SCHEMA_VERSION,
+        account_id: AccountId::from_str(ID).unwrap(),
+        workspace_id: WorkspaceId::from_str(ID).unwrap(),
         previous_checkpoint_hash: Sha256Digest([9; 32]),
         causal_frontier: vec![DeviceSequence {
             device_id: DeviceId::from_str(ID).unwrap(),

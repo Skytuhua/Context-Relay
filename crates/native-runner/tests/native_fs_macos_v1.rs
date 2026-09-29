@@ -21,16 +21,14 @@ use context_relay_native_runner::{
 const TEST_NONCE: [u8; 16] = [0x6d; 16];
 
 const XATTR_NAME: &str = "com.context-relay.native-test";
+const QUARANTINE_XATTR_NAME: &str = "com.apple.quarantine";
 
 fn scratch(parent: &Path, label: &str) -> PathBuf {
     let suffix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let path = parent.join(format!(
-        "context-relay-native-fs-{label}-{}-{suffix}",
-        std::process::id()
-    ));
+    let path = parent.join(format!("crnf-{label}-{}-{suffix}", std::process::id()));
     fs::create_dir(&path).unwrap();
     path
 }
@@ -121,8 +119,12 @@ fn c_path(path: &Path) -> CString {
 }
 
 fn set_xattr(path: &Path, bytes: &[u8]) {
+    set_named_xattr(path, XATTR_NAME, bytes);
+}
+
+fn set_named_xattr(path: &Path, name: &str, bytes: &[u8]) {
     let path = c_path(path);
-    let name = CString::new(XATTR_NAME).unwrap();
+    let name = CString::new(name).unwrap();
     assert_eq!(
         unsafe {
             libc::setxattr(
@@ -136,6 +138,34 @@ fn set_xattr(path: &Path, bytes: &[u8]) {
         },
         0
     );
+}
+
+#[test]
+fn native_tree_accepts_only_fingerprinted_macos_quarantine_metadata() {
+    let root = scratch(&default_case_insensitive_root(), "quarantine-xattr");
+    let nested = root.join("nested");
+    fs::create_dir(&nested).unwrap();
+    let file = nested.join("rules.md");
+    fs::write(&file, b"rules\n").unwrap();
+    set_named_xattr(
+        &nested,
+        QUARANTINE_XATTR_NAME,
+        b"0081;fixture;ContextRelay;",
+    );
+    set_named_xattr(&file, QUARANTINE_XATTR_NAME, b"0081;fixture;ContextRelay;");
+
+    let inventory = inspect_native_tree(&root, RuntimeTarget::MacosArm64).unwrap();
+    set_named_xattr(&file, QUARANTINE_XATTR_NAME, b"0081;changed;ContextRelay;");
+    assert_eq!(
+        inventory.verify_unchanged(),
+        Err(RunnerError::ConcurrentChange)
+    );
+    set_xattr(&file, b"unexpected-metadata");
+    assert_eq!(
+        inspect_native_tree(&root, RuntimeTarget::MacosArm64),
+        Err(RunnerError::UnsafeTopology)
+    );
+    cleanup(&root);
 }
 
 fn get_xattr(path: &Path) -> Vec<u8> {
@@ -264,6 +294,7 @@ fn snapshot_and_compare_and_swap_restore_posix_metadata_and_xattrs() {
     let root = scratch(&default_root(), "snapshot");
     let path = root.join("settings.json");
     fs::write(&path, b"before\n").unwrap();
+    set_xattr(&path, b"preserve-me");
     fs::set_permissions(&path, fs::Permissions::from_mode(0o440)).unwrap();
     let user = std::env::var("USER").expect("macOS native CI must expose USER");
     assert!(
@@ -275,7 +306,6 @@ fn snapshot_and_compare_and_swap_restore_posix_metadata_and_xattrs() {
             .success(),
         "macOS native CI must support a real file ACL"
     );
-    set_xattr(&path, b"preserve-me");
     let native = OsNativeFileSystem::new();
     let before = native.snapshot(&path).unwrap();
     let before_meta = fs::metadata(&path).unwrap();
@@ -364,6 +394,7 @@ fn compare_and_swap_create_delete_and_post_enumeration_swap_are_exact() {
     fs::write(&path, b"before\n").unwrap();
     let native = OsNativeFileSystem::new();
     let before = native.snapshot(&path).unwrap();
+    let before_token = before.object_token().unwrap().clone();
     let absent = before.absent_state();
 
     let deleted = native
@@ -371,10 +402,14 @@ fn compare_and_swap_create_delete_and_post_enumeration_swap_are_exact() {
         .unwrap();
     assert!(deleted.wrote());
     assert!(!path.exists());
+    native
+        .cleanup_committed_delete_observed(&path, before.fingerprint(), &TEST_NONCE, &before_token)
+        .unwrap();
+    let cleaned_absent = native.snapshot(&path).unwrap();
     let restored = native
         .compare_and_swap(
             &path,
-            deleted.snapshot().fingerprint(),
+            cleaned_absent.fingerprint(),
             before.state(),
             &TEST_NONCE,
         )
@@ -388,6 +423,49 @@ fn compare_and_swap_create_delete_and_post_enumeration_swap_are_exact() {
     assert_eq!(
         inventory.verify_unchanged(),
         Err(RunnerError::ConcurrentChange)
+    );
+    cleanup(&root);
+}
+
+#[test]
+fn empty_parent_derives_private_creation_metadata_with_exact_rollback() {
+    let root = scratch(&default_root(), "empty-private-creation");
+    let path = root.join("AGENTS.md");
+    let native = OsNativeFileSystem::new();
+    let absent = native.snapshot(&path).unwrap();
+    let metadata = native.metadata_for_new_private_file(&path).unwrap();
+    let desired = NativeState::regular_file(b"managed\n".to_vec(), metadata);
+
+    let created = native
+        .compare_and_swap(&path, absent.fingerprint(), &desired, &TEST_NONCE)
+        .unwrap();
+    assert!(created.wrote());
+    assert_eq!(created.snapshot().fingerprint(), &desired.fingerprint());
+    assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o600);
+
+    let rolled_back = native
+        .compare_and_swap(
+            &path,
+            created.snapshot().fingerprint(),
+            absent.state(),
+            &TEST_NONCE,
+        )
+        .unwrap();
+    assert!(rolled_back.wrote());
+    assert_eq!(rolled_back.snapshot().fingerprint(), absent.fingerprint());
+    assert!(!path.exists());
+    cleanup(&root);
+}
+
+#[test]
+fn private_creation_metadata_rejects_redirected_parent_topology() {
+    let root = scratch(&default_root(), "private-creation-redirect");
+    let real = root.join("real");
+    fs::create_dir(&real).unwrap();
+    std::os::unix::fs::symlink(&real, root.join("redirected")).unwrap();
+    assert_eq!(
+        OsNativeFileSystem::new().metadata_for_new_private_file(&root.join("redirected/AGENTS.md")),
+        Err(RunnerError::UnsafeTopology)
     );
     cleanup(&root);
 }

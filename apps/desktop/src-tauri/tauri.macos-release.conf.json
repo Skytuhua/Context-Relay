@@ -1,0 +1,25 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "active": true,
+    "targets": ["app"],
+    "externalBin": [
+      "binaries/context-relay-contextd",
+      "binaries/context-relay-context-mcp",
+      "binaries/context-relay-native-helper",
+      "binaries/context-relay-sidecar-installer"
+    ],
+    "resources": {
+      "../../../LICENSE": "LICENSE",
+      "../../../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md",
+      "resources/search/model/model_optimized.onnx": "search/model/model_optimized.onnx",
+      "resources/search/model/config.json": "search/model/config.json",
+      "resources/search/model/special_tokens_map.json": "search/model/special_tokens_map.json",
+      "resources/search/model/tokenizer.json": "search/model/tokenizer.json",
+      "resources/search/model/tokenizer_config.json": "search/model/tokenizer_config.json",
+      "resources/search/runtime/libonnxruntime.1.24.2.dylib": "search/runtime/libonnxruntime.1.24.2.dylib",
+      "resources/search/runtime/LICENSE": "search/runtime/LICENSE",
+      "resources/search/runtime/ThirdPartyNotices.txt": "search/runtime/ThirdPartyNotices.txt"
+    }
+  }
+}

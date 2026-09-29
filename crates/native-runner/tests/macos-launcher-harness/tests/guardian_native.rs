@@ -49,7 +49,7 @@ fn guardian_fd_probe_inner() {
     let original_limit = resource_limit();
     let _restore_limit = ResourceLimitGuard(original_limit);
     let lease_directory = LeaseDirectory::new("fd-probe");
-    assert_ne!(original_limit.rlim_max, libc::RLIM_INFINITY);
+    assert_ne!(original_limit.rlim_cur, libc::RLIM_INFINITY);
 
     let baseline_highest = highest_open_descriptor();
     let lowered_soft = baseline_highest + 32;

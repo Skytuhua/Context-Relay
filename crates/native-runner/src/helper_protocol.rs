@@ -18,7 +18,9 @@ const MAX_CONTENT_FRAMES: usize = 1_024;
 const MAX_CONTENT_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const MAX_TOTAL_CONTENT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_REPORT_BYTES: usize = 8 * 1024 * 1024;
-const MAX_RUNTIME_MS: u32 = 30_000;
+const DEFAULT_RUNTIME_MS: u32 = 30_000;
+const SEMGREP_RUNTIME_MS: u32 = 90_000;
+const MAX_RUNTIME_MS: u32 = SEMGREP_RUNTIME_MS;
 const MAX_CLOSURE_MATERIALS: usize = 256;
 const MAX_CLOSURE_MATERIAL_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_CLOSURE_BYTES: u64 = 768 * 1024 * 1024;
@@ -67,13 +69,18 @@ pub struct RunLimits {
 }
 
 impl RunLimits {
-    pub const fn for_command(_command: &SidecarCommand) -> Self {
+    pub const fn for_command(command: &SidecarCommand) -> Self {
         Self {
             max_files: MAX_CONTENT_FRAMES,
             max_file_bytes: MAX_CONTENT_FRAME_BYTES,
             max_total_bytes: MAX_TOTAL_CONTENT_BYTES,
             max_report_bytes: MAX_REPORT_BYTES,
-            timeout_ms: MAX_RUNTIME_MS,
+            timeout_ms: match command {
+                SidecarCommand::OsemgrepScanPackage => SEMGREP_RUNTIME_MS,
+                SidecarCommand::RuleSyncGenerate { .. } | SidecarCommand::GitleaksScanPackage => {
+                    DEFAULT_RUNTIME_MS
+                }
+            },
         }
     }
 
@@ -175,18 +182,27 @@ impl ClosureMaterial {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HelperRunRequest {
     request: RunRequest,
+    runtime_closure_sha256: [u8; 32],
     closure: Vec<ClosureMaterial>,
 }
 
 impl HelperRunRequest {
-    pub fn new(
+    pub fn new(request: RunRequest, closure: Vec<ClosureMaterial>) -> Result<Self, RunnerError> {
+        let helper_request = Self::for_resigned_runtime(request, closure)?;
+        if &helper_request.runtime_closure_sha256
+            != helper_request.request.expected_closure_sha256()
+        {
+            return Err(RunnerError::ClosureMismatch);
+        }
+        Ok(helper_request)
+    }
+
+    pub fn for_resigned_runtime(
         request: RunRequest,
         mut closure: Vec<ClosureMaterial>,
     ) -> Result<Self, RunnerError> {
         normalize_closure_materials(&mut closure)?;
-        if &closure_material_digest(&closure)? != request.expected_closure_sha256() {
-            return Err(RunnerError::ClosureMismatch);
-        }
+        let runtime_closure_sha256 = closure_material_digest(&closure)?;
         let executable = closure
             .iter()
             .filter(|material| material.executable)
@@ -206,7 +222,11 @@ impl HelperRunRequest {
         {
             return Err(RunnerError::InvalidFrame);
         }
-        Ok(Self { request, closure })
+        Ok(Self {
+            request,
+            runtime_closure_sha256,
+            closure,
+        })
     }
 
     pub fn from_verified(
@@ -235,6 +255,10 @@ impl HelperRunRequest {
 
     pub const fn request(&self) -> &RunRequest {
         &self.request
+    }
+
+    pub const fn runtime_closure_sha256(&self) -> &[u8; 32] {
+        &self.runtime_closure_sha256
     }
 
     pub fn closure(&self) -> &[ClosureMaterial] {
@@ -440,10 +464,16 @@ fn normalize_closure_materials(materials: &mut [ClosureMaterial]) -> Result<(), 
 }
 
 fn expected_executable_name(command: &SidecarCommand, name: &str) -> bool {
+    if matches!(command, SidecarCommand::OsemgrepScanPackage) {
+        return matches!(
+            name,
+            "osemgrep" | "osemgrep.exe" | "semgrep-core" | "semgrep-core.exe"
+        );
+    }
     let stem = match command {
         SidecarCommand::RuleSyncGenerate { .. } => "rulesync",
         SidecarCommand::GitleaksScanPackage => "gitleaks",
-        SidecarCommand::OsemgrepScanPackage => "osemgrep",
+        SidecarCommand::OsemgrepScanPackage => unreachable!(),
     };
     name == stem || name == format!("{stem}.exe")
 }
@@ -454,16 +484,15 @@ fn forbidden_semgrep_material(material: &ClosureMaterial) -> bool {
             .nfkc()
             .flat_map(char::to_lowercase)
             .collect::<String>();
-        [
-            "python",
-            "pysemgrep",
-            "site-packages",
-            "wheelhouse",
-            "semgrep-core",
-        ]
-        .iter()
-        .any(|forbidden| normalized.contains(forbidden))
-    })
+        ["python", "pysemgrep", "site-packages", "wheelhouse"]
+            .iter()
+            .any(|forbidden| normalized.contains(forbidden))
+    }) || (!material.executable
+        && material
+            .path
+            .as_str()
+            .split('/')
+            .any(|component| component.to_ascii_lowercase().contains("semgrep-core")))
 }
 
 pub fn write_run_request<W: Write>(
@@ -610,7 +639,7 @@ fn decode_request_payload(payload: &[u8]) -> Result<RunRequest, RunnerError> {
 
 fn encode_helper_request_payload(request: &HelperRunRequest) -> Result<Vec<u8>, RunnerError> {
     let mut encoder = Encoder::new(Vec::new());
-    encoder.map(5).map_err(enc)?;
+    encoder.map(6).map_err(enc)?;
     key(&mut encoder, 0)?;
     encoder.bytes(request.request.nonce()).map_err(enc)?;
     key(&mut encoder, 1)?;
@@ -623,12 +652,16 @@ fn encode_helper_request_payload(request: &HelperRunRequest) -> Result<Vec<u8>, 
     encode_content_frames(&mut encoder, request.request.inputs())?;
     key(&mut encoder, 4)?;
     encode_closure_materials(&mut encoder, request.closure())?;
+    key(&mut encoder, 5)?;
+    encoder
+        .bytes(request.runtime_closure_sha256())
+        .map_err(enc)?;
     Ok(encoder.into_writer())
 }
 
 fn decode_helper_request_payload(payload: &[u8]) -> Result<HelperRunRequest, RunnerError> {
     let mut decoder = Decoder::new(payload);
-    require_map(&mut decoder, 5)?;
+    require_map(&mut decoder, 6)?;
     expect_key(&mut decoder, 0)?;
     let nonce = read_fixed::<16>(&mut decoder)?;
     expect_key(&mut decoder, 1)?;
@@ -639,13 +672,18 @@ fn decode_helper_request_payload(payload: &[u8]) -> Result<HelperRunRequest, Run
     let inputs = decode_content_frames(&mut decoder)?;
     expect_key(&mut decoder, 4)?;
     let closure = decode_closure_materials(&mut decoder)?;
+    expect_key(&mut decoder, 5)?;
+    let runtime_closure_sha256 = read_fixed::<32>(&mut decoder)?;
     if decoder.position() != payload.len() {
         return Err(RunnerError::InvalidFrame);
     }
-    let request = HelperRunRequest::new(
+    let request = HelperRunRequest::for_resigned_runtime(
         RunRequest::new(nonce, closure_sha256, command, inputs)?,
         closure,
     )?;
+    if request.runtime_closure_sha256 != runtime_closure_sha256 {
+        return Err(RunnerError::ClosureMismatch);
+    }
     if encode_helper_request_payload(&request)? != payload {
         return Err(RunnerError::InvalidFrame);
     }

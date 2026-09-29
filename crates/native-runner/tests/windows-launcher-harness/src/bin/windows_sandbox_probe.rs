@@ -1,9 +1,10 @@
 #![cfg(windows)]
 
+use context_relay_native_runner::read_helper_request;
 use std::{
     env,
     ffi::OsString,
-    io::{Read, Write},
+    io::Write,
     net::{SocketAddr, TcpStream},
     os::windows::ffi::OsStringExt,
     path::PathBuf,
@@ -17,8 +18,15 @@ fn main() {
     stdout.write_all(b"READY\n").unwrap();
     stdout.flush().unwrap();
 
-    let mut request = String::new();
-    std::io::stdin().read_to_string(&mut request).unwrap();
+    let helper_request = read_helper_request(&mut std::io::stdin().lock()).unwrap();
+    assert_eq!(helper_request.request().inputs().len(), 1);
+    let request = std::str::from_utf8(helper_request.request().inputs()[0].bytes()).unwrap();
+    if request == "PATH-RESOLUTION\n" {
+        let home = PathBuf::from(env::var_os("HOME").unwrap());
+        let result = context_relay_windows_launcher_harness::path_probe::inspect(&home);
+        writeln!(stdout, "PATH-RESOLUTION={result}").unwrap();
+        return;
+    }
     let mut lines = request.lines();
     if lines.next() == Some("RUNTIME-SEAL") {
         assert_eq!(lines.next(), None);
@@ -54,6 +62,15 @@ fn main() {
                 .open(nested.join("attacker.dll"))
                 .is_err()
         );
+        let executable = nested.join("pinned.exe");
+        let mut child = std::process::Command::new(executable)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        drop(child.stdin.take());
+        child.wait().unwrap();
         writeln!(stdout, "RUNTIME-SEALED").unwrap();
         return;
     }

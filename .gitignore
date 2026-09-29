@@ -8,9 +8,11 @@
 /apps/desktop/dist/
 /src-tauri/target/
 /apps/desktop/src-tauri/gen/schemas/
+/apps/desktop/src-tauri/binaries/
 /.pnpm-store/
 
 # Supabase local state
+# Supabase CLI runtime state and local environment overrides only.
 /supabase/.temp/
 /supabase/.branches/
 /supabase/.local/
@@ -45,4 +47,6 @@ Desktop.ini
 /secrets/
 
 # Local development workflow state
+/apps/desktop/src-tauri/resources/search/
 /.superpowers/
+/.worktrees/

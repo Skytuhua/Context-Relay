@@ -1,15 +1,27 @@
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 
 import { acceptsCygwinRelease } from './assert-cygwin-release.mjs';
 import { validateIndependentBuilderIdentities } from './verify-native-builder-identities.mjs';
 
 const workflowUrl = new URL('../.github/workflows/ci.yml', import.meta.url);
+const releaseQualificationWorkflowUrl = new URL(
+  '../.github/workflows/semgrep-release-qualification.yml',
+  import.meta.url,
+);
+const firewallWorkflowUrl = new URL('../.github/workflows/windows-firewall-diagnostic.yml', import.meta.url);
+const firewallPolicyUrl = new URL('../third_party/sidecars/semgrep/windows-offline-firewall.ps1', import.meta.url);
 const publicationWorkflowUrl = new URL('../.github/workflows/publish-semgrep-native.yml', import.meta.url);
 const sourceLockUrl = new URL('../third_party/sidecars/semgrep/source-lock.v1.json', import.meta.url);
 const provenanceUrl = new URL('../third_party/sidecars/semgrep/native-ci-provenance.v1.json', import.meta.url);
+const execFileAsync = promisify(execFile);
 
 function job(source, name, next) {
   const start = source.indexOf(`  ${name}:`);
@@ -19,7 +31,7 @@ function job(source, name, next) {
   return source.slice(start, end);
 }
 
-test('native CI independently builds, compares, candidate-smokes, then uploads exact target artifacts', async () => {
+test('native CI prepares, candidate-smokes, then uploads exact target artifacts', async () => {
   const source = await readFile(workflowUrl, 'utf8');
   const windowsBuilder = job(source, 'native-semgrep-windows-x64-builders', 'native-isolation-windows-x64');
   const windows = job(source, 'native-isolation-windows-x64', 'native-semgrep-macos-arm64-builders');
@@ -33,12 +45,13 @@ test('native CI independently builds, compares, candidate-smokes, then uploads e
   }
 
   for (const [target, body] of [['windows', windows], ['macos', macos]]) {
-    assert.match(body, /prepare-semgrep-runtime\.mjs --prepare[^\n]+--source-bundle[^\n]+--bundle-evidence/);
+    assert.match(body, /prepare-semgrep-runtime\.mjs[^\n]+--source-bundle[^\n]+--bundle-evidence/);
+    assert.match(body, /--prepare-v1/);
     assert.match(body, /-- --list/);
     assert.match(body, /CONTEXT_RELAY_REAL_SIDECAR_MANIFEST_ROOT/);
     assert.match(body, /CONTEXT_RELAY_CI_CANDIDATE_DOCUMENT/);
     assert.doesNotMatch(body, /Require enabled .*Semgrep/);
-    const prepared = body.indexOf('prepare-semgrep-runtime.mjs --prepare');
+    const prepared = body.indexOf('prepare-semgrep-runtime.mjs');
     const nativeSmoke = body.indexOf('real_semgrep', prepared) >= 0
       ? body.indexOf('real_semgrep', prepared)
       : body.indexOf('real_sidecar_semgrep', prepared);
@@ -64,6 +77,11 @@ test('native CI independently builds, compares, candidate-smokes, then uploads e
     macos,
     /cargo test -p context-relay-core --test native_filesystem_macos_v1 --test native_recovery_v1 --test native_recovery_crash_v1/,
   );
+  assert.match(
+    windows,
+    /windows-launcher-harness\/Cargo\.toml -- --nocapture --test-threads=1/,
+  );
+  assert.match(windows, /runs-on: windows-2025\n/);
 
   assert.match(macosBuilder, /runs-on: macos-15\n/);
   assert.match(macos, /runs-on: macos-15\n/);
@@ -80,6 +98,107 @@ test('native CI independently builds, compares, candidate-smokes, then uploads e
     'real_sidecar_gitleaks_clean_and_finding_ignore_attacker_gitleaksignore',
     'real_sidecar_semgrep_clean_and_finding_use_the_closed_policy',
   ]) assert.match(source, new RegExp(name));
+});
+
+test('normal CI uses one native builder per platform and defers A/B qualification', async () => {
+  const [source, qualification] = await Promise.all([
+    readFile(workflowUrl, 'utf8'),
+    readFile(releaseQualificationWorkflowUrl, 'utf8'),
+  ]);
+  assert.match(source, /workflow_call:[\s\S]+semgrep_release_qualification:[\s\S]+default:\s*false/);
+  assert.equal(
+    source.split(`fromJSON(inputs.semgrep_release_qualification && '["a","b"]' || '["a"]')`).length - 1,
+    2,
+  );
+  assert.equal((source.match(/--prepare-v1/g) ?? []).length, 2);
+  assert.match(source, /request-native-sidecar-publication:[\s\S]+inputs\.semgrep_release_qualification/);
+  assert.match(qualification, /workflow_dispatch:/);
+  assert.match(qualification, /uses:\s*\.\/\.github\/workflows\/ci\.yml/);
+  assert.match(qualification, /semgrep_release_qualification:\s*true/);
+  const caller = job(qualification, 'qualification');
+  assert.match(caller, /permissions:\s*\n\s+actions: read\s*\n\s+contents: write/);
+  assert.match(source, /github\.event_name == 'push' && github\.ref == 'refs\/heads\/main' && github\.ref_protected == true/);
+});
+
+test('normal V1 retries reuse successful native artifacts across workflow attempts', async () => {
+  const source = await readFile(workflowUrl, 'utf8');
+  assert.equal(
+    (source.match(/inputs\.semgrep_release_qualification && format\('-\{0\}', github\.run_attempt\) \|\| ''/g) ?? []).length,
+    4,
+  );
+  assert.equal(
+    (source.match(/overwrite:\s*\$\{\{ !inputs\.semgrep_release_qualification \}\}/g) ?? []).length,
+    2,
+  );
+  assert.match(source, /\$artifactAttempt = if \(\$env:CONTEXT_RELAY_RELEASE_QUALIFICATION -eq 'true'\)/);
+  assert.match(source, /artifactName = "task9-semgrep-windows-build-[^"]+\$artifactAttempt"/);
+  assert.match(source, /const attempt=process\.env\.CONTEXT_RELAY_RELEASE_QUALIFICATION==="true"/);
+});
+
+test('normal V1 fixes can reuse a prior native build without repeating it', async () => {
+  const source = await readFile(workflowUrl, 'utf8');
+  assert.match(source, /semgrep_artifact_run_id:[\s\S]+type:\s*string/);
+  assert.match(source, /semgrep_artifact_commit:[\s\S]+type:\s*string/);
+  assert.equal((source.match(/run-id:\s*\$\{\{ inputs\.semgrep_artifact_run_id \}\}/g) ?? []).length, 2);
+  assert.equal((source.match(/github-token:\s*\$\{\{ github\.token \}\}/g) ?? []).length, 2);
+  assert.match(source, /workflow_dispatch' && inputs\.semgrep_artifact_run_id == ''/);
+});
+
+test('normal CI skips native Semgrep for non-material evidence-only changes', async () => {
+  const source = await readFile(workflowUrl, 'utf8');
+  const changes = job(source, 'semgrep-materials', 'native-semgrep-windows-x64-builders');
+  assert.match(changes, /native-build-evidence\.v1\.json/);
+  assert.match(changes, /changed=false/);
+  assert.match(changes, /changed=true/);
+  for (const name of [
+    'native-semgrep-windows-x64-builders',
+    'native-semgrep-macos-arm64-builders',
+  ]) {
+    const body = job(
+      source,
+      name,
+      name === 'native-semgrep-windows-x64-builders'
+        ? 'native-isolation-windows-x64'
+        : 'native-isolation-macos-arm64',
+    );
+    assert.match(body, /needs:\s*semgrep-materials/);
+    if (name === 'native-semgrep-windows-x64-builders') {
+      assert.match(body, /needs\.semgrep-materials\.outputs\.changed == 'true'/);
+    } else {
+      assert.match(body, /^    if: \$\{\{ false \}\}$/m);
+    }
+  }
+});
+
+test('macOS native CI mounts a debuggable case-sensitive APFS image', async () => {
+  const source = await readFile(workflowUrl, 'utf8');
+  const macos = job(source, 'native-isolation-macos-arm64', 'request-native-sidecar-publication');
+  const start = macos.indexOf('- name: Mount canonical case-sensitive APFS root');
+  const end = macos.indexOf('- name: Run macOS native and exact registered real-sidecar gates', start);
+  assert.ok(start >= 0 && end > start, 'missing case-sensitive APFS mount step');
+  const mount = macos.slice(start, end);
+
+  assert.match(mount, /hdiutil create[^\n]+-fs 'Case-sensitive APFS'/);
+  assert.doesNotMatch(mount, /-fs APFSX|hdiutil (?:create|attach) -quiet/);
+  assert.match(mount, /printf x > "\$mount\/CaseProbe"/);
+  assert.match(mount, /printf y > "\$mount\/caseprobe"/);
+  assert.match(mount, /find "\$mount"[^\n]+-iname caseprobe[^\n]+wc -l/);
+
+  const gates = macos.slice(end);
+  const canonicalTempAt = gates.indexOf('export TMPDIR="$(cd "${TMPDIR:-$RUNNER_TEMP}" && pwd -P)"');
+  const cargoAt = gates.indexOf('cargo test -p context-relay-native-runner');
+  assert.ok(canonicalTempAt > 0 && canonicalTempAt < cargoAt, 'native tests require a canonical default temp root');
+  assert.doesNotMatch(gates, /export TMPDIR="\$CONTEXT_RELAY_CASE_SENSITIVE_APFS_ROOT"/);
+});
+
+test('macOS generation bound contains the full Semgrep helper envelope', async () => {
+  const [launcher, native] = await Promise.all([
+    readFile(new URL('../crates/native-runner/src/launcher/macos/mod.rs', import.meta.url), 'utf8'),
+    readFile(new URL('../crates/native-runner/src/launcher/macos/native.rs', import.meta.url), 'utf8'),
+  ]);
+  assert.match(launcher, /checked_add\(HELPER_SHUTDOWN_GRACE\)/);
+  assert.match(launcher, /semgrep_helper_envelope_fits_the_native_generation_bound/);
+  assert.match(native, /pub\(super\) const MAX_RUNTIME:\s*Duration\s*=\s*Duration::from_secs\(95\)/);
 });
 
 test('the CI-only candidate verifier feature is scoped to the exact ignored Semgrep smokes', async () => {
@@ -121,11 +240,72 @@ test('Windows native CI pins and records its exact AMD64 toolchain', async () =>
   assert.match(windows, /v24\.14\.0/);
   assert.match(windows, /cygcheck\.exe -cd/);
   assert.match(windows, /assert-cygwin-release\.mjs/);
+  assert.match(windows, /'cygwin=3\.6\.10-1'/);
   assert.match(windows, /--windows-evidence/);
   assert.match(windows, /--windows-stable-toolchain/);
   for (const block of windows.split(/(?=      - name:|      - uses:)/)) {
     if (block.includes('shell: pwsh')) assert.match(block, /\$PSNativeCommandUseErrorActionPreference = \$true/);
   }
+});
+
+test('native builders provision locked system dependencies before closed builds', async () => {
+  const [source, lockText, macosScript] = await Promise.all([
+    readFile(workflowUrl, 'utf8'),
+    readFile(sourceLockUrl, 'utf8'),
+    readFile(new URL('../third_party/sidecars/semgrep/build-public-source-macos.sh', import.meta.url), 'utf8'),
+  ]);
+  const lock = JSON.parse(lockText);
+  const windows = job(source, 'native-semgrep-windows-x64-builders', 'native-isolation-windows-x64');
+  const macos = job(source, 'native-semgrep-macos-arm64-builders', 'native-isolation-macos-arm64');
+  const cygwinPackages = [
+    'mingw64-i686-curl',
+    'mingw64-i686-gmp',
+    'mingw64-i686-pcre2',
+    'mingw64-x86_64-curl',
+    'mingw64-x86_64-gmp',
+    'mingw64-x86_64-pcre2',
+    'pkgconf',
+  ];
+  const homebrewFormulae = [
+    'curl',
+    'dwarfutils',
+    'gmp',
+    'libev',
+    'libunwind-headers',
+    'pcre2',
+    'pkgconf',
+    'zstd',
+  ];
+
+  const windowsProvision = windows.indexOf('$cygwinSetup');
+  const windowsClosedBuild = windows.indexOf('build-public-source-windows.ps1');
+  assert.ok(windowsProvision >= 0 && windowsClosedBuild > windowsProvision);
+  assert.match(windows, /C:\\cygwin\\setup-x86_64\.exe/);
+  for (const name of cygwinPackages) assert.match(windows, new RegExp(`['\"]${name}['\"]`));
+  assert.match(
+    windows,
+    /Start-Process -FilePath \$cygwinSetup -ArgumentList \$arguments -Wait -PassThru -WindowStyle Hidden/,
+  );
+  assert.match(windows, /\$process\.ExitCode/);
+  assert.doesNotMatch(windows, /& \$cygwinSetup @arguments/);
+  const lockedWindows = lock.toolchains.find(({ distributionTarget }) => distributionTarget === 'windows-x86_64');
+  for (const name of cygwinPackages) assert.ok(lockedWindows.cygwinPackages.includes(name), name);
+
+  const macosProvision = macos.indexOf('brew install');
+  const macosClosedBuild = macos.indexOf('build-public-source-macos.sh');
+  assert.ok(macosProvision >= 0 && macosClosedBuild > macosProvision);
+  assert.match(macos, /HOMEBREW_NO_AUTO_UPDATE=1/);
+  for (const name of homebrewFormulae) {
+    assert.match(macos, new RegExp(`brew install[^\\n]*\\b${name.replace('-', '\\-')}\\b`));
+    assert.match(macosScript, new RegExp(`\\b${name.replace('-', '\\-')}\\b`));
+  }
+  const lockedMacos = lock.toolchains.find(({ distributionTarget }) => distributionTarget === 'aarch64-apple-darwin');
+  const provenance = JSON.parse(await readFile(provenanceUrl, 'utf8'));
+  const provenanceMacos = provenance.toolchains.find(({ distributionTarget }) => distributionTarget === 'aarch64-apple-darwin');
+  assert.deepEqual(lockedMacos.homebrewPackages, homebrewFormulae);
+  assert.deepEqual(provenanceMacos.homebrewPackages, homebrewFormulae);
+  assert.match(macosScript, /brew list --versions/);
+  assert.doesNotMatch(macosScript, /brew install/);
 });
 
 test('the shared Cygwin release policy accepts package-suffixed 3.6.10 builds', () => {
@@ -137,7 +317,37 @@ test('the shared Cygwin release policy accepts package-suffixed 3.6.10 builds', 
   }
 });
 
-test('each target uses two independent native builder jobs and a fail-closed comparator', async () => {
+test('macOS artifact transport restores only a proven executable mode', async () => {
+  const source = await readFile(workflowUrl, 'utf8');
+  const builder = job(source, 'native-semgrep-macos-arm64-builders', 'native-isolation-macos-arm64');
+  const comparator = job(source, 'native-isolation-macos-arm64', 'request-native-sidecar-publication');
+  const built = builder.indexOf('build-public-source-macos.sh');
+  const producerProof = builder.indexOf('macOS producer executable mode mismatch');
+  const uploaded = builder.indexOf('actions/upload-artifact@');
+  assert.ok(built >= 0 && producerProof > built && uploaded > producerProof, 'producer mode proof must follow the build and precede upload');
+  assert.match(builder, /O_NOFOLLOW/);
+  assert.match(builder, /fstatSync\(fd\)/);
+  assert.match(builder, /s\.nlink !== 1/);
+  assert.match(builder, /\(s\.mode & 0o777\) !== 0o755/);
+
+  const firstDownload = comparator.indexOf('actions/download-artifact@');
+  const verified = comparator.indexOf('verify-native-builder-identities.mjs');
+  const normalized = comparator.indexOf('macOS artifact transport mode mismatch');
+  const prepared = comparator.indexOf('prepare-semgrep-runtime.mjs');
+  assert.ok(firstDownload >= 0 && verified > firstDownload && normalized > verified && prepared > normalized);
+  assert.match(comparator, /paths=\("\$root\/build-a\/osemgrep"\)/);
+  assert.match(comparator, /inputs\.semgrep_release_qualification[\s\S]+paths\+=\("\$root\/build-b\/osemgrep"\)/);
+  assert.match(comparator, /\(before\.mode & 0o777\) !== 0o644/);
+  assert.match(comparator, /fchmodSync\(fd, 0o755\)/);
+  assert.match(comparator, /\(after\.mode & 0o777\) !== 0o755/);
+  assert.match(comparator, /before\.nlink !== 1/);
+  assert.match(comparator, /after\.nlink !== 1/);
+  assert.doesNotMatch(comparator, /chmod\s+-R|chmod[^\n]*\*/);
+  const windows = job(source, 'native-isolation-windows-x64', 'native-semgrep-macos-arm64-builders');
+  assert.doesNotMatch(windows, /artifact transport mode|fchmodSync/);
+});
+
+test('each target uses one V1 builder or two fail-closed release-qualification builders', async () => {
   const source = await readFile(workflowUrl, 'utf8');
   for (const [target, builderName, comparatorName, next] of [
     ['windows', 'native-semgrep-windows-x64-builders', 'native-isolation-windows-x64', 'native-semgrep-macos-arm64-builders'],
@@ -145,7 +355,9 @@ test('each target uses two independent native builder jobs and a fail-closed com
   ]) {
     const builder = job(source, builderName, comparatorName);
     const comparator = job(source, comparatorName, next);
-    assert.match(builder, /matrix:\s*\n\s+build:\s*\[a, b\]/);
+    assert.match(builder, /fromJSON\(inputs\.semgrep_release_qualification/);
+    assert.match(builder, /'\["a","b"\]'/);
+    assert.match(builder, /'\["a"\]'/);
     assert.match(builder, /strategy\.job-index/);
     assert.match(builder, /strategy\.job-total/);
     assert.match(builder, /job\.check_run_id/);
@@ -157,6 +369,8 @@ test('each target uses two independent native builder jobs and a fail-closed com
     assert.match(comparator, /build-a\.identity\.v1\.json/);
     assert.match(comparator, /build-b\.identity\.v1\.json/);
     assert.match(comparator, /verify-native-builder-identities\.mjs/);
+    assert.match(comparator, /if:\s*\$\{\{ inputs\.semgrep_release_qualification \}\}/);
+    assert.match(comparator, /if:\s*\$\{\{ !inputs\.semgrep_release_qualification \}\}/);
     assert.match(builder, /checkRunId/);
     assert.match(builder, /jobIndex/);
     assert.match(builder, /runId/);
@@ -215,10 +429,56 @@ test('independent builder identity validation rejects empty, zero, or reused pro
   assert.throws(() => validateIndependentBuilderIdentities(a, reused, expected));
 });
 
+test('Windows offline evidence uses the same strict policy in CI and release finalization', async () => {
+  const { validateWindowsOfflineEvidence } = await import('./verify-native-builder-identities.mjs');
+  const workflow = await readFile(workflowUrl, 'utf8');
+  const windows = job(workflow, 'native-isolation-windows-x64', 'native-semgrep-macos-arm64-builders');
+  const producer = await readFile(new URL('../third_party/sidecars/semgrep/build-public-source-windows.ps1', import.meta.url), 'utf8');
+  const finalizer = await readFile(new URL('./finalize-semgrep-native-release.mjs', import.meta.url), 'utf8');
+  assert.match(windows, /--windows-offline-evidence qualification/);
+  assert.match(windows, /--windows-offline-evidence runtime-smoke/);
+  assert.match(finalizer, /validateWindowsOfflineEvidence\(bytes, 'qualification'\)/);
+  const root = await mkdtemp(join(tmpdir(), 'windows-offline-evidence-'));
+  try {
+    for (const [mode, mechanism] of [
+      ['qualification', 'windows-firewall-default-outbound-block-ancestor-runner-hca-tcp443-hca-imds80-experiment'],
+      ['runtime-smoke', 'windows-firewall-runtime-smoke-network-deny'],
+    ]) {
+      const value = { mechanism, probe: 'hostile-outbound-tcp443-and-imds-tcp80-denied', schemaVersion: 1 };
+      const bytes = Buffer.from(`${JSON.stringify(value)}\n`);
+      assert.ok(producer.includes(mechanism));
+      assert.ok(producer.includes(value.probe));
+      assert.equal(validateWindowsOfflineEvidence(bytes, mode), true);
+      for (const changed of [
+        { ...value, mechanism: 'windows-firewall-default-outbound-block-hash-pinned-runner-tcp443-allow' },
+        { ...value, probe: 'hostile-outbound-tcp-denied' },
+        { ...value, mechanism: 'arbitrary-network-allow' },
+        { ...value, schemaVersion: 2 },
+        { mechanism, schemaVersion: 1 },
+        { ...value, unreviewed: true },
+      ]) assert.throws(() => validateWindowsOfflineEvidence(Buffer.from(`${JSON.stringify(changed)}\n`), mode));
+      assert.throws(() => validateWindowsOfflineEvidence(bytes, mode === 'qualification' ? 'runtime-smoke' : 'qualification'));
+      assert.throws(() => validateWindowsOfflineEvidence(bytes.subarray(0, -1), mode));
+      assert.throws(() => validateWindowsOfflineEvidence(bytes, 'unknown'));
+      const path = join(root, 'offline.json');
+      const args = [fileURLToPath(new URL('./verify-native-builder-identities.mjs', import.meta.url)), '--windows-offline-evidence', mode, path];
+      await writeFile(path, bytes);
+      await execFileAsync(process.execPath, args);
+      await writeFile(path, '{}\n');
+      await assert.rejects(execFileAsync(process.execPath, args), /invalid Windows offline evidence/);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('native runtime builds prove OS-enforced offline execution', async () => {
   const [macos, windows] = await Promise.all([
     readFile(new URL('../third_party/sidecars/semgrep/build-public-source-macos.sh', import.meta.url), 'utf8'),
-    readFile(new URL('../third_party/sidecars/semgrep/build-public-source-windows.ps1', import.meta.url), 'utf8'),
+    Promise.all([
+      readFile(new URL('../third_party/sidecars/semgrep/build-public-source-windows.ps1', import.meta.url), 'utf8'),
+      readFile(firewallPolicyUrl, 'utf8'),
+    ]).then((parts) => parts.join('\n')),
   ]);
   assert.match(macos, /\/usr\/bin\/sandbox-exec/);
   assert.match(macos, /\(deny network\*\)/);
@@ -245,6 +505,124 @@ test('native runtime builds prove OS-enforced offline execution', async () => {
   assert.match(windows, /offline-egress\.v1\.json/);
 });
 
+test('Windows offline experiment bounds ancestor HTTPS and HCA-only IMDS rules', async () => {
+  const [windows, workflow] = await Promise.all([
+    Promise.all([
+      readFile(new URL('../third_party/sidecars/semgrep/build-public-source-windows.ps1', import.meta.url), 'utf8'),
+      readFile(firewallPolicyUrl, 'utf8'),
+    ]).then((parts) => parts.join('\n')),
+    readFile(workflowUrl, 'utf8'),
+  ]);
+  const windowsBuilder = job(workflow, 'native-semgrep-windows-x64-builders', 'native-isolation-windows-x64');
+  assert.doesNotMatch(windowsBuilder, /Capture active Actions run-service hosts|CONTEXT_RELAY_RUN_SERVICE_HOSTS/);
+  assert.match(windows, /function Get-RunnerControlPlanePrograms/);
+  assert.match(windows, /Get-FileHash[^\n]+SHA256[^\n]+\$Path/);
+  assert.match(
+    windows,
+    /New-NetFirewallRule[^\n]+-Program\s+\$Program[^\n]+-RemoteAddress\s+Any[^\n]+-RemotePort\s+443[^\n]+-Protocol\s+TCP/,
+  );
+  assert.match(windows, /Get-NetFirewallApplicationFilter/);
+  assert.match(windows, /\$AddressFilter\s*=\s*\$Rule\s*\|\s*Get-NetFirewallAddressFilter/);
+  assert.match(windows, /Get-NetFirewallPortFilter/);
+  assert.match(windows, /function Assert-OfflineFirewallRules/);
+  assert.equal((windows.match(/Assert-OfflineFirewallRules \$ExpectedRules\.ToArray\(\)/g) ?? []).length, 2);
+  assert.equal((windows.match(/Assert-RunnerControlPlaneIdentity \$RunnerIdentities/g) ?? []).length, 2);
+  assert.match(windows, /New-NetFirewallRule[^\n]+-Program \$HcaProgram[^\n]+-RemoteAddress '169\.254\.169\.254'[^\n]+-RemotePort 80[^\n]+-Protocol TCP/);
+  assert.equal((windows.match(/Test-OutboundTcp \$ImdsAddress 80/g) ?? []).length, 3);
+  assert.equal((windows.match(/Test-OutboundTcp \$ProbeAddress/g) ?? []).length, 3);
+  assert.doesNotMatch(windows, /provjobd|WaAppAgent|WindowsAzureGuestAgent/);
+  assert.doesNotMatch(windows, /New-NetFirewallDynamicKeywordAddress|Update-NetFirewallDynamicKeywordAddress/);
+  assert.doesNotMatch(windows, /Start-Job|RunnerAddressRefresher|Get-NetTCPConnection/);
+  assert.match(windows, /Get-DnsClientServerAddress/);
+  assert.match(
+    windows,
+    /New-NetFirewallRule[^\n]+-Service\s+Dnscache[^\n]+-RemoteAddress\s+\$ResolverAddresses[^\n]+-RemotePort\s+53/,
+  );
+  assert.doesNotMatch(windows, /WriteAll(?:Text|Lines|Bytes)\([^\n]*(?:Uri|Url|Diag|Log)/i);
+
+  assert.match(
+    windows,
+    /finally\s*\{[\s\S]*Set-NetFirewallProfile[\s\S]*Enable-NetFirewallRule[\s\S]*Remove-NetFirewallRule/,
+  );
+
+  assert.doesNotMatch(windows, /New-NetFirewallRule[^\n]+-Service\s+Dnscache[^\n]+-RemoteAddress\s+Any/i);
+});
+
+test('Windows V1 compiles before the runtime-only firewall window', async () => {
+  const windows = await readFile(
+    new URL('../third_party/sidecars/semgrep/build-public-source-windows.ps1', import.meta.url),
+    'utf8',
+  );
+  const compiled = windows.indexOf('$Build = if ($OfflineBuild) { $null } else { Build-Once $BuildLabel }');
+  const isolated = windows.indexOf('Invoke-WindowsOfflineFirewall {', compiled);
+  const releaseCompile = windows.indexOf('if ($OfflineBuild) { $Build = Build-Once $BuildLabel }', isolated);
+  const smoke = windows.indexOf('Invoke-RuntimeSmoke $Build', isolated);
+  const policy = await readFile(firewallPolicyUrl, 'utf8');
+  const blocked = policy.indexOf('Set-NetFirewallProfile -Profile $ProfileSnapshot.Name -DefaultOutboundAction Block');
+  const action = policy.indexOf('. $Action', blocked);
+  const restored = policy.lastIndexOf('} finally {');
+  assert.match(policy, /if \(\$RestoreFailures.Count -ne 0\) \{ Fail/);
+  assert.match(windows, /Invoke-WindowsOfflineFirewall \{[\s\S]+Invoke-RuntimeSmoke \$Build\s*\}\s*\[IO.File\]::WriteAllText\(/);
+  assert.match(windows, /\. \(Join-Path \$PSScriptRoot 'windows-offline-firewall\.ps1'\)/);
+  assert.ok(compiled >= 0 && isolated > compiled, 'compiler must run before outbound blocking');
+  assert.ok(releaseCompile > isolated && smoke > releaseCompile, 'release compilation and smoke must share the isolated action');
+  assert.ok(blocked >= 0 && action > blocked && restored > action, 'shared policy restores after the isolated action');
+  assert.match(windows, /function Invoke-RuntimeSmoke[\s\S]+& \$RuntimeExecutable --experimental --version/);
+  assert.match(windows, /runtime smoke completed with network denial/i);
+  assert.doesNotMatch(windows, /native build completed with .*network denial/i);
+});
+
+test('Windows checked commands cannot contaminate the typed build result', async () => {
+  const windows = await readFile(
+    new URL('../third_party/sidecars/semgrep/build-public-source-windows.ps1', import.meta.url),
+    'utf8',
+  );
+  assert.match(
+    windows,
+    /function Invoke-Checked\(\[scriptblock\]\$Command, \[string\]\$Label\) \{\s*& \$Command \| Out-Host\s*if \(\$LASTEXITCODE -ne 0\)/,
+  );
+});
+
+test('Windows closed scans validate native exit codes explicitly', async () => {
+  const windows = await readFile(
+    new URL('../third_party/sidecars/semgrep/build-public-source-windows.ps1', import.meta.url),
+    'utf8',
+  );
+  assert.match(
+    windows,
+    /Set-StrictMode -Version Latest\s+\$PSNativeCommandUseErrorActionPreference = \$false/,
+  );
+  assert.match(windows, /\$FindingStatus -ne 1/);
+  assert.match(windows, /\$InvalidStatus -eq 0 -or \$InvalidStatus -eq 1/);
+});
+
+test('Windows stages exact OCaml compatibility sources and selects only AMD64 curl metadata', async () => {
+  const windows = await readFile(
+    new URL('../third_party/sidecars/semgrep/build-public-source-windows.ps1', import.meta.url),
+    'utf8',
+  );
+  assert.match(windows, /patches\.windows\.v1\.json/);
+  assert.match(windows, /ANSITerminal\.0\.8\.5/);
+  assert.match(windows, /parmap\.1\.2\.5/);
+  assert.match(windows, /ocurl\.0\.9\.1/);
+  assert.equal((windows.match(/pin add --no-action --kind=path/g) ?? []).length, 3);
+  assert.match(windows, /OcurlArchive[^\n]+cache\\sha256\\c6/);
+  assert.doesNotMatch(windows, /OcurlArchiveSha512/);
+  assert.match(windows, /sources[\\/]opam/);
+  assert.match(windows, /Get-FileHash[^\n]+SHA256/);
+  assert.match(windows, /PKG_CONFIG_LIBDIR[^\n]+x86_64-w64-mingw32/);
+  assert.doesNotMatch(windows, /PKG_CONFIG_LIBDIR[^\n]+i686-w64-mingw32/);
+  assert.match(windows, /CPPFLAGS[^\n]+MingwRootForward[^\n]+include/);
+  assert.match(windows, /curl\/curl\.h[^\n]+x86_64-w64-mingw32-gcc \$CPPFLAGS/);
+  const patches = windows.indexOf('patches.windows.v1.json');
+  const headerProbe = windows.indexOf('AMD64 libcurl header preflight');
+  const install = windows.indexOf('$Opam install --locked');
+  assert.ok(
+    patches >= 0 && headerProbe > patches && install > headerProbe,
+    'exact dependency patches and the header preflight must precede installation',
+  );
+});
+
 test('Windows runtime DLL closure never searches ambient PATH', async () => {
   const windows = await readFile(
     new URL('../third_party/sidecars/semgrep/build-public-source-windows.ps1', import.meta.url),
@@ -252,7 +630,18 @@ test('Windows runtime DLL closure never searches ambient PATH', async () => {
   );
   assert.doesNotMatch(windows, /\$env:PATH\.Split/);
   assert.match(windows, /TrustedDllRoots/);
+  assert.match(windows, /\$TreeSitterRuntime = Join-Path \$Project 'libs\\ocaml-tree-sitter-core\\tree-sitter-0\.22\.6\\bin\\libtree-sitter\.dll'/);
+  assert.match(windows, /\(Split-Path -Parent \$TreeSitterRuntime\)/);
+  const treeSitterPreflight = windows.indexOf('libtree-sitter.dll was not built');
+  assert.ok(
+    treeSitterPreflight > windows.indexOf("'tree-sitter build'")
+      && treeSitterPreflight < windows.indexOf('$Opam install --locked'),
+    'tree-sitter runtime closure must fail before the full Semgrep build',
+  );
   assert.match(windows, /x86_64-w64-mingw32-gcc/);
+  assert.match(windows, /\$SystemDllRoot = \(Resolve-Path -LiteralPath \(\[Environment\]::SystemDirectory\)\)\.Path/);
+  assert.match(windows, /\$SystemDllCandidate = Join-Path \$SystemDllRoot \$Name/);
+  assert.match(windows, /\$SystemDllCandidate.*ReparsePoint/s);
   assert.match(windows, /untrusted runtime DLL path/);
 });
 
@@ -265,6 +654,16 @@ test('native builders consume authoritative CI provenance bound to the sealed so
     readFile(new URL('../third_party/sidecars/semgrep/build-public-source-windows.ps1', import.meta.url), 'utf8'),
   ]);
   const provenance = JSON.parse(provenanceText);
+  const sourceLock = JSON.parse(lockBytes);
+  // The source lock is sealed historical source evidence. Its embedded workflow blob is
+  // intentionally non-authoritative for live CI, so ordinary CI hardening must not rewrite it.
+  // Keep the historical records canonical and identical while validating live authority below
+  // through the exact source-lock digest plus native-ci-provenance actions and toolchains.
+  const historicalWorkflowBlobs = new Set(
+    sourceLock.toolchains.map(({ workflowGitBlob }) => workflowGitBlob),
+  );
+  assert.equal(historicalWorkflowBlobs.size, 1);
+  assert.match([...historicalWorkflowBlobs][0] ?? '', /^(?!0{40}$)[0-9a-f]{40}$/);
   assert.equal(provenance.schemaVersion, 1);
   assert.equal(provenance.sourceLock.path, 'third_party/sidecars/semgrep/source-lock.v1.json');
   assert.equal(
@@ -385,9 +784,14 @@ test('every workflow action remains pinned to a full commit SHA', async () => {
   const source = (await Promise.all([
     readFile(workflowUrl, 'utf8'),
     readFile(publicationWorkflowUrl, 'utf8'),
+    readFile(releaseQualificationWorkflowUrl, 'utf8'),
+    readFile(firewallWorkflowUrl, 'utf8'),
   ])).join('\n');
   const uses = [...source.matchAll(/^\s*- uses:\s*(\S+?)(?:\s+#.*)?\s*$/gm)].map((match) => match[1]);
   assert.ok(uses.length > 0);
-  for (const action of uses) assert.match(action, /^[^@]+@[0-9a-f]{40}$/);
+  for (const action of uses) {
+    if (action.startsWith('./')) assert.equal(action, './.github/workflows/ci.yml');
+    else assert.match(action, /^[^@]+@[0-9a-f]{40}$/);
+  }
   assert.doesNotMatch(source, /continue-on-error:\s*true/);
 });

@@ -16,6 +16,7 @@ import {
 import { dirname, basename, join, posix, resolve } from 'node:path';
 import { isIP } from 'node:net';
 import { promisify } from 'node:util';
+import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 
 import { verifyResolvedSourceInventory } from './semgrep-source-inventory.mjs';
@@ -28,6 +29,7 @@ const MAX_BUNDLE_BYTES = 1280 * 1024 * 1024;
 const BUNDLE_METADATA = Buffer.from('{"format":"context-relay-semgrep-source-v1","schemaVersion":1}\n');
 const SOURCE_ASSET_URL = 'https://github.com/Skytuhua/Context-Relay/releases/download/sidecars-semgrep-1.170.0-source.1/semgrep-1.170.0-corresponding-source.tar';
 const BUNDLE_EVIDENCE_STATUSES = new Set([
+  'source_bundle_v1_native_builds_pending',
   'source_bundle_reproducible_native_builds_pending',
   'complete_corresponding_source',
 ]);
@@ -36,6 +38,7 @@ const LEGACY_HTTP_ARCHIVE = new Map([[
   '6a00db1b12b6f55e1b2419f206fdfbaa669e14b51c78f8ac3cffa0a58897be83',
 ]]);
 const DEFAULT_SUPPORT_PATHS = [
+  'scripts/apply-semgrep-source-patches.mjs',
   'scripts/semgrep-source-bundle.mjs',
   'scripts/semgrep-source-inventory.mjs',
   'third_party/sidecars/licenses/semgrep-LGPL-2.1-or-later.txt',
@@ -45,7 +48,9 @@ const DEFAULT_SUPPORT_PATHS = [
   'third_party/sidecars/semgrep/builder-evidence.windows-x86_64.v1.schema.json',
   'third_party/sidecars/semgrep/build-public-source-macos.sh',
   'third_party/sidecars/semgrep/build-public-source-windows.ps1',
+  'third_party/sidecars/semgrep/windows-offline-firewall.ps1',
   'third_party/sidecars/semgrep/patches.v1.json',
+  'third_party/sidecars/semgrep/patches.windows.v1.json',
 ];
 
 function fail(message) {
@@ -583,6 +588,24 @@ function officialArchivePath({ algorithm, digest }) {
   return `opam-repository/cache/${algorithm}/${digest.slice(0, 2)}/${digest}`;
 }
 
+export function archiveCacheLinks(lock) {
+  const aliases = new Map();
+  for (const archive of flattenArchiveSources(lock)) {
+    const stored = bundledArchivePath(archive);
+    for (const [algorithm, digest] of requiredArchiveChecksums(archive)) {
+      if (algorithm === archive.algorithm && digest === archive.digest) continue;
+      const path = officialArchivePath({ algorithm, digest });
+      const target = posix.relative(posix.dirname(path), stored);
+      const previous = aliases.get(path);
+      if (previous !== undefined && previous !== target) fail('archive checksum alias is ambiguous');
+      aliases.set(path, target);
+    }
+  }
+  return [...aliases]
+    .map(([path, target]) => safeLink({ path, target }))
+    .sort((left, right) => compareUtf8(left.path, right.path));
+}
+
 function parseBundledArchivePath(path) {
   if (!path.startsWith('opam-repository/cache/')) return null;
   const sha256 = /^opam-repository\/cache\/sha256\/([0-9a-f]{2})\/([0-9a-f]{64})$/.exec(path);
@@ -681,11 +704,22 @@ async function fetchWithRedirects(start, sha256, fetchImpl, requestTimeoutMs) {
   let current = safeFetchUrl(start, sha256);
   const signal = AbortSignal.timeout(requestTimeoutMs);
   for (let redirects = 0; redirects <= 5; redirects += 1) {
-    const response = await fetchImpl(current, {
-      headers: { 'accept-encoding': 'identity', 'user-agent': 'Context-Relay-Semgrep-Source/1' },
-      redirect: 'manual',
-      signal,
-    });
+    let response;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      response = await fetchImpl(current, {
+        headers: { 'accept-encoding': 'identity', 'user-agent': 'Context-Relay-Semgrep-Source/1' },
+        redirect: 'manual',
+        signal,
+      });
+      if (response.status !== 200) {
+        // Release both native Node and fetch response streams before retry/redirect.
+        response.body?.destroy?.();
+        await response.body?.cancel?.();
+      }
+      if (![408, 429, 500, 502, 503, 504].includes(response.status) || attempt === 2) break;
+      // All retries and redirects share the original request deadline.
+      await delay(250 * (attempt + 1), undefined, { signal });
+    }
     if ([301, 302, 303, 307, 308].includes(response.status)) {
       const location = response.headers.get('location');
       if (location === null || redirects === 5) fail('archive redirect chain is invalid or too long');
@@ -977,9 +1011,9 @@ function validateBundleLock(lock) {
   return lock;
 }
 
-async function readJsonFile(path, label) {
+async function readJsonFile(path, label, maximum = 16 * 1024 * 1024) {
   const info = await lstat(resolve(path));
-  if (!info.isFile() || info.isSymbolicLink() || info.size === 0 || info.size > 16 * 1024 * 1024) {
+  if (!info.isFile() || info.isSymbolicLink() || info.size === 0 || info.size > maximum) {
     fail(`${label} is not a bounded no-link regular file`);
   }
   const bytes = await readFile(path);
@@ -1021,7 +1055,7 @@ export async function buildSemgrepSourceBundle({
   pinRoot,
   semgrepRoot,
   sourceLockPath,
-  supportPaths = [],
+  supportPaths = DEFAULT_SUPPORT_PATHS,
   supportRoot = process.cwd(),
 }) {
   if (![archiveCacheRoot, opamRoot, outputPath, pinRoot, semgrepRoot, sourceLockPath, supportRoot]
@@ -1069,6 +1103,7 @@ export async function buildSemgrepSourceBundle({
   }
 
   state.entries.push(...await verifyArchiveCache(lock, archiveCacheRoot));
+  state.links.push(...archiveCacheLinks(lock));
   state.entries.push({ bytes: loaded.bytes, executable: false, path: 'metadata/source-lock.v1.json' });
   for (const path of [...supportPaths].sort(compareUtf8)) {
     safePath(path, 'support path');
@@ -1110,12 +1145,20 @@ function exactEvidenceKeys(value, expected, label) {
   }
 }
 
-export async function verifyBundleEvidence({ bundlePath, evidencePath, sourceLockPath }) {
+export async function verifyBundleEvidence(options) {
+  return verifyBundleEvidenceForDelivery(options, false);
+}
+
+export async function verifyInternalBundleEvidenceV2(options) {
+  return verifyBundleEvidenceForDelivery(options, true);
+}
+
+async function verifyBundleEvidenceForDelivery({ bundlePath, evidencePath, sourceLockPath }, internal) {
   if (![bundlePath, evidencePath, sourceLockPath].every((value) => typeof value === 'string')) {
     fail('bundle evidence arguments are invalid');
   }
   const [evidenceFile, sourceLockFile] = await Promise.all([
-    readJsonFile(evidencePath, 'bundle evidence'),
+    readJsonFile(evidencePath, 'bundle evidence', internal ? 65536 : undefined),
     readJsonFile(sourceLockPath, 'source lock'),
   ]);
   const evidence = evidenceFile.value;
@@ -1126,7 +1169,7 @@ export async function verifyBundleEvidence({ bundlePath, evidencePath, sourceLoc
     'format',
     'independentBuilds',
     'schemaVersion',
-    'sourceAssetUrl',
+    internal ? 'sourceDelivery' : 'sourceAssetUrl',
     'sourceLockSha256',
     'status',
   ], 'bundle evidence');
@@ -1137,13 +1180,19 @@ export async function verifyBundleEvidence({ bundlePath, evidencePath, sourceLoc
     'size',
   ], 'bundle evidence bundle');
   const sha256Pattern = /^[0-9a-f]{64}$/;
-  if (evidence.sourceAssetUrl !== SOURCE_ASSET_URL) {
+  if (internal) {
+    exactEvidenceKeys(evidence.sourceDelivery, ['kind', 'path'], 'bundle evidence source delivery');
+    if (evidence.sourceDelivery.kind !== 'bundled'
+        || evidence.sourceDelivery.path !== 'compliance/semgrep/semgrep-1.170.0-corresponding-source.tar') {
+      fail('bundle evidence source delivery is invalid');
+    }
+  } else if (evidence.sourceAssetUrl !== SOURCE_ASSET_URL) {
     fail('bundle evidence source asset URL is invalid');
   }
-  if (evidence.schemaVersion !== 1
+  if (evidence.schemaVersion !== (internal ? 2 : 1)
       || evidence.format !== 'context-relay-semgrep-source-v1'
-      || evidence.independentBuilds !== 2
-      || evidence.byteIdentical !== true
+      || !Number.isSafeInteger(evidence.independentBuilds)
+      || typeof evidence.byteIdentical !== 'boolean'
       || !BUNDLE_EVIDENCE_STATUSES.has(evidence.status)
       || !sha256Pattern.test(evidence.sourceLockSha256)
       || !sha256Pattern.test(evidence.bundleGeneratorSha256)
@@ -1152,6 +1201,54 @@ export async function verifyBundleEvidence({ bundlePath, evidencePath, sourceLoc
       || !Number.isSafeInteger(evidence.bundle.payloadEntries) || evidence.bundle.payloadEntries < 1
       || !Number.isSafeInteger(evidence.bundle.recordedLinks) || evidence.bundle.recordedLinks < 0) {
     fail('bundle evidence is invalid');
+  }
+  const v1 = evidence.status === 'source_bundle_v1_native_builds_pending';
+  if (evidence.independentBuilds !== (v1 ? 1 : 2)
+      || evidence.byteIdentical !== !v1) fail('bundle evidence qualification claim is invalid');
+  if (internal) {
+    if (evidence.status !== 'complete_corresponding_source'
+        || [evidence.sourceLockSha256, evidence.bundleGeneratorSha256, evidence.bundle.sha256]
+          .some((value) => typeof value !== 'string' || /^0+$/.test(value))
+        || evidence.bundle.size > 2147483648
+        || evidence.bundle.payloadEntries > 1000000 || evidence.bundle.recordedLinks > 1000000) {
+      fail('internal bundle evidence is incomplete or exceeds its bounds');
+    }
+    const canonical = {
+      schemaVersion: evidence.schemaVersion,
+      format: evidence.format,
+      sourceLockSha256: evidence.sourceLockSha256,
+      bundleGeneratorSha256: evidence.bundleGeneratorSha256,
+      independentBuilds: evidence.independentBuilds,
+      byteIdentical: evidence.byteIdentical,
+      status: evidence.status,
+      sourceDelivery: { kind: evidence.sourceDelivery.kind, path: evidence.sourceDelivery.path },
+      bundle: {
+        sha256: evidence.bundle.sha256,
+        size: evidence.bundle.size,
+        payloadEntries: evidence.bundle.payloadEntries,
+        recordedLinks: evidence.bundle.recordedLinks,
+      },
+    };
+    if (!evidenceFile.bytes.equals(Buffer.from(`${JSON.stringify(canonical, null, 2)}\n`))) {
+      fail('internal bundle evidence is not canonical JSON');
+    }
+    const lock = sourceLockFile.value;
+    if (lock?.completeCorrespondingSource !== true || lock.recursiveInventoryComplete !== true
+        || lock.opam?.resolvedSourceArchivesComplete !== true
+        || !Array.isArray(lock.missingMaterial) || lock.missingMaterial.length !== 0
+        || !Array.isArray(lock.targetStatus) || lock.targetStatus.length !== 2) {
+      fail('internal source lock is incomplete');
+    }
+    for (const status of lock.targetStatus) {
+      exactEvidenceKeys(status, ['distributionTarget', 'enabled', 'reason'], 'internal source lock target');
+    }
+    const windows = lock.targetStatus.filter((status) => status.distributionTarget === 'windows-x86_64');
+    const apple = lock.targetStatus.filter((status) => status.distributionTarget === 'aarch64-apple-darwin');
+    if (windows.length !== 1 || windows[0].enabled !== true || windows[0].reason !== null
+        || apple.length !== 1 || apple[0].enabled !== false
+        || apple[0].reason !== 'deferred_apple_native_qualification') {
+      fail('internal source lock target qualification is invalid');
+    }
   }
   if (evidence.sourceLockSha256 !== hash('sha256', sourceLockFile.bytes)) {
     fail('bundle evidence source lock hash mismatch');
@@ -1166,6 +1263,13 @@ export async function verifyBundleEvidence({ bundlePath, evidencePath, sourceLoc
     fail('bundle evidence generator hash mismatch');
   }
   const verified = await verifySemgrepSourceBundle({ bundlePath, sourceLockPath });
+  if (internal) {
+    for (const material of sourceLockFile.value.licenseMaterials) {
+      if (verified.digests[material.path] !== material.sha256) {
+        fail('internal source lock license material does not match the bundle');
+      }
+    }
+  }
   if (evidence.bundle.sha256 !== verified.sha256
       || evidence.bundle.size !== verified.size
       || evidence.bundle.payloadEntries !== verified.payloadEntries
@@ -1247,6 +1351,17 @@ export async function materializeBundleLinks(root) {
       if (error.code !== 'ENOENT') throw error;
     }
     const target = posix.normalize(posix.join(posix.dirname(item.path), item.target));
+    if (item.path.startsWith('opam-repository/cache/')) {
+      if (!target.startsWith('opam-repository/cache/')) fail('archive checksum alias target is unsafe');
+      await noLinkParent(root, target);
+      const source = join(resolve(root), ...target.split('/'));
+      const sourceInfo = await lstat(source);
+      if (!sourceInfo.isFile() || sourceInfo.isSymbolicLink()) {
+        fail('archive checksum alias source is unsafe');
+      }
+      await link(source, destination);
+      continue;
+    }
     let type = 'file';
     try {
       if ((await lstat(join(resolve(root), ...target.split('/')))).isDirectory()) type = 'dir';
@@ -1274,8 +1389,12 @@ export async function materializeBundleLinks(root) {
     if (!sourceInfo.isFile() || sourceInfo.isSymbolicLink()) fail('bundled SHA-512 archive is unsafe');
     const destination = join(resolve(root), ...official.split('/'));
     try {
-      await lstat(destination);
-      fail(`official SHA-512 cache path already exists: ${official}`);
+      const destinationInfo = await lstat(destination);
+      if (!destinationInfo.isFile() || destinationInfo.isSymbolicLink()
+          || destinationInfo.dev !== sourceInfo.dev || destinationInfo.ino !== sourceInfo.ino) {
+        fail(`official SHA-512 cache path already exists: ${official}`);
+      }
+      continue;
     } catch (error) {
       if (error.code !== 'ENOENT') throw error;
     }

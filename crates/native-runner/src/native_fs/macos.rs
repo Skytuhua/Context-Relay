@@ -1,5 +1,5 @@
 use std::{
-    ffi::{CStr, CString, c_void},
+    ffi::{CStr, CString, OsStr, c_void},
     fs::{self, File},
     io::Read,
     mem::{size_of, zeroed},
@@ -27,7 +27,11 @@ const MODE_SYMLINK: u32 = libc::S_IFLNK as u32;
 const MAX_SNAPSHOT_BYTES: u64 = 200 * 1024 * 1024;
 const MAX_SECURITY_BYTES: usize = 1024 * 1024;
 const MAX_XATTRS: usize = 128;
+const QUARANTINE_XATTR: &[u8] = b"com.apple.quarantine";
+const PROVENANCE_XATTR: &[u8] = b"com.apple.provenance";
 type ExtendedAttributes = Vec<(Vec<u8>, Vec<u8>)>;
+#[cfg(test)]
+type TestHook = Box<dyn FnOnce() + Send>;
 
 #[cfg(test)]
 static PRE_TARGET_MUTATION_TEST_HOOK: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> =
@@ -47,68 +51,68 @@ static PRE_ROLLBACK_MOVE_TEST_HOOK: std::sync::Mutex<Option<Box<dyn FnOnce() + S
 #[cfg(test)]
 static RECOVERY_AFTER_PARENT_CHECK_TEST_HOOK: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> =
     std::sync::Mutex::new(None);
+#[cfg(test)]
+static CREATION_METADATA_TEST_HOOK: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn take_test_hook(hook: &std::sync::Mutex<Option<TestHook>>) -> Option<TestHook> {
+    hook.lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+}
 
 #[cfg(test)]
 fn run_pre_target_mutation_test_hook() {
-    if let Some(hook) = PRE_TARGET_MUTATION_TEST_HOOK
-        .lock()
-        .expect("test hook lock")
-        .take()
-    {
+    if let Some(hook) = take_test_hook(&PRE_TARGET_MUTATION_TEST_HOOK) {
         hook();
     }
 }
 
 #[cfg(test)]
 fn run_pre_backup_removal_test_hook() {
-    if let Some(hook) = PRE_BACKUP_REMOVAL_TEST_HOOK
-        .lock()
-        .expect("test hook lock")
-        .take()
-    {
+    if let Some(hook) = take_test_hook(&PRE_BACKUP_REMOVAL_TEST_HOOK) {
         hook();
     }
 }
 
 #[cfg(test)]
 fn run_pre_install_test_hook() {
-    if let Some(hook) = PRE_INSTALL_TEST_HOOK.lock().expect("test hook lock").take() {
+    if let Some(hook) = take_test_hook(&PRE_INSTALL_TEST_HOOK) {
         hook();
     }
 }
 
 #[cfg(test)]
 fn run_post_missing_snapshot_test_hook() {
-    if let Some(hook) = POST_MISSING_SNAPSHOT_TEST_HOOK
-        .lock()
-        .expect("test hook lock")
-        .take()
-    {
+    if let Some(hook) = take_test_hook(&POST_MISSING_SNAPSHOT_TEST_HOOK) {
         hook();
     }
 }
 
 #[cfg(test)]
 fn run_pre_rollback_move_test_hook() {
-    if let Some(hook) = PRE_ROLLBACK_MOVE_TEST_HOOK
-        .lock()
-        .expect("test hook lock")
-        .take()
-    {
+    if let Some(hook) = take_test_hook(&PRE_ROLLBACK_MOVE_TEST_HOOK) {
         hook();
     }
 }
 
 #[cfg(test)]
 fn run_recovery_after_parent_check_test_hook() {
-    if let Some(hook) = RECOVERY_AFTER_PARENT_CHECK_TEST_HOOK
-        .lock()
-        .expect("test hook lock")
-        .take()
-    {
+    if let Some(hook) = take_test_hook(&RECOVERY_AFTER_PARENT_CHECK_TEST_HOOK) {
         hook();
     }
 }
+
+#[cfg(test)]
+fn run_creation_metadata_test_hook() {
+    if let Some(hook) = take_test_hook(&CREATION_METADATA_TEST_HOOK) {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn run_creation_metadata_test_hook() {}
 
 unsafe extern "C" {
     fn acl_free(object: *mut c_void) -> libc::c_int;
@@ -147,6 +151,69 @@ pub(super) fn snapshot(path: &Path) -> Result<NativeSnapshot, RunnerError> {
     Ok(snapshot)
 }
 
+pub(super) fn metadata_for_new_private_file(path: &Path) -> Result<NativeMetadata, RunnerError> {
+    let parent = OpenParent::new(path)?;
+    let before = raw_node(&parent.directory)?;
+    if !before.directory() {
+        return Err(RunnerError::UnsafeTopology);
+    }
+    match raw_at(&parent.directory, &parent.name) {
+        Err(RunnerError::Io) if last_errno() == libc::ENOENT => {}
+        Ok(_) => return Err(RunnerError::ConcurrentChange),
+        Err(error) => return Err(error),
+    }
+    run_creation_metadata_test_hook();
+    let final_parent_links = before
+        .links
+        .checked_add(1)
+        .ok_or(RunnerError::LimitExceeded)?;
+    let inherited_provenance = xattrs(&parent.directory)?
+        .into_iter()
+        .filter(|(name, _)| name.as_slice() == PROVENANCE_XATTR)
+        .collect();
+    let security = PosixSecurity {
+        uid: unsafe { libc::geteuid() },
+        gid: unsafe { libc::getegid() },
+        mode: MODE_REGULAR | 0o600,
+        flags: 0,
+        acl: Vec::new(),
+        xattrs: inherited_provenance,
+        parent_uid: before.uid,
+        parent_gid: before.gid,
+        parent_mode: before.mode,
+        parent_flags: before.flags,
+        parent_links: final_parent_links,
+    };
+    let after = raw_node(&parent.directory)?;
+    match raw_at(&parent.directory, &parent.name) {
+        Err(RunnerError::Io) if last_errno() == libc::ENOENT => {}
+        Ok(_) => return Err(RunnerError::ConcurrentChange),
+        Err(error) => return Err(error),
+    }
+    if !before.same_snapshot(&after) || !identity_matches_path(&parent.directory, &parent.path)? {
+        return Err(RunnerError::ConcurrentChange);
+    }
+    let (parent_attributes, parent_link_count) = parent_marker_fields(
+        before.mode,
+        before.flags,
+        before.uid,
+        before.gid,
+        final_parent_links,
+    );
+    Ok(NativeMetadata {
+        file_attributes: 0,
+        creation_time: timestamp(before.birth_seconds, before.birth_nanoseconds)?,
+        last_access_time: timestamp(before.access_seconds, before.access_nanoseconds)?,
+        last_write_time: timestamp(before.write_seconds, before.write_nanoseconds)?,
+        change_time: timestamp(before.change_seconds, before.change_nanoseconds)?,
+        security_descriptor: security.encode()?,
+        alternate_streams: Vec::new(),
+        link_count: 1,
+        parent_attributes,
+        parent_link_count,
+    })
+}
+
 pub(super) fn compare_and_swap_with_provenance(
     path: &Path,
     expected: &[u8; 32],
@@ -158,6 +225,7 @@ pub(super) fn compare_and_swap_with_provenance(
     let parent = OpenParent::new(path).map_err(super::NativeMutationFailure::from)?;
     let current = snapshot_named(&parent.directory, &parent.name)
         .map_err(super::NativeMutationFailure::from)?;
+    let intended_fingerprint = fingerprint(desired);
     if current.fingerprint() != expected
         || expected_token.is_some_and(|token| current.object_token() != Some(token))
         || !identity_matches_path(&parent.directory, &parent.path)
@@ -168,7 +236,7 @@ pub(super) fn compare_and_swap_with_provenance(
     if matches!(
         (current.state(), desired),
         (NativeState::Absent { .. }, NativeState::Absent { .. })
-    ) || current.fingerprint() == &fingerprint(desired)
+    ) || current.fingerprint() == &intended_fingerprint
     {
         return Ok(super::NativeMutationOutcome {
             wrote: false,
@@ -178,24 +246,31 @@ pub(super) fn compare_and_swap_with_provenance(
     }
     let mut installed_token = None;
     let write = match desired {
-        NativeState::Absent { .. } => delete_regular_file(
-            &parent,
-            current
-                .object_token()
-                .ok_or(RunnerError::ConcurrentChange)
-                .map_err(super::NativeMutationFailure::from)?,
-            expected,
-            &mut installed_token,
-            persist_candidate,
-        ),
+        NativeState::Absent { .. } => {
+            let retain_backup = delete_retains_backup(&current, &intended_fingerprint)
+                .map_err(super::NativeMutationFailure::from)?;
+            delete_regular_file(
+                &parent,
+                current
+                    .object_token()
+                    .ok_or(RunnerError::ConcurrentChange)
+                    .map_err(super::NativeMutationFailure::from)?,
+                expected,
+                &intended_fingerprint,
+                retain_backup,
+                &mut installed_token,
+                persist_candidate,
+            )
+        }
         NativeState::RegularFile { bytes, metadata } => replace_regular_file(
             &parent,
             current.object_token(),
             matches!(current.state(), NativeState::RegularFile { .. }),
+            false,
             expected,
             bytes,
             metadata,
-            fingerprint(desired),
+            intended_fingerprint,
             transaction_nonce,
             &mut installed_token,
             persist_candidate,
@@ -213,10 +288,7 @@ pub(super) fn compare_and_swap_with_provenance(
         .map_err(|error| super::NativeMutationFailure::installed(error, installed_token.clone()))?;
     if !identity_matches_path(&parent.directory, &parent.path)
         .map_err(|error| super::NativeMutationFailure::installed(error, installed_token.clone()))?
-        || (!matches!(
-            (snapshot.state(), desired),
-            (NativeState::Absent { .. }, NativeState::Absent { .. })
-        ) && snapshot.fingerprint() != &fingerprint(desired))
+        || snapshot.fingerprint() != &intended_fingerprint
     {
         return Err(super::NativeMutationFailure::installed(
             RunnerError::ConcurrentChange,
@@ -242,9 +314,49 @@ pub(super) fn create_new_file(path: &Path) -> Result<File, RunnerError> {
     Ok(file)
 }
 
+pub(super) fn open_pinned_directory(path: &Path) -> Result<File, RunnerError> {
+    let directory = open_path(path, libc::O_RDONLY | libc::O_DIRECTORY)?;
+    if raw_node(&directory)?.directory() {
+        Ok(directory)
+    } else {
+        Err(RunnerError::UnsafeTopology)
+    }
+}
+
+pub(super) fn verify_pinned_directory(directory: &File, path: &Path) -> Result<bool, RunnerError> {
+    Ok(raw_node(directory)?.directory() && identity_matches_path(directory, path)?)
+}
+
+pub(super) fn open_or_create_pinned_regular(
+    directory: &File,
+    name: &OsStr,
+) -> Result<File, RunnerError> {
+    let name = CString::new(name.as_bytes()).map_err(|_| RunnerError::InvalidPath)?;
+    openat(
+        directory,
+        &name,
+        libc::O_RDWR | libc::O_CREAT | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0o600,
+    )
+}
+
+pub(super) fn verify_pinned_regular(
+    directory: &File,
+    name: &OsStr,
+    file: &File,
+) -> Result<bool, RunnerError> {
+    let name = CString::new(name.as_bytes()).map_err(|_| RunnerError::InvalidPath)?;
+    let held = raw_node(file)?;
+    let named = raw_at(directory, &name)?;
+    Ok(held.regular()
+        && held.links == 1
+        && held.uid == unsafe { libc::geteuid() }
+        && held.same_identity(&named))
+}
+
 pub(super) fn identity_matches_path(file: &File, path: &Path) -> Result<bool, RunnerError> {
     let reopened = open_path(path, libc::O_RDONLY | libc::O_NONBLOCK)?;
-    Ok(raw_node(file)?.same_object(&raw_node(&reopened)?))
+    Ok(raw_node(file)?.same_path_identity(&raw_node(&reopened)?))
 }
 
 pub(super) fn capture_file(path: &Path) -> Result<CapturedFile, CaptureError> {
@@ -333,7 +445,7 @@ pub(super) fn capture_node(path: &Path, forbid_xattrs: bool) -> Result<CapturedN
     let parent = open_path(parent_path, libc::O_RDONLY | libc::O_DIRECTORY)?;
     let parent_node = raw_node(&parent)?;
     let security = capture_security(&file, &before, &parent_node)?;
-    if forbid_xattrs && security.xattr_count != 0 {
+    if forbid_xattrs && security.has_forbidden_tree_xattrs {
         return Err(RunnerError::UnsafeTopology);
     }
     let mut hash = Sha256::new();
@@ -380,6 +492,7 @@ fn replace_regular_file(
     parent: &OpenParent,
     expected: Option<&NativeObjectToken>,
     expected_present: bool,
+    retain_extra_parent_entry: bool,
     expected_fingerprint: &[u8; 32],
     bytes: &[u8],
     metadata: &NativeMetadata,
@@ -394,6 +507,9 @@ fn replace_regular_file(
         || !identity_matches_path(&parent.directory, &parent.path)?
     {
         return Err(RunnerError::ConcurrentChange);
+    }
+    if !expected_present {
+        validate_absent(parent, expected, expected_fingerprint)?;
     }
     let (mut temporary, mut cleanup) = create_adjacent_temp(parent, transaction_nonce)?;
     use std::io::Write as _;
@@ -410,7 +526,12 @@ fn replace_regular_file(
     full_sync(&temporary)?;
 
     let staged = snapshot_named(&parent.directory, &cleanup.name)?;
-    if staged.fingerprint() != &intended_fingerprint {
+    let staged_fingerprint = if expected_present || retain_extra_parent_entry {
+        fingerprint_before_extra_parent_entry(&staged)?
+    } else {
+        *staged.fingerprint()
+    };
+    if staged_fingerprint != intended_fingerprint {
         return Err(RunnerError::ConcurrentChange);
     }
     let staged_token = staged
@@ -423,7 +544,7 @@ fn replace_regular_file(
     let _expected_handle = if expected_present {
         verify_expected(parent, expected)?
     } else {
-        validate_absent(parent, expected, expected_fingerprint)?;
+        validate_absent_after_parent_entry_added(parent, expected_fingerprint)?;
         None
     };
 
@@ -439,7 +560,7 @@ fn replace_regular_file(
     if let (Some(expected), Some(backup)) = (expected, backup.as_ref()) {
         rename_exclusive(&parent.directory, &parent.name, backup)?;
         flush_directory(&parent.directory)?;
-        if validate_named(
+        if validate_named_before_extra_parent_entry(
             &parent.directory,
             backup,
             Some(expected),
@@ -451,7 +572,7 @@ fn replace_regular_file(
             return Err(RunnerError::ConcurrentChange);
         }
     } else {
-        validate_absent(parent, expected, expected_fingerprint)?;
+        validate_absent_after_parent_entry_added(parent, expected_fingerprint)?;
     }
 
     #[cfg(test)]
@@ -483,17 +604,32 @@ fn replace_regular_file(
     cleanup.armed = false;
     *installed_token = Some(staged_token.clone());
     if let Err(error) = flush_directory(&parent.directory).and_then(|()| {
-        validate_named(
-            &parent.directory,
-            &parent.name,
-            Some(&staged_token),
-            &intended_fingerprint,
-        )
-        .map(|_| ())
+        let installed = if expected_present || retain_extra_parent_entry {
+            validate_named_before_extra_parent_entry(
+                &parent.directory,
+                &parent.name,
+                Some(&staged_token),
+                &intended_fingerprint,
+            )
+        } else {
+            validate_named(
+                &parent.directory,
+                &parent.name,
+                Some(&staged_token),
+                &intended_fingerprint,
+            )
+        };
+        installed.map(|_| ())
     }) {
         if backup.is_none()
-            && rollback_created_target(parent, &cleanup.name, &staged_token, &intended_fingerprint)
-                .is_ok()
+            && rollback_created_target(
+                parent,
+                &cleanup.name,
+                &staged_token,
+                &intended_fingerprint,
+                retain_extra_parent_entry,
+            )
+            .is_ok()
         {
             cleanup.armed = true;
             return Err(error);
@@ -510,13 +646,13 @@ fn replace_regular_file(
     }
 
     if let (Some(expected), Some(backup)) = (expected, backup.as_ref()) {
-        validate_named(
+        validate_named_before_extra_parent_entry(
             &parent.directory,
             &parent.name,
             Some(&staged_token),
             &intended_fingerprint,
         )?;
-        validate_named(
+        validate_named_before_extra_parent_entry(
             &parent.directory,
             backup,
             Some(expected),
@@ -534,12 +670,21 @@ fn replace_regular_file(
             },
         )?;
     }
-    validate_named(
-        &parent.directory,
-        &parent.name,
-        Some(&staged_token),
-        &intended_fingerprint,
-    )?;
+    if retain_extra_parent_entry {
+        validate_named_before_extra_parent_entry(
+            &parent.directory,
+            &parent.name,
+            Some(&staged_token),
+            &intended_fingerprint,
+        )?;
+    } else {
+        validate_named(
+            &parent.directory,
+            &parent.name,
+            Some(&staged_token),
+            &intended_fingerprint,
+        )?;
+    }
     Ok(())
 }
 
@@ -547,6 +692,8 @@ fn delete_regular_file(
     parent: &OpenParent,
     expected: &NativeObjectToken,
     expected_fingerprint: &[u8; 32],
+    intended_fingerprint: &[u8; 32],
+    retain_backup: bool,
     installed_token: &mut Option<NativeObjectToken>,
     persist_candidate: &mut dyn FnMut(&NativeObjectToken) -> Result<(), RunnerError>,
 ) -> Result<(), RunnerError> {
@@ -574,6 +721,21 @@ fn delete_regular_file(
     {
         let _ = restore_moved_name(parent, &backup);
         return Err(RunnerError::ConcurrentChange);
+    }
+    if !retain_backup {
+        remove_exact_private_named(parent, &backup, expected, expected_fingerprint)?;
+        let absent = snapshot_named(&parent.directory, &parent.name)?;
+        let absent_token = absent
+            .object_token()
+            .filter(|_| matches!(absent.state(), NativeState::Absent { .. }))
+            .ok_or(RunnerError::ConcurrentChange)?
+            .clone();
+        *installed_token = Some(absent_token.clone());
+        if absent.fingerprint() != intended_fingerprint {
+            return Err(RunnerError::ConcurrentChange);
+        }
+        persist_candidate(&absent_token)?;
+        return Ok(());
     }
     let absent = snapshot_named(&parent.directory, &parent.name)?;
     let absent_token = absent
@@ -629,6 +791,7 @@ pub(super) fn cleanup_committed_delete(
     before_fingerprint: &[u8; 32],
     _transaction_nonce: &[u8; 16],
     original_token: &NativeObjectToken,
+    removed_parent_entries: u64,
 ) -> Result<(), RunnerError> {
     let parent = OpenParent::new(path)?;
     if !identity_matches_path(&parent.directory, &parent.path)? {
@@ -639,10 +802,17 @@ pub(super) fn cleanup_committed_delete(
     if matches!(backup.state(), NativeState::Absent { .. }) {
         return Ok(());
     }
-    if backup.object_token() != Some(original_token) || backup.fingerprint() != before_fingerprint {
+    let metadata = backup.metadata().ok_or(RunnerError::ConcurrentChange)?;
+    let parent_links = PosixSecurity::decode(&metadata.security_descriptor)?
+        .parent_links
+        .checked_add(removed_parent_entries)
+        .ok_or(RunnerError::ConcurrentChange)?;
+    if backup.object_token() != Some(original_token)
+        || fingerprint_with_parent_links(&backup, parent_links)? != *before_fingerprint
+    {
         return Err(RunnerError::ConcurrentChange);
     }
-    remove_exact_private_named(&parent, &name, original_token, before_fingerprint)
+    remove_exact_private_named(&parent, &name, original_token, backup.fingerprint())
 }
 
 fn recover_interrupted_replace_held(
@@ -676,9 +846,6 @@ fn recover_interrupted_replace_held(
         Ok(snapshot) => snapshot,
         Err(_) => return Err(RunnerError::ConcurrentChange),
     };
-    if backup.fingerprint() != before_fingerprint {
-        return Err(RunnerError::ConcurrentChange);
-    }
     let backup_token = backup
         .object_token()
         .ok_or(RunnerError::ConcurrentChange)?
@@ -688,6 +855,9 @@ fn recover_interrupted_replace_held(
     }
     let target = snapshot_named(&parent.directory, &parent.name)?;
     if matches!(target.state(), NativeState::Absent { .. }) {
+        if backup.fingerprint() != before_fingerprint {
+            return Err(RunnerError::ConcurrentChange);
+        }
         if (target.fingerprint() == applied_fingerprint
             && !provenance.accepts_applied(target.object_token()))
             || (target.fingerprint() != applied_fingerprint
@@ -696,10 +866,20 @@ fn recover_interrupted_replace_held(
         {
             return Ok(super::NativeRecoveryDisposition::Abandoned);
         }
-        restore_backup(parent, &backup_name, &backup_token, before_fingerprint)?;
+        restore_backup(
+            parent,
+            &backup_name,
+            &backup_token,
+            before_fingerprint,
+            false,
+        )?;
         return Ok(super::NativeRecoveryDisposition::Restored);
     }
-    if target.fingerprint() == before_fingerprint {
+    if fingerprint_before_extra_parent_entry(&backup)? != *before_fingerprint {
+        return Err(RunnerError::ConcurrentChange);
+    }
+    let target_fingerprint = fingerprint_before_extra_parent_entry(&target)?;
+    if target_fingerprint == *before_fingerprint {
         let target_token = target
             .object_token()
             .ok_or(RunnerError::ConcurrentChange)?
@@ -717,7 +897,7 @@ fn recover_interrupted_replace_held(
         )?;
         return Ok(super::NativeRecoveryDisposition::Restored);
     }
-    if target.fingerprint() != applied_fingerprint {
+    if target_fingerprint != *applied_fingerprint {
         return Err(RunnerError::ConcurrentChange);
     }
     let target_token = target
@@ -733,7 +913,7 @@ fn recover_interrupted_replace_held(
     let temp_name = temp_name(&parent.name, transaction_nonce);
     rename_exclusive(&parent.directory, &parent.name, &temp_name)?;
     flush_directory(&parent.directory)?;
-    if validate_named(
+    if validate_named_before_extra_parent_entry(
         &parent.directory,
         &temp_name,
         Some(&target_token),
@@ -744,7 +924,13 @@ fn recover_interrupted_replace_held(
         let _ = restore_moved_name_to(parent, &temp_name, &parent.name);
         return Err(RunnerError::ConcurrentChange);
     }
-    if let Err(error) = restore_backup(parent, &backup_name, &backup_token, before_fingerprint) {
+    if let Err(error) = restore_backup(
+        parent,
+        &backup_name,
+        &backup_token,
+        before_fingerprint,
+        true,
+    ) {
         let _ = restore_moved_name_to(parent, &temp_name, &parent.name);
         return Err(error);
     }
@@ -833,6 +1019,82 @@ fn validate_named(
     Ok(snapshot)
 }
 
+fn fingerprint_with_parent_links(
+    snapshot: &NativeSnapshot,
+    parent_links: u64,
+) -> Result<[u8; 32], RunnerError> {
+    let mut state = snapshot.state().clone();
+    let NativeState::RegularFile { metadata, .. } = &mut state else {
+        return Err(RunnerError::ConcurrentChange);
+    };
+    let mut security = PosixSecurity::decode(&metadata.security_descriptor)?;
+    security.parent_links = parent_links;
+    (metadata.parent_attributes, metadata.parent_link_count) = parent_marker_fields(
+        security.parent_mode,
+        security.parent_flags,
+        security.parent_uid,
+        security.parent_gid,
+        parent_links,
+    );
+    metadata.security_descriptor = security.encode()?;
+    Ok(fingerprint(&state))
+}
+
+fn fingerprint_before_extra_parent_entry(
+    snapshot: &NativeSnapshot,
+) -> Result<[u8; 32], RunnerError> {
+    let metadata = snapshot.metadata().ok_or(RunnerError::ConcurrentChange)?;
+    let links = PosixSecurity::decode(&metadata.security_descriptor)?
+        .parent_links
+        .checked_sub(1)
+        .ok_or(RunnerError::ConcurrentChange)?;
+    fingerprint_with_parent_links(snapshot, links)
+}
+
+fn validate_named_before_extra_parent_entry(
+    parent: &File,
+    name: &CStr,
+    expected_token: Option<&NativeObjectToken>,
+    expected_fingerprint: &[u8; 32],
+) -> Result<NativeSnapshot, RunnerError> {
+    let snapshot = snapshot_named(parent, name)?;
+    if fingerprint_before_extra_parent_entry(&snapshot)? != *expected_fingerprint
+        || expected_token.is_some_and(|expected| snapshot.object_token() != Some(expected))
+    {
+        return Err(RunnerError::ConcurrentChange);
+    }
+    Ok(snapshot)
+}
+
+fn delete_retains_backup(
+    current: &NativeSnapshot,
+    intended_fingerprint: &[u8; 32],
+) -> Result<bool, RunnerError> {
+    if fingerprint(&current.absent_state()) == *intended_fingerprint {
+        return Ok(true);
+    }
+    let metadata = current.metadata().ok_or(RunnerError::ConcurrentChange)?;
+    let security = PosixSecurity::decode(&metadata.security_descriptor)?;
+    let links = security
+        .parent_links
+        .checked_sub(1)
+        .ok_or(RunnerError::ConcurrentChange)?;
+    let (parent_attributes, parent_link_count) = parent_marker_fields(
+        security.parent_mode,
+        security.parent_flags,
+        security.parent_uid,
+        security.parent_gid,
+        links,
+    );
+    if fingerprint(&NativeState::absent(parent_attributes, parent_link_count))
+        == *intended_fingerprint
+    {
+        Ok(false)
+    } else {
+        Err(RunnerError::ConcurrentChange)
+    }
+}
+
 fn validate_absent(
     parent: &OpenParent,
     expected_token: Option<&NativeObjectToken>,
@@ -843,6 +1105,29 @@ fn validate_absent(
         || snapshot.fingerprint() != expected_fingerprint
         || expected_token.is_some_and(|expected| snapshot.object_token() != Some(expected))
     {
+        return Err(RunnerError::ConcurrentChange);
+    }
+    Ok(())
+}
+
+fn validate_absent_after_parent_entry_added(
+    parent: &OpenParent,
+    expected_fingerprint: &[u8; 32],
+) -> Result<(), RunnerError> {
+    if !matches!(
+        snapshot_named(&parent.directory, &parent.name)?.state(),
+        NativeState::Absent { .. }
+    ) {
+        return Err(RunnerError::ConcurrentChange);
+    }
+    let node = raw_node(&parent.directory)?;
+    let links = node
+        .links
+        .checked_sub(1)
+        .ok_or(RunnerError::ConcurrentChange)?;
+    let (attributes, links) =
+        parent_marker_fields(node.mode, node.flags, node.uid, node.gid, links);
+    if fingerprint(&NativeState::absent(attributes, links)) != *expected_fingerprint {
         return Err(RunnerError::ConcurrentChange);
     }
     Ok(())
@@ -882,16 +1167,26 @@ fn restore_backup(
     backup_name: &CStr,
     backup_token: &NativeObjectToken,
     before_fingerprint: &[u8; 32],
+    extra_parent_entry: bool,
 ) -> Result<(), RunnerError> {
     if !identity_matches_path(&parent.directory, &parent.path)? {
         return Err(RunnerError::ConcurrentChange);
     }
-    validate_named(
-        &parent.directory,
-        backup_name,
-        Some(backup_token),
-        before_fingerprint,
-    )?;
+    if extra_parent_entry {
+        validate_named_before_extra_parent_entry(
+            &parent.directory,
+            backup_name,
+            Some(backup_token),
+            before_fingerprint,
+        )?;
+    } else {
+        validate_named(
+            &parent.directory,
+            backup_name,
+            Some(backup_token),
+            before_fingerprint,
+        )?;
+    }
     if !matches!(
         snapshot_named(&parent.directory, &parent.name)?.state(),
         NativeState::Absent { .. }
@@ -900,14 +1195,22 @@ fn restore_backup(
     }
     rename_exclusive(&parent.directory, backup_name, &parent.name)?;
     flush_directory(&parent.directory)?;
-    if validate_named(
-        &parent.directory,
-        &parent.name,
-        Some(backup_token),
-        before_fingerprint,
-    )
-    .is_err()
-    {
+    let restored = if extra_parent_entry {
+        validate_named_before_extra_parent_entry(
+            &parent.directory,
+            &parent.name,
+            Some(backup_token),
+            before_fingerprint,
+        )
+    } else {
+        validate_named(
+            &parent.directory,
+            &parent.name,
+            Some(backup_token),
+            before_fingerprint,
+        )
+    };
+    if restored.is_err() {
         let _ = restore_moved_name_to(parent, &parent.name, backup_name);
         return Err(RunnerError::ConcurrentChange);
     }
@@ -919,25 +1222,31 @@ fn rollback_created_target(
     temp_name: &CStr,
     staged_token: &NativeObjectToken,
     intended_fingerprint: &[u8; 32],
+    extra_parent_entry: bool,
 ) -> Result<(), RunnerError> {
-    validate_named(
-        &parent.directory,
-        &parent.name,
-        Some(staged_token),
-        intended_fingerprint,
-    )?;
+    let validate = |name: &CStr| {
+        if extra_parent_entry {
+            validate_named_before_extra_parent_entry(
+                &parent.directory,
+                name,
+                Some(staged_token),
+                intended_fingerprint,
+            )
+        } else {
+            validate_named(
+                &parent.directory,
+                name,
+                Some(staged_token),
+                intended_fingerprint,
+            )
+        }
+    };
+    validate(&parent.name)?;
     #[cfg(test)]
     run_pre_rollback_move_test_hook();
     rename_exclusive(&parent.directory, &parent.name, temp_name)?;
     flush_directory(&parent.directory)?;
-    if validate_named(
-        &parent.directory,
-        temp_name,
-        Some(staged_token),
-        intended_fingerprint,
-    )
-    .is_err()
-    {
+    if validate(temp_name).is_err() {
         let _ = restore_moved_name_to(parent, temp_name, &parent.name);
         return Err(RunnerError::ConcurrentChange);
     }
@@ -965,25 +1274,25 @@ fn remove_exact_named(
     if !identity_matches_path(&parent.directory, &parent.path)? {
         return Err(RunnerError::ConcurrentChange);
     }
-    let first = validate_named(
+    let first = validate_named_before_extra_parent_entry(
         &parent.directory,
         name,
         Some(expected_token),
         expected_fingerprint,
     )?;
-    validate_named(
+    validate_named_before_extra_parent_entry(
         &parent.directory,
         guard.name,
         Some(guard.token),
         guard.fingerprint,
     )?;
-    validate_named(
+    validate_named_before_extra_parent_entry(
         &parent.directory,
         name,
         first.object_token(),
         expected_fingerprint,
     )?;
-    validate_named(
+    validate_named_before_extra_parent_entry(
         &parent.directory,
         guard.name,
         Some(guard.token),
@@ -1008,6 +1317,8 @@ fn remove_exact_private_named(
     expected_token: &NativeObjectToken,
     expected_fingerprint: &[u8; 32],
 ) -> Result<(), RunnerError> {
+    #[cfg(test)]
+    run_pre_backup_removal_test_hook();
     if !identity_matches_path(&parent.directory, &parent.path)? {
         return Err(RunnerError::ConcurrentChange);
     }
@@ -1133,6 +1444,27 @@ fn validate_metadata(
         return Err(RunnerError::InvalidNativeState);
     }
     Ok(())
+}
+
+pub(super) fn metadata_for_absent_sibling_creation(
+    template: &NativeMetadata,
+) -> Result<NativeMetadata, RunnerError> {
+    let mut security = PosixSecurity::decode(&template.security_descriptor)?;
+    validate_metadata(template, &security)?;
+    security.parent_links = security
+        .parent_links
+        .checked_add(1)
+        .ok_or(RunnerError::LimitExceeded)?;
+    let mut metadata = template.clone();
+    (metadata.parent_attributes, metadata.parent_link_count) = parent_marker_fields(
+        security.parent_mode,
+        security.parent_flags,
+        security.parent_uid,
+        security.parent_gid,
+        security.parent_links,
+    );
+    metadata.security_descriptor = security.encode()?;
+    Ok(metadata)
 }
 
 fn verify_expected(
@@ -1513,6 +1845,10 @@ impl RawNode {
             && self.mode & MODE_MASK == other.mode & MODE_MASK
     }
 
+    const fn same_path_identity(self, other: &Self) -> bool {
+        self.same_identity(other) && (self.directory() || self.links == other.links)
+    }
+
     const fn same_snapshot(self, other: &Self) -> bool {
         self.same_object(other)
             && self.mode == other.mode
@@ -1631,7 +1967,7 @@ fn shared_lock(file: &File) -> Result<(), RunnerError> {
 
 struct CapturedSecurity {
     encoded: Vec<u8>,
-    xattr_count: usize,
+    has_forbidden_tree_xattrs: bool,
 }
 
 fn capture_security(
@@ -1640,7 +1976,9 @@ fn capture_security(
     parent: &RawNode,
 ) -> Result<CapturedSecurity, RunnerError> {
     let xattrs = xattrs(file)?;
-    let xattr_count = xattrs.len();
+    let has_forbidden_tree_xattrs = xattrs
+        .iter()
+        .any(|(name, _)| name.as_slice() != QUARANTINE_XATTR);
     let security = PosixSecurity {
         uid: node.uid,
         gid: node.gid,
@@ -1656,7 +1994,7 @@ fn capture_security(
     };
     Ok(CapturedSecurity {
         encoded: security.encode()?,
-        xattr_count,
+        has_forbidden_tree_xattrs,
     })
 }
 
@@ -1857,7 +2195,8 @@ fn acl_text(file: &File) -> Result<Vec<u8>, RunnerError> {
     }
     let pointer = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
     if pointer.is_null() {
-        return if last_errno() == 0 {
+        // acl_get_fd_np leaves ENOENT when FILESEC_ACL is absent.
+        return if matches!(last_errno(), 0 | libc::ENOENT) {
             Ok(Vec::new())
         } else {
             Err(RunnerError::Io)
@@ -1880,8 +2219,9 @@ fn acl_text(file: &File) -> Result<Vec<u8>, RunnerError> {
 }
 
 fn restore_security(file: &File, security: &PosixSecurity) -> Result<(), RunnerError> {
+    let final_mode = (security.mode & 0o7777) as libc::mode_t;
     if unsafe { libc::fchown(file.as_raw_fd(), security.uid, security.gid) } != 0
-        || unsafe { libc::fchmod(file.as_raw_fd(), (security.mode & 0o7777) as libc::mode_t) } != 0
+        || unsafe { libc::fchmod(file.as_raw_fd(), final_mode | 0o200) } != 0
     {
         return Err(RunnerError::Io);
     }
@@ -1907,7 +2247,11 @@ fn restore_security(file: &File, security: &PosixSecurity) -> Result<(), RunnerE
             return Err(RunnerError::Io);
         }
     }
-    restore_acl(file, &security.acl)
+    restore_acl(file, &security.acl)?;
+    if unsafe { libc::fchmod(file.as_raw_fd(), final_mode) } != 0 {
+        return Err(RunnerError::Io);
+    }
+    Ok(())
 }
 
 fn restore_acl(file: &File, text: &[u8]) -> Result<(), RunnerError> {
@@ -2134,7 +2478,55 @@ mod guarded_mutation_tests {
                 .as_nanos()
         ));
         fs::create_dir(&root).unwrap();
-        root
+        fs::canonicalize(root).unwrap()
+    }
+
+    #[test]
+    fn private_creation_metadata_rejects_parent_identity_change() {
+        let _serial = SERIAL.lock().unwrap();
+        let root = test_root("private-creation-parent-race");
+        let path = root.join("AGENTS.md");
+        let moved = root.with_extension("moved");
+        let changed = root.clone();
+        let changed_moved = moved.clone();
+        *CREATION_METADATA_TEST_HOOK.lock().unwrap() = Some(Box::new(move || {
+            fs::rename(&changed, &changed_moved).unwrap();
+            fs::create_dir(&changed).unwrap();
+        }));
+
+        assert_eq!(
+            metadata_for_new_private_file(&path),
+            Err(RunnerError::ConcurrentChange)
+        );
+        assert!(!path.exists());
+        fs::remove_dir_all(root).unwrap();
+        if moved.exists() {
+            fs::remove_dir_all(moved).unwrap();
+        }
+    }
+
+    #[test]
+    fn pinned_directory_opens_children_relative_and_detects_path_replacement() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let root = test_root("pinned-directory");
+        let profile = root.join("profile");
+        let replacement = root.join("replacement");
+        let parked = root.join("parked");
+        fs::create_dir(&profile).unwrap();
+        fs::create_dir(&replacement).unwrap();
+        let directory = open_pinned_directory(&profile).unwrap();
+        let lock = open_or_create_pinned_regular(&directory, OsStr::new("gateway.lock")).unwrap();
+        assert!(verify_pinned_regular(&directory, OsStr::new("gateway.lock"), &lock).unwrap());
+
+        fs::rename(&profile, &parked).unwrap();
+        std::os::unix::fs::symlink(&replacement, &profile).unwrap();
+
+        assert!(verify_pinned_directory(&directory, &profile).is_err());
+        assert!(!replacement.join("gateway.lock").exists());
+        fs::remove_file(&profile).unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2146,8 +2538,46 @@ mod guarded_mutation_tests {
     }
 
     #[test]
+    fn path_identity_ignores_directory_link_churn_but_not_file_link_churn() {
+        let directory = RawNode {
+            device: 1,
+            object: 2,
+            generation: 3,
+            mode: libc::S_IFDIR as u32 | 0o700,
+            links: 2,
+            uid: 501,
+            gid: 20,
+            size: 0,
+            flags: 0,
+            access_seconds: 0,
+            access_nanoseconds: 0,
+            write_seconds: 0,
+            write_nanoseconds: 0,
+            change_seconds: 0,
+            change_nanoseconds: 0,
+            birth_seconds: 0,
+            birth_nanoseconds: 0,
+        };
+        let mut changed_links = directory;
+        changed_links.links += 1;
+
+        assert!(directory.same_path_identity(&changed_links));
+
+        let file = RawNode {
+            mode: libc::S_IFREG as u32 | 0o600,
+            ..directory
+        };
+        let mut hardlinked = file;
+        hardlinked.links += 1;
+
+        assert!(!file.same_path_identity(&hardlinked));
+    }
+
+    #[test]
     fn replacement_preserves_an_unexpected_final_boundary_occupant() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = test_root("replace-boundary");
         let path = root.join("settings.json");
         let moved = root.join("observed.json");
@@ -2176,7 +2606,9 @@ mod guarded_mutation_tests {
 
     #[test]
     fn replacement_does_not_overwrite_a_target_reoccupied_before_install() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = test_root("replace-install-boundary");
         let path = root.join("settings.json");
         fs::write(&path, b"before\n").unwrap();
@@ -2202,7 +2634,9 @@ mod guarded_mutation_tests {
 
     #[test]
     fn absent_create_rollback_restores_a_late_unexpected_target_occupant() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = test_root("absent-rollback-boundary");
         let path = root.join("settings.json");
         let preserved = root.join("installed.json");
@@ -2222,12 +2656,18 @@ mod guarded_mutation_tests {
         }));
 
         assert_eq!(
-            rollback_created_target(&parent, &temp, &installed_token, &installed_fingerprint),
+            rollback_created_target(
+                &parent,
+                &temp,
+                &installed_token,
+                &installed_fingerprint,
+                false,
+            ),
             Err(RunnerError::ConcurrentChange)
         );
         assert_eq!(fs::read(&path).unwrap(), b"attacker\n");
         assert_eq!(fs::read(&preserved).unwrap(), b"installed\n");
-        assert!(!matches!(
+        assert!(matches!(
             snapshot_named(&parent.directory, &temp).unwrap().state(),
             NativeState::Absent { .. }
         ));
@@ -2236,7 +2676,9 @@ mod guarded_mutation_tests {
 
     #[test]
     fn deletion_preserves_an_unexpected_final_boundary_occupant() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = test_root("delete-boundary");
         let path = root.join("settings.json");
         let moved = root.join("observed.json");
@@ -2254,7 +2696,7 @@ mod guarded_mutation_tests {
         }));
 
         assert_eq!(
-            native.compare_and_swap(&path, before.fingerprint(), &absent, &TEST_NONCE,),
+            native.compare_and_swap(&path, before.fingerprint(), &absent, &TEST_NONCE),
             Err(RunnerError::ConcurrentChange)
         );
         assert_eq!(fs::read(&path).unwrap(), b"attacker\n");
@@ -2264,7 +2706,9 @@ mod guarded_mutation_tests {
 
     #[test]
     fn backup_removal_revalidates_before_unlinking() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = test_root("backup-removal-boundary");
         let path = root.join("settings.json");
         fs::write(&path, b"before\n").unwrap();
@@ -2296,7 +2740,9 @@ mod guarded_mutation_tests {
 
     #[test]
     fn replacement_keeps_the_backup_if_the_installed_target_changes_during_cleanup() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = test_root("replace-cleanup-target-boundary");
         let path = root.join("settings.json");
         let installed = root.join("installed.json");
@@ -2328,7 +2774,9 @@ mod guarded_mutation_tests {
 
     #[test]
     fn deletion_keeps_the_backup_if_the_empty_target_is_reoccupied_during_cleanup() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = test_root("delete-cleanup-target-boundary");
         let path = root.join("settings.json");
         fs::write(&path, b"before\n").unwrap();
@@ -2342,8 +2790,16 @@ mod guarded_mutation_tests {
             move || fs::write(path, b"attacker\n").unwrap()
         }));
 
+        native
+            .compare_and_swap(&path, before.fingerprint(), &absent, &TEST_NONCE)
+            .unwrap();
         assert_eq!(
-            native.compare_and_swap(&path, before.fingerprint(), &absent, &TEST_NONCE,),
+            native.cleanup_committed_delete_observed(
+                &path,
+                before.fingerprint(),
+                &TEST_NONCE,
+                before.object_token().unwrap(),
+            ),
             Err(RunnerError::ConcurrentChange)
         );
         assert_eq!(fs::read(&path).unwrap(), b"attacker\n");
@@ -2353,7 +2809,9 @@ mod guarded_mutation_tests {
 
     #[test]
     fn absent_snapshot_rechecks_the_name_before_returning() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = test_root("absent-snapshot-boundary");
         let path = root.join("settings.json");
         *POST_MISSING_SNAPSHOT_TEST_HOOK.lock().unwrap() = Some(Box::new({
@@ -2367,8 +2825,48 @@ mod guarded_mutation_tests {
     }
 
     #[test]
+    fn absent_create_and_restore_install_exact_stable_states() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let root = test_root("absent-create");
+        let path = root.join("settings.json");
+        fs::write(&path, b"approved-secret\n").unwrap();
+        let native = OsNativeFileSystem::new();
+        let intended = native.snapshot(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        let absent = native.snapshot(&path).unwrap();
+
+        let created = native
+            .compare_and_swap(&path, absent.fingerprint(), intended.state(), &TEST_NONCE)
+            .unwrap();
+
+        assert!(created.wrote());
+        assert_eq!(created.snapshot().fingerprint(), intended.fingerprint());
+        assert_eq!(
+            native.snapshot(&path).unwrap().fingerprint(),
+            intended.fingerprint()
+        );
+        let restored = native
+            .compare_and_swap(
+                &path,
+                created.snapshot().fingerprint(),
+                absent.state(),
+                &TEST_NONCE,
+            )
+            .unwrap();
+        assert!(restored.wrote());
+        assert_eq!(restored.snapshot().fingerprint(), absent.fingerprint());
+        assert!(!path.exists());
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn token_aware_create_rejects_a_parent_replaced_before_the_cas_call() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = test_root("absent-parent-pre-call-swap");
         let live = root.join("live");
         let moved = root.join("moved");
@@ -2381,7 +2879,7 @@ mod guarded_mutation_tests {
         let before = native.snapshot(&path).unwrap();
         let before_token = before.object_token().unwrap();
         assert_eq!(before_token.volume(), before_token.parent_volume());
-        assert_eq!(before_token.object(), before_token.parent_object());
+        assert_ne!(before_token.object(), before_token.parent_object());
         assert_ne!(before_token.object(), &[0; 16]);
         fs::rename(&live, &moved).unwrap();
         fs::create_dir(&live).unwrap();
@@ -2410,7 +2908,9 @@ mod guarded_mutation_tests {
 
     #[test]
     fn token_aware_replace_rejects_the_wrong_present_object_token() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = test_root("present-token-mismatch");
         let path = root.join("settings.json");
         let other = root.join("other.json");
@@ -2438,7 +2938,9 @@ mod guarded_mutation_tests {
 
     #[test]
     fn absent_create_rejects_a_same_metadata_parent_swap_without_leaking_bytes() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = test_root("absent-parent-swap");
         let live = root.join("live");
         let moved = root.join("moved");
@@ -2446,13 +2948,15 @@ mod guarded_mutation_tests {
         let template = live.join("template.json");
         let path = live.join("settings.json");
         fs::write(&template, b"template\n").unwrap();
+        fs::write(&path, b"placeholder\n").unwrap();
         let native = OsNativeFileSystem::new();
-        let template = native.snapshot(&template).unwrap();
+        let intended = native.snapshot(&path).unwrap();
+        fs::remove_file(&path).unwrap();
         let before = native.snapshot(&path).unwrap();
         assert!(before.object_token().is_some());
         let desired = NativeState::regular_file(
             b"approved-secret\n".to_vec(),
-            template.metadata().unwrap().clone(),
+            intended.metadata().unwrap().clone(),
         );
         *PRE_TARGET_MUTATION_TEST_HOOK.lock().unwrap() = Some(Box::new({
             let live = live.clone();
@@ -2474,7 +2978,9 @@ mod guarded_mutation_tests {
 
     #[test]
     fn recovery_restores_the_exact_backup_from_the_empty_target_phase() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = test_root("recover-empty-target");
         let path = root.join("settings.json");
         fs::write(&path, b"before\n").unwrap();
@@ -2499,7 +3005,7 @@ mod guarded_mutation_tests {
             native.snapshot(&path).unwrap().fingerprint(),
             before.fingerprint()
         );
-        assert!(!matches!(
+        assert!(matches!(
             snapshot_named(&parent.directory, &backup).unwrap().state(),
             NativeState::Absent { .. }
         ));
@@ -2516,7 +3022,9 @@ mod guarded_mutation_tests {
 
     #[test]
     fn recovery_rejects_an_absent_replacement_target_when_no_backup_exists() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = test_root("recover-unexpected-absent-replace");
         let path = root.join("settings.json");
         fs::write(&path, b"before\n").unwrap();
@@ -2540,20 +3048,22 @@ mod guarded_mutation_tests {
 
     #[test]
     fn recovery_accepts_an_absent_delete_target_when_no_backup_exists() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = test_root("recover-applied-delete");
         let path = root.join("settings.json");
         fs::write(&path, b"before\n").unwrap();
         let native = OsNativeFileSystem::new();
         let before = native.snapshot(&path).unwrap();
-        let absent = before.absent_state();
         fs::remove_file(&path).unwrap();
+        let absent = native.snapshot(&path).unwrap();
 
         native
             .recover_interrupted_replace(
                 &path,
                 before.fingerprint(),
-                &absent.fingerprint(),
+                absent.fingerprint(),
                 &TEST_NONCE,
             )
             .unwrap();
@@ -2562,15 +3072,24 @@ mod guarded_mutation_tests {
 
     #[test]
     fn recovery_rolls_back_an_installed_target_and_cleans_only_its_nonce() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = test_root("recover-installed-target");
         let path = root.join("settings.json");
         fs::write(&path, b"before\n").unwrap();
         let native = OsNativeFileSystem::new();
+        let parent = OpenParent::new(&path).unwrap();
+        let other_nonce = [0x7eu8; 16];
+        let other_temp = temp_name(&parent.name, &other_nonce);
+        fs::write(
+            root.join(OsStr::from_bytes(other_temp.to_bytes())),
+            b"other transaction\n",
+        )
+        .unwrap();
         let before = native.snapshot(&path).unwrap();
         let desired =
             NativeState::regular_file(b"after\n".to_vec(), before.metadata().unwrap().clone());
-        let parent = OpenParent::new(&path).unwrap();
         let backup = backup_name(&parent.name);
         rename_exclusive(&parent.directory, &parent.name, &backup).unwrap();
         flush_directory(&parent.directory).unwrap();
@@ -2583,6 +3102,7 @@ mod guarded_mutation_tests {
             &parent,
             absent.object_token(),
             false,
+            true,
             absent.fingerprint(),
             bytes,
             metadata,
@@ -2592,14 +3112,6 @@ mod guarded_mutation_tests {
             &mut |_| Ok(()),
         )
         .unwrap();
-        let other_nonce = [0x7eu8; 16];
-        let other_temp = temp_name(&parent.name, &other_nonce);
-        fs::write(
-            root.join(OsStr::from_bytes(other_temp.to_bytes())),
-            b"other transaction\n",
-        )
-        .unwrap();
-
         native
             .recover_interrupted_replace(
                 &path,
@@ -2618,37 +3130,50 @@ mod guarded_mutation_tests {
 
     #[test]
     fn attributed_recovery_preserves_an_identical_replacement_target() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = test_root("attributed-recovery-identical-replacement");
         let path = root.join("settings.json");
         fs::write(&path, b"before\n").unwrap();
         let native = OsNativeFileSystem::new();
         let before = native.snapshot(&path).unwrap();
-        let desired =
-            NativeState::regular_file(b"after\n".to_vec(), before.metadata().unwrap().clone());
         let parent = OpenParent::new(&path).unwrap();
         let backup = backup_name(&parent.name);
         rename_exclusive(&parent.directory, &parent.name, &backup).unwrap();
         flush_directory(&parent.directory).unwrap();
 
-        let absent = native.snapshot(&path).unwrap();
-        let first = native
-            .compare_and_swap(&path, absent.fingerprint(), &desired, &TEST_NONCE)
-            .unwrap();
-        let installed_token = first.installed_token().unwrap().clone();
+        fs::write(&path, b"after\n").unwrap();
+        let first = native.snapshot(&path).unwrap();
+        let desired = first.state().clone();
+        let applied_fingerprint = fingerprint_before_extra_parent_entry(&first).unwrap();
+        let installed_token = first.object_token().unwrap().clone();
+        let concurrent_name = CString::new("concurrent.json").unwrap();
+        assert_eq!(
+            unsafe {
+                libc::clonefileat(
+                    parent.directory.as_raw_fd(),
+                    parent.name.as_ptr(),
+                    parent.directory.as_raw_fd(),
+                    concurrent_name.as_ptr(),
+                    0,
+                )
+            },
+            0
+        );
         fs::remove_file(&path).unwrap();
-        let absent = native.snapshot(&path).unwrap();
-        let concurrent = native
-            .compare_and_swap(&path, absent.fingerprint(), &desired, &TEST_NONCE)
-            .unwrap();
-        let concurrent_token = concurrent.snapshot().object_token().unwrap().clone();
+        rename_exclusive(&parent.directory, &concurrent_name, &parent.name).unwrap();
+        flush_directory(&parent.directory).unwrap();
+        let concurrent = native.snapshot(&path).unwrap();
+        assert_eq!(concurrent.fingerprint(), &desired.fingerprint());
+        let concurrent_token = concurrent.object_token().unwrap().clone();
         assert_ne!(concurrent_token, installed_token);
 
         assert_eq!(
             native.recover_interrupted_replace_observed_with_provenance(
                 &path,
                 before.fingerprint(),
-                &desired.fingerprint(),
+                &applied_fingerprint,
                 &TEST_NONCE,
                 before.object_token(),
                 Some(&installed_token),
@@ -2659,7 +3184,7 @@ mod guarded_mutation_tests {
             native.snapshot(&path).unwrap().object_token(),
             Some(&concurrent_token)
         );
-        assert!(matches!(
+        assert!(!matches!(
             snapshot_named(&parent.directory, &backup).unwrap().state(),
             NativeState::Absent { .. }
         ));
@@ -2669,23 +3194,22 @@ mod guarded_mutation_tests {
 
     #[test]
     fn attributed_recovery_preserves_a_concurrently_deleted_target() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = test_root("attributed-recovery-concurrent-delete");
         let path = root.join("settings.json");
         fs::write(&path, b"before\n").unwrap();
         let native = OsNativeFileSystem::new();
         let before = native.snapshot(&path).unwrap();
-        let desired =
-            NativeState::regular_file(b"after\n".to_vec(), before.metadata().unwrap().clone());
         let parent = OpenParent::new(&path).unwrap();
         let backup = backup_name(&parent.name);
         rename_exclusive(&parent.directory, &parent.name, &backup).unwrap();
         flush_directory(&parent.directory).unwrap();
-        let absent = native.snapshot(&path).unwrap();
-        let installed = native
-            .compare_and_swap(&path, absent.fingerprint(), &desired, &TEST_NONCE)
-            .unwrap();
-        let installed_token = installed.installed_token().unwrap().clone();
+        fs::write(&path, b"after\n").unwrap();
+        let installed = native.snapshot(&path).unwrap();
+        let desired = installed.state().clone();
+        let installed_token = installed.object_token().unwrap().clone();
         fs::remove_file(&path).unwrap();
 
         assert_eq!(
@@ -2700,7 +3224,7 @@ mod guarded_mutation_tests {
             Ok(NativeRecoveryDisposition::Abandoned)
         );
         assert!(!path.exists());
-        assert!(matches!(
+        assert!(!matches!(
             snapshot_named(&parent.directory, &backup).unwrap().state(),
             NativeState::Absent { .. }
         ));
@@ -2710,7 +3234,9 @@ mod guarded_mutation_tests {
 
     #[test]
     fn recovery_parent_swap_preserves_the_moved_and_replacement_trees() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = test_root("recovery-parent-swap");
         let live = root.join("live");
         let moved = root.join("moved");
@@ -2719,17 +3245,14 @@ mod guarded_mutation_tests {
         fs::write(&path, b"before\n").unwrap();
         let native = OsNativeFileSystem::new();
         let before = native.snapshot(&path).unwrap();
-        let desired =
-            NativeState::regular_file(b"after\n".to_vec(), before.metadata().unwrap().clone());
         let parent = OpenParent::new(&path).unwrap();
         let backup = backup_name(&parent.name);
         rename_exclusive(&parent.directory, &parent.name, &backup).unwrap();
         flush_directory(&parent.directory).unwrap();
-        let absent = native.snapshot(&path).unwrap();
-        let installed = native
-            .compare_and_swap(&path, absent.fingerprint(), &desired, &TEST_NONCE)
-            .unwrap();
-        let installed_token = installed.installed_token().unwrap().clone();
+        fs::write(&path, b"after\n").unwrap();
+        let installed = native.snapshot(&path).unwrap();
+        let desired = installed.state().clone();
+        let installed_token = installed.object_token().unwrap().clone();
 
         *RECOVERY_AFTER_PARENT_CHECK_TEST_HOOK.lock().unwrap() = Some(Box::new({
             let live = live.clone();
