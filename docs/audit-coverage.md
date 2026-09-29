@@ -141,6 +141,31 @@ exiting only when the error stopped being retryable — and is fixed in #37.
 Nothing in the audit scope is still unreviewed. The areas below were walked but not
 read line by line, and are the most likely place for something to have been missed.
 
-- `contextd` request dispatch, handler by handler, for the handlers outside the
-  workspace queue (pairing, revocation, sync, native transaction).
-- The React front end beyond the screens touched by #22-#28 and #30.
+**Dispatch outside the workspace queue** (`contextd/src/lib.rs`) — the pairing and
+recovery executors are unavailable unless a service is injected, and
+`HarnessPrepare` delegates to `bridge_install::prepare`, which builds a plan rather
+than touching the filesystem. `ProjectPathSet` goes to `put_path`, which rejects an
+empty id and validates the value; every other caller is test support. The `Desktop`
+role is enforced by `role_allows` at the IPC layer for all of these, not by the
+narrower list inside `route_request`.
+
+**Desktop privilege separation** (`src-tauri/src/main.rs`,
+`apps/desktop/src/local-client.ts`) — recovery runs under a distinct
+`DesktopRecoveryHost` role rather than `Desktop`. Phrase entry and confirmation are
+`DesktopRecoveryHost`-only while read-only status queries stay `Desktop`, so the
+renderer cannot drive an approval it has no host prompt for. The recovery phrase is
+entered in a native prompt and never crosses the JavaScript boundary, and the generic
+`call()` throws if a recovery method is routed through it, making the dedicated
+native command the only path. No `dangerouslySetInnerHTML`, `innerHTML` or `eval`
+appears anywhere in the front end.
+
+## Not yet reviewed
+
+Nothing in the audit scope is still unreviewed. The areas below were walked but not
+read line by line, and are the most likely place for something to have been missed.
+
+- The React screens themselves, for interaction and state bugs rather than security
+  boundaries — layout, focus management and error presentation outside the screens
+  touched by #22-#28 and #30.
+- The native transaction and recovery state machines in their failure paths, rather
+  than their guards.
