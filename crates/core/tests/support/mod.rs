@@ -395,6 +395,17 @@ pub fn native_path() -> WireNativeValue {
     }
 }
 
+/// A distinct Windows path per name, for tests that need a transaction to carry
+/// more than one target — a target may not be named twice in the same transaction.
+pub fn native_path_named(name: &str) -> WireNativeValue {
+    let path = format!(r"C:\vault\{name}");
+    WireNativeValue {
+        platform: NativePlatform::Windows,
+        bytes: path.encode_utf16().flat_map(u16::to_le_bytes).collect(),
+        display: Some(path),
+    }
+}
+
 pub fn basis(index: usize) -> Embedding384 {
     let mut values = vec![0.0; 384];
     values[index] = 1.0;

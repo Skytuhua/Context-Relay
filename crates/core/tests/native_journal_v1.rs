@@ -18,7 +18,8 @@ use context_relay_protocol::{PlanId, Sha256Digest};
 use rusqlite::{Connection, OptionalExtension};
 
 use support::{
-    ID_1, ID_2, ID_3, ID_4, ID_5, ID_6, MemoryKeyStore, TempVault, native_path, receipt,
+    ID_1, ID_2, ID_3, ID_4, ID_5, ID_6, MemoryKeyStore, TempVault, native_path, native_path_named,
+    receipt,
 };
 
 const CREDENTIAL: &str = "task-9-native-journal";
@@ -306,6 +307,174 @@ fn before_image_batch_reserves_budget_before_inserting_any_member() {
     assert_eq!(vault.before_image_bytes().unwrap(), 10);
     assert!(vault.has_before_image("first").unwrap());
     assert!(vault.has_before_image("second").unwrap());
+}
+
+/// A compensation pass walks the WAL one record at a time, each transition in
+/// its own SQL transaction. If one of those fails, the ones before it are
+/// already committed, so recovery has to be able to run the same walk again
+/// and pick up where it stopped rather than reject the states it already
+/// achieved. This is the property that makes a partial rollback resumable.
+#[test]
+fn a_partially_applied_compensation_resumes_from_its_own_midpoint() {
+    let path = TempVault::new("native-wal-resume");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    let plan_id = plan_id(ID_2);
+    let approval = Sha256Digest([8; 32]);
+    vault
+        .begin_native_transaction(
+            ID_1,
+            plan(&plan_id, &approval, b"encrypted native plan"),
+            windows_identity(),
+        )
+        .unwrap();
+    vault
+        .put_before_images_batch(
+            &[
+                BeforeImageWrite {
+                    id: "before-0",
+                    plan_id: Some(&plan_id),
+                    payload: b"before zero",
+                    created_ms: 10,
+                },
+                BeforeImageWrite {
+                    id: "before-1",
+                    plan_id: Some(&plan_id),
+                    payload: b"before one",
+                    created_ms: 10,
+                },
+            ],
+            BeforeImagePolicy::new(1024, 100),
+        )
+        .unwrap();
+
+    let expected = fingerprint(1);
+    let applied = fingerprint(2);
+    let restored = fingerprint(3);
+    for (sequence, before_image, volume) in [(0_u32, "before-0", 1_u8), (1_u32, "before-1", 4_u8)] {
+        // Each sequence needs its own target: a transaction may not name the same
+        // target twice.
+        let target = native_path_named(before_image);
+        vault
+            .prepare_native_wal(
+                ID_1,
+                &wal(
+                    sequence,
+                    before_image,
+                    &target,
+                    &NativeObjectToken {
+                        volume: vec![volume],
+                        object: vec![volume + 1],
+                        topology: vec![volume + 2],
+                    },
+                    &expected,
+                    &applied,
+                    &restored,
+                ),
+            )
+            .unwrap();
+        vault
+            .transition_native_wal_with_applied_object_token(
+                ID_1,
+                sequence,
+                NativeWalState::Applied,
+                &NativeObjectToken {
+                    volume: vec![volume],
+                    object: vec![volume + 1],
+                    topology: vec![volume + 2],
+                },
+            )
+            .unwrap();
+    }
+
+    // First pass: bring sequence 0 to Restored, then stop as a crash would.
+    vault
+        .transition_native_wal(ID_1, 0, NativeWalState::RestorePrepared)
+        .unwrap();
+    vault
+        .record_native_wal_restored_candidate(
+            ID_1,
+            0,
+            &NativeObjectToken {
+                volume: vec![1],
+                object: vec![2],
+                topology: vec![3],
+            },
+        )
+        .unwrap();
+    vault
+        .transition_native_wal(ID_1, 0, NativeWalState::Restored)
+        .unwrap();
+    let interrupted = vault.native_wal(ID_1).unwrap();
+    assert_eq!(interrupted[0].state, NativeWalState::Restored);
+    assert_eq!(interrupted[1].state, NativeWalState::Applied);
+
+    // Second pass: the same walk `finish_compensated` performs, driven by each
+    // record's current state rather than by replaying a fixed sequence. This is
+    // the point of the test — a record already Restored takes the no-op arm while
+    // one still Applied is carried the rest of the way. Replaying the literal
+    // transitions instead would be rejected as non-monotonic, which is correct:
+    // the state machine refuses to move backwards, and resumption works by
+    // dispatching on state, not by retrying steps.
+    for record in vault.native_wal(ID_1).unwrap() {
+        let sequence = record.target_sequence;
+        let token = if sequence == 0 {
+            NativeObjectToken {
+                volume: vec![1],
+                object: vec![2],
+                topology: vec![3],
+            }
+        } else {
+            NativeObjectToken {
+                volume: vec![4],
+                object: vec![5],
+                topology: vec![6],
+            }
+        };
+        match record.state {
+            NativeWalState::Prepared => {
+                vault
+                    .transition_native_wal(ID_1, sequence, NativeWalState::Restored)
+                    .unwrap();
+            }
+            NativeWalState::Applied => {
+                vault
+                    .transition_native_wal(ID_1, sequence, NativeWalState::RestorePrepared)
+                    .unwrap();
+            }
+            // Interrupted mid-restore: the record is already RestorePrepared, so
+            // only the completion is left.
+            NativeWalState::RestorePrepared => {}
+            // Already finished by the interrupted pass; nothing to carry.
+            NativeWalState::Restored | NativeWalState::Conflict => continue,
+        }
+        // The candidate is recorded while the record is still RestorePrepared —
+        // the vault rejects it once the record has reached Restored — and
+        // recording the same token twice is itself tolerated.
+        if vault.native_wal(ID_1).unwrap()[sequence as usize].state
+            == NativeWalState::RestorePrepared
+        {
+            vault
+                .record_native_wal_restored_candidate(ID_1, sequence, &token)
+                .unwrap();
+            vault
+                .record_native_wal_restored_candidate(ID_1, sequence, &token)
+                .unwrap();
+        }
+        vault
+            .transition_native_wal(ID_1, sequence, NativeWalState::Restored)
+            .unwrap();
+    }
+
+    let resumed = vault.native_wal(ID_1).unwrap();
+    for record in &resumed {
+        assert_eq!(
+            record.state,
+            NativeWalState::Restored,
+            "sequence {} must finish Restored after a resumed compensation",
+            record.target_sequence
+        );
+    }
 }
 
 #[test]
