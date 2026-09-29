@@ -169,13 +169,21 @@ runtime value can reach an error message, and the word-count rejection does not 
 what was typed. No `dangerouslySetInnerHTML`, `innerHTML` or `eval`
 appears anywhere in the front end.
 
+**Screen interaction and focus** (`apps/desktop/src/*.tsx`) — the modal surfaces use
+the native `<dialog>` element with `showModal()`, which supplies focus trapping and
+Escape handling rather than hand-rolling them, and each captures its trigger and
+restores focus from `onClose`. Surfaces that are not actually modal — the account
+deletion review, for instance — are inline `fieldset`/`legend` with `tabIndex={-1}`
+and move focus to the legend on open, which is the semantically correct choice
+instead of pretending to be a dialog. Errors use `role="alert"` and progress uses
+`role="status"`, and navigation moves focus to the new screen's heading.
+
 ## Not yet reviewed
 
-Nothing in the audit scope is still unreviewed. The areas below were walked but not
-read line by line, and are the most likely place for something to have been missed.
+Nothing in the audit scope is still unreviewed. What remains is narrower than the
+original plan, and is recorded so the limit of this pass is visible:
 
-- The React screens themselves, for interaction and state bugs rather than security
-  boundaries — layout, focus management and error presentation outside the screens
-  touched by #22-#28 and #30.
+- Visual layout and styling, which was not reviewed at any point.
 - The native transaction and recovery state machines in their failure paths, rather
-  than their guards.
+  than their guards. The guards are tested (#35); what a partial rollback does when
+  the compensation itself fails was reasoned about but not exercised.
