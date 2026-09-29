@@ -576,8 +576,12 @@ mod tests {
                 Duration::from_millis(500),
             );
             assert_eq!(result.is_ok(), mode == "valid", "{mode}: {result:?}");
+            // The probe's own timeout is 500ms; this budget only has to cover
+            // process teardown, so it is generous on purpose. A tight bound
+            // here failed under `cargo test -j 2`, where a loaded scheduler
+            // delays teardown well past any small margin.
             assert!(
-                start.elapsed() < Duration::from_secs(5),
+                start.elapsed() < Duration::from_secs(20),
                 "{mode} exceeded deadline"
             );
             assert!(
@@ -595,7 +599,20 @@ mod tests {
             }
             cases.push(case);
         }
-        thread::sleep(Duration::from_millis(1700));
+        // The descendant writes `escaped` 1500ms after it starts, so waiting a
+        // fixed 1700ms raced that write whenever the machine was loaded. Poll
+        // for the deadline instead: the assertion below is about the file
+        // never appearing, and a bounded wait makes that a real guarantee
+        // rather than a bet on scheduling.
+        for case in &cases {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while Instant::now() < deadline {
+                if case.join("escaped").exists() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
         for case in cases {
             assert!(
                 !case.join("escaped").exists(),
