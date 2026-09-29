@@ -140,11 +140,6 @@ cancel after the session is connected is covered by
 refresh loop after the wait loop was unbounded — no deadline, no cancellation check,
 exiting only when the error stopped being retryable — and is fixed in #37.
 
-## Not yet reviewed
-
-Nothing in the audit scope is still unreviewed. The areas below were walked but not
-read line by line, and are the most likely place for something to have been missed.
-
 **Dispatch outside the workspace queue** (`contextd/src/lib.rs`) — the pairing and
 recovery executors are unavailable unless a service is injected, and
 `HarnessPrepare` delegates to `bridge_install::prepare`, which builds a plan rather
@@ -182,12 +177,32 @@ and move focus to the legend on open, which is the semantically correct choice
 instead of pretending to be a dialog. Errors use `role="alert"` and progress uses
 `role="status"`, and navigation moves focus to the new screen's heading.
 
+**Design system conformance** (`apps/desktop/DESIGN.md`, `src/styles.css`) — the
+visual layer was checked against its own written specification rather than by
+inspecting the CSS alone. Every measurable contract in the document holds: the
+canvas, surface and primary values, a 200px sidebar, 36px controls, 6px and 8px
+corners, a 72ch prose measure, and the coarse-pointer 44px expansion. The two
+documented breakpoints are present as `64rem` and `46rem` rather than the pixel
+equivalents, which is the better choice given the same document requires headings to
+stay at fixed rem sizes. The stacked rail is capped at `30dvh`, matching the "at most
+30% of the viewport" rule, and reduced-motion and forced-colors both have explicit
+rules, including a system-colour outline for selected navigation and choices.
+
+Contrast was computed rather than eyeballed. Body text reaches 15.3:1 on the dark
+canvas and 15.6:1 on the light one, supporting text 8.7:1 and 6.5:1, and the primary
+action's own text reaches 7.1:1 on its fill in dark and 6.0:1 in light. The action
+boundary against the canvas clears the 3:1 requirement at 6.7:1 and 5.7:1. Every
+text-on-surface pairing required to clear 4.5:1 does.
+
 ## Not yet reviewed
 
 Nothing in the audit scope is still unreviewed. What remains is narrower than the
 original plan, and is recorded so the limit of this pass is visible:
 
-- Visual layout and styling, which was not reviewed at any point.
-- A compensation pass failing *mid-walk* is now covered for the write-ahead log by
-  #38, but only there. The equivalent resumption for the CLI WAL and the sandbox
-  cleanup path was reasoned about and not exercised.
+- A compensation pass failing *mid-walk* is covered for the write-ahead log and the
+  CLI WAL by #38. The sandbox cleanup path has the same structure and was reasoned
+  about, not exercised.
+- Rendered acceptance at the sizes DESIGN.md names (1180x760, 900x600, 600px, 200%
+  text). Those need a running app; the browser tool here refuses localhost, so this
+  pass verified the tokens, dimensions and contrast arithmetic rather than the
+  rendered result.
