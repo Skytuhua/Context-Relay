@@ -445,8 +445,6 @@ fn a_partially_applied_compensation_resumes_from_its_own_midpoint() {
             // Interrupted mid-restore: the record is already RestorePrepared, so
             // only the completion is left.
             NativeWalState::RestorePrepared => {}
-            // Nothing was applied to this target, so it needs no restore.
-            NativeWalState::Prepared => {}
             // Already finished by the interrupted pass; nothing to carry.
             NativeWalState::Restored | NativeWalState::Conflict => continue,
         }
