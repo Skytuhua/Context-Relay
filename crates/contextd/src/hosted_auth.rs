@@ -103,6 +103,12 @@ fn error(code: ErrorCode, message: &str) -> ClientError {
         retryable: false,
     }
 }
+/// How long a failing session refresh is retried before the maintenance task
+/// gives up and reports the session unavailable. Generous enough to ride out a
+/// transient outage, bounded so a refresh that never succeeds cannot keep the
+/// task alive indefinitely.
+const REFRESH_RETRY_CEILING: Duration = Duration::from_secs(15 * 60);
+
 fn failed(error: LoginError) -> HostedAuthState {
     HostedAuthState::Failed {
         reason: match error {
@@ -190,8 +196,25 @@ async fn maintain_session(
                 break;
             }
         }
+        // Refreshing past the expiry is deliberate: a refresh that succeeds
+        // after the wait loop's deadline renews the session, and
+        // `expired_session_is_not_connected_and_transient_refresh_recovers`
+        // covers exactly that. What it does *not* cover is a refresh that never
+        // succeeds — the loop below retried `Unavailable` with no bound and no
+        // cancellation check, so it ran until the process dropped the service.
+        // Cancelling is therefore the only bound applied here, plus a ceiling on
+        // how long a single stuck refresh is retried.
         let mut retry = Duration::from_secs(5);
+        let refresh_deadline = tokio::time::Instant::now() + REFRESH_RETRY_CEILING;
         loop {
+            if cancellation.is_canceled() {
+                publish(&weak, generation, failed(LoginError::Canceled));
+                return;
+            }
+            if tokio::time::Instant::now() >= refresh_deadline {
+                publish(&weak, generation, failed(LoginError::Unavailable));
+                return;
+            }
             let refreshing_owner = owner.clone();
             let refreshing_cancellation = cancellation.clone();
             metadata = tokio::task::spawn_blocking(move || {
@@ -205,6 +228,10 @@ async fn maintain_session(
             }
             tokio::time::sleep(retry).await;
             retry = (retry * 2).min(Duration::from_secs(60));
+        }
+        if let Err(error) = &metadata {
+            publish(&weak, generation, failed(*error));
+            return;
         }
     }
 }
