@@ -200,8 +200,15 @@ Nothing in the audit scope is still unreviewed. What remains is narrower than th
 original plan, and is recorded so the limit of this pass is visible:
 
 - A compensation pass failing *mid-walk* is covered for the write-ahead log and the
-  CLI WAL by #38. The sandbox cleanup path has the same structure and was reasoned
-  about, not exercised.
+  CLI WAL by #38. The sandbox cleanup path was originally recorded here as
+  "reasoned about, not exercised", which was wrong: two existing tests in
+  `native_journal_v1.rs` already cover it.
+  `terminal_cleanup_reclaims_wal_and_before_images_under_a_tiny_cap` calls
+  `finish_native_cleanup` twice and asserts the second call succeeds, which is
+  precisely the resumption case — at step 20 with a `Cleaned` disposition the
+  function returns early rather than rejecting. And
+  `cleanup_conflict_accepts_a_durably_entered_terminal_cleanup_step` covers the
+  `Conflict` disposition the same way. So this item is closed, not outstanding.
 - Rendered acceptance was carried out against the production build, not the dev
   server, at the four sizes DESIGN.md names. The sidebar measures exactly 200px at
   1180x760, 900x600 and 200% text; the first control is 37px tall, rising to 58px
