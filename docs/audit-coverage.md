@@ -100,7 +100,11 @@ transaction, and the step transition uses a compare-and-swap `UPDATE` that fails
 entry is idempotent, which is what lets crash recovery re-enter a step it had
 already entered. `commit_native_success` cross-checks the legacy and native
 receipts against each other (target counts, per-target fingerprints, duplicate
-targets) and is idempotent on replay. The journal releases its profile lock on
+targets) and is idempotent on replay. Because each WAL transition commits on its
+own, a compensation that fails partway leaves the earlier transitions durable, so
+resumption has to dispatch on each record's current state rather than replay a
+fixed step list; `finish_compensated` does exactly that, with an explicit no-op arm
+for a record already restored, and #38 exercises it. The journal releases its profile lock on
 every error path and composes both the primary and the compensation error when a
 rollback also fails. The gap found here was in the tests rather than the code, and
 is now covered by #35.
@@ -184,6 +188,6 @@ Nothing in the audit scope is still unreviewed. What remains is narrower than th
 original plan, and is recorded so the limit of this pass is visible:
 
 - Visual layout and styling, which was not reviewed at any point.
-- The native transaction and recovery state machines in their failure paths, rather
-  than their guards. The guards are tested (#35); what a partial rollback does when
-  the compensation itself fails was reasoned about but not exercised.
+- A compensation pass failing *mid-walk* is now covered for the write-ahead log by
+  #38, but only there. The equivalent resumption for the CLI WAL and the sandbox
+  cleanup path was reasoned about and not exercised.
