@@ -105,7 +105,18 @@ every error path and composes both the primary and the compensation error when a
 rollback also fails. The gap found here was in the tests rather than the code, and
 is now covered by #35.
 
+**Bridge install** (`contextd/src/bridge_install.rs`, `core/src/mcp/install.rs`) —
+the module holds no direct filesystem writes in production code; it builds a plan and
+hands it to the native transaction engine, so it inherits the guarantees above rather
+than reimplementing them. The trait boundary is explicit about it: implementations
+receive protocol DTOs only, and callers cannot inject paths, digests, commands or
+plan bodies into apply or rollback. No shell is ever invoked. The executable is
+attested before use: the path must be absolute and free of control characters,
+`symlink_metadata` (not `metadata`, so it does not follow the link) must show a
+regular file that is neither a symlink nor a reparse point, it must carry the
+executable bit, and the value that gets stored and launched is the `canonicalize`d
+path rather than the supplied one.
+
 ## Not yet reviewed
 
 - `hosted_auth` / `hosted_sync` state machines and retry backoff.
-- `bridge_install` (2.1k lines).
