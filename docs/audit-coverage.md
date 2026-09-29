@@ -216,6 +216,13 @@ original plan, and is recorded so the limit of this pass is visible:
   selected row and the error banner. Note the default preference is `dark`, not
   `system`, so the app does not follow the OS appearance until a user changes it.
 
+  That pass turned up a real defect in passing: `vite dev` rendered the app
+  completely unstyled, and #39 fixes it. The CSP meta tag in `index.html` blocks
+  the styles Vite injects at runtime, so the dev server served bare HTML. The
+  packaged app was never affected, because Tauri supplies the same policy as a
+  real response header. Worth keeping in mind that "the dev server looks broken"
+  and "the app is broken" are separate claims, and measuring both is cheap.
+
   One finding: `index.html` repeats the full CSP in a `<meta http-equiv>` tag, and
   the browser logs an error for `frame-ancestors` because that directive is ignored
   when delivered that way. Tauri injects a byte-identical policy as a real header
