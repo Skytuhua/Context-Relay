@@ -20,6 +20,8 @@ import {
   hydrateCiCandidateSidecar,
   hydrateSidecars,
   parseSidecarManifest,
+  parseInternalWindowsDescriptorV2,
+  validateInternalWindowsNativeBuildEvidence,
 } from './hydrate-sidecars.mjs';
 import { verifyBundleEvidence } from './semgrep-source-bundle.mjs';
 
@@ -268,7 +270,13 @@ async function copyRuntimeFiles(source, destination, inventory) {
   }
 }
 
-export async function prepareRuntimeArtifact({ buildRoot, outputRoot, targetName, version }) {
+export async function prepareRuntimeArtifact({
+  buildRoot,
+  outputRoot,
+  releaseQualification = true,
+  targetName,
+  version,
+}) {
   targetPolicy(targetName);
   if (typeof version !== 'string' || !/^\d+\.\d+\.\d+$/.test(version)) fail('version is invalid');
   buildRoot = resolve(buildRoot);
@@ -287,41 +295,51 @@ export async function prepareRuntimeArtifact({ buildRoot, outputRoot, targetName
     await mkdir(outputRoot);
     created = true;
     const aEvidence = await readEvidenceDirectory(join(buildRoot, 'build-a-evidence'), 'build-a evidence', version);
-    const bEvidence = await readEvidenceDirectory(join(buildRoot, 'build-b-evidence'), 'build-b evidence', version);
     const a = await readBuildDirectory(join(buildRoot, 'build-a'), aEvidence.root, targetName, 'build-a');
-    const b = await readBuildDirectory(join(buildRoot, 'build-b'), bEvidence.root, targetName, 'build-b');
-    if (!a.manifestBytes.equals(b.manifestBytes)) {
-      fail('twice-built MANIFEST.sha256 mismatch');
+    let b;
+    let bEvidence;
+    if (releaseQualification) {
+      bEvidence = await readEvidenceDirectory(join(buildRoot, 'build-b-evidence'), 'build-b evidence', version);
+      b = await readBuildDirectory(join(buildRoot, 'build-b'), bEvidence.root, targetName, 'build-b');
+      if (!a.manifestBytes.equals(b.manifestBytes)) {
+        fail('twice-built MANIFEST.sha256 mismatch');
+      }
+      assertExactRuntimeInventory(a.inventory, b.inventory);
+      assertExactRuntimeInventory(aEvidence.inventory, bEvidence.inventory);
     }
-    assertExactRuntimeInventory(a.inventory, b.inventory);
-    assertExactRuntimeInventory(aEvidence.inventory, bEvidence.inventory);
     const closure = a.inventory;
     const artifactRoot = join(outputRoot, 'artifact');
     await mkdir(artifactRoot);
     await copyRuntimeFiles(a.root, join(artifactRoot, 'release'), closure);
     await writeFile(join(artifactRoot, 'build-a.MANIFEST.sha256'), a.manifestBytes, { flag: 'wx' });
-    await writeFile(join(artifactRoot, 'build-b.MANIFEST.sha256'), b.manifestBytes, { flag: 'wx' });
     await writeFile(join(artifactRoot, 'build-a-evidence.MANIFEST.sha256'), inventoryManifest(aEvidence.inventory), { flag: 'wx' });
-    await writeFile(join(artifactRoot, 'build-b-evidence.MANIFEST.sha256'), inventoryManifest(bEvidence.inventory), { flag: 'wx' });
+    if (releaseQualification) {
+      await writeFile(join(artifactRoot, 'build-b.MANIFEST.sha256'), b.manifestBytes, { flag: 'wx' });
+      await writeFile(join(artifactRoot, 'build-b-evidence.MANIFEST.sha256'), inventoryManifest(bEvidence.inventory), { flag: 'wx' });
+    }
     await copyRuntimeFiles(aEvidence.root, join(artifactRoot, 'release-evidence'), aEvidence.inventory);
     const archiveName = `semgrep-${version}-${targetName}.tar.gz`;
     const archivePath = join(artifactRoot, archiveName);
-    const comparisonPath = join(outputRoot, 'runtime-build-b.tar.gz');
     const archiveA = await writeArchive(archivePath, a.root, a.inventory);
-    const archiveB = await writeArchive(comparisonPath, b.root, b.inventory);
-    if (archiveA.size !== archiveB.size || archiveA.sha256 !== archiveB.sha256) {
-      fail('twice-built runtime archives differ');
+    if (releaseQualification) {
+      const comparisonPath = join(outputRoot, 'runtime-build-b.tar.gz');
+      const archiveB = await writeArchive(comparisonPath, b.root, b.inventory);
+      if (archiveA.size !== archiveB.size || archiveA.sha256 !== archiveB.sha256) {
+        fail('twice-built runtime archives differ');
+      }
+      await rm(comparisonPath);
     }
-    await rm(comparisonPath);
     const evidenceArchiveName = `semgrep-${version}-${targetName}-release-evidence.tar.gz`;
     const evidenceArchivePath = join(artifactRoot, evidenceArchiveName);
-    const evidenceComparisonPath = join(outputRoot, 'evidence-build-b.tar.gz');
     const evidenceArchiveA = await writeArchive(evidenceArchivePath, aEvidence.root, aEvidence.inventory);
-    const evidenceArchiveB = await writeArchive(evidenceComparisonPath, bEvidence.root, bEvidence.inventory);
-    if (evidenceArchiveA.size !== evidenceArchiveB.size || evidenceArchiveA.sha256 !== evidenceArchiveB.sha256) {
-      fail('twice-built evidence archives differ');
+    if (releaseQualification) {
+      const evidenceComparisonPath = join(outputRoot, 'evidence-build-b.tar.gz');
+      const evidenceArchiveB = await writeArchive(evidenceComparisonPath, bEvidence.root, bEvidence.inventory);
+      if (evidenceArchiveA.size !== evidenceArchiveB.size || evidenceArchiveA.sha256 !== evidenceArchiveB.sha256) {
+        fail('twice-built evidence archives differ');
+      }
+      await rm(evidenceComparisonPath);
     }
-    await rm(evidenceComparisonPath);
     await writeFile(
       join(artifactRoot, `runtime-closure.${targetName}.v1.json`),
       jsonBytes({
@@ -398,12 +416,14 @@ export function createCandidateDocuments({
   if (statuses.length !== 1 || statuses[0].enabled !== false) {
     fail('candidate source target status is missing, ambiguous, or already enabled');
   }
+  const v1Source = bundleEvidence?.status === 'source_bundle_v1_native_builds_pending'
+    && bundleEvidence.independentBuilds === 1 && bundleEvidence.byteIdentical === false;
+  const qualifiedSource = bundleEvidence?.status === 'source_bundle_reproducible_native_builds_pending'
+    && bundleEvidence.independentBuilds === 2 && bundleEvidence.byteIdentical === true;
   if (!bundleEvidence || typeof bundleEvidence !== 'object' || Array.isArray(bundleEvidence)
       || bundleEvidence.sourceLockSha256 !== sourceLockSha256
-      || bundleEvidence.independentBuilds !== 2
-      || bundleEvidence.byteIdentical !== true
-      || bundleEvidence.status !== 'source_bundle_reproducible_native_builds_pending') {
-    fail('candidate bundle evidence is not honestly pending and reproducible');
+      || (!v1Source && !qualifiedSource)) {
+    fail('candidate bundle evidence is not an honest pending V1 or qualified source bundle');
   }
 
   const semgrep = manifest.tools?.find(({ id }) => id === 'semgrep');
@@ -453,6 +473,96 @@ export function createCandidateDocuments({
     candidateDocumentBytes,
     documentRelativePath: `third_party/sidecars/semgrep/ci-candidate-closure.${targetName}.v1.json`,
     target,
+  };
+}
+
+// Document construction binds supplied bytes; package verification must check the actual
+// source companion, compliance inventory and runtime before these bytes are staged/embedded.
+export function createInternalWindowsDocuments({
+  applicationSourceCommit,
+  qualification,
+  manifestBytes,
+  sourceLockBytes,
+  nativeBuildEvidenceBytes,
+  bundleEvidenceBytes,
+  complianceManifestBytes,
+}) {
+  for (const bytes of [manifestBytes, sourceLockBytes, nativeBuildEvidenceBytes, bundleEvidenceBytes, complianceManifestBytes]) {
+    if (!Buffer.isBuffer(bytes) || bytes.length === 0 || bytes.length > 16_777_216) fail('internal material bytes are invalid');
+  }
+  const manifest = parseSidecarManifest(new TextDecoder('utf-8', { fatal: true }).decode(manifestBytes));
+  const semgrep = manifest.tools.find(({ id }) => id === 'semgrep');
+  const target = semgrep?.targets.find(({ target: name }) => name === 'windows-x86_64');
+  if (!target?.enabled || semgrep.targets.filter(({ enabled }) => enabled).length !== 1
+      || target.reproducibleBuilds !== 2 || target.correspondingSourceComplete !== true
+      || semgrep.targets.find(({ target: name }) => name === 'macos-aarch64')?.disabledReason !== 'deferred_apple_native_qualification') {
+    fail('internal manifest must qualify only Windows');
+  }
+  const decode = (bytes) => JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+  const sourceLock = decode(sourceLockBytes);
+  const bundle = decode(bundleEvidenceBytes);
+  const native = decode(nativeBuildEvidenceBytes);
+  const nativeMaterial = semgrep.materials.find(({ role }) => role === 'native-build-evidence');
+  const bundleMaterial = semgrep.materials.find(({ role }) => role === 'source-bundle-evidence');
+  if (semgrep.source.materialPath !== 'third_party/sidecars/semgrep/source-lock.v1.json'
+      || semgrep.source.materialSha256 !== sha256(sourceLockBytes)
+      || nativeMaterial?.sha256 !== sha256(nativeBuildEvidenceBytes)
+      || bundleMaterial?.sha256 !== sha256(bundleEvidenceBytes)
+      || bundleMaterial.path !== 'third_party/sidecars/semgrep/bundle-evidence.internal-windows.v2.json'
+      || bundle.schemaVersion !== 2 || bundle.status !== 'complete_corresponding_source'
+      || bundle.sourceLockSha256 !== sha256(sourceLockBytes) || bundle.independentBuilds !== 2
+      || bundle.byteIdentical !== true || bundle.sourceDelivery?.kind !== 'bundled'
+      || bundle.sourceDelivery.path !== 'compliance/semgrep/semgrep-1.170.0-corresponding-source.tar') {
+    fail('internal finalizer material identity mismatch');
+  }
+  validateInternalWindowsNativeBuildEvidence(native, sourceLock, nativeMaterial, semgrep.materials, [target], qualification);
+  const prefix = 'sidecars/semgrep/verification/';
+  const identity = (path, bytes) => ({ path, size: bytes.length, sha256: sha256(bytes) });
+  const descriptorBytes = jsonBytes({
+    schemaVersion: 2,
+    purpose: 'internal-windows-package-qualification',
+    publishable: false,
+    enabled: true,
+    target: 'windows-x86_64',
+    sidecar: 'semgrep',
+    version: semgrep.version,
+    applicationSourceCommit,
+    qualification: {
+      commit: qualification.commit,
+      runId: qualification.runId,
+      runAttempt: qualification.runAttempt,
+      workflowRef: qualification.workflowRef,
+      workflowSha: qualification.workflowSha,
+    },
+    sidecarManifest: identity(`${prefix}third_party/sidecars/manifest.v1.json`, manifestBytes),
+    sourceLock: identity(`${prefix}third_party/sidecars/semgrep/source-lock.v1.json`, sourceLockBytes),
+    nativeBuildEvidence: identity(`${prefix}third_party/sidecars/semgrep/native-build-evidence.v1.json`, nativeBuildEvidenceBytes),
+    bundleEvidence: identity(`${prefix}third_party/sidecars/semgrep/bundle-evidence.internal-windows.v2.json`, bundleEvidenceBytes),
+    commandTemplate: { id: semgrep.commandTemplate.id, sha256: semgrep.commandTemplate.sha256 },
+    archive: {
+      format: target.download.format,
+      size: target.download.size,
+      sha256: target.download.sha256,
+      entries: target.closure.map(({ path, size }) => ({ path, type: 'file', size })),
+      extractPath: target.download.extractPath,
+    },
+    executable: { path: target.executable.path, size: target.executable.size, sha256: target.executable.sha256 },
+    closure: target.closure.map(({ path, size, sha256: digest, executable }) => ({ path, size, sha256: digest, executable })),
+    sourceCompanion: {
+      path: bundle.sourceDelivery.path,
+      size: bundle.bundle.size,
+      sha256: bundle.bundle.sha256,
+      payloadEntries: bundle.bundle.payloadEntries,
+      recordedLinks: bundle.bundle.recordedLinks,
+    },
+    complianceManifest: identity('compliance/manifest.v1.json', complianceManifestBytes),
+  });
+  parseInternalWindowsDescriptorV2(descriptorBytes);
+  return {
+    descriptorBytes,
+    descriptorDigest: sha256(Buffer.concat([
+      Buffer.from('context-relay/internal-windows-package-qualification/v2\0'), descriptorBytes,
+    ])),
   };
 }
 
@@ -533,6 +643,7 @@ export async function prepareAndHydrate({
   buildRoot,
   bundleEvidencePath,
   outputRoot,
+  releaseQualification = true,
   sourceBundlePath,
   targetName,
   workspace,
@@ -550,7 +661,13 @@ export async function prepareAndHydrate({
     evidencePath: committedEvidencePath,
     sourceLockPath,
   });
-  const runtime = await prepareRuntimeArtifact({ buildRoot, outputRoot, targetName, version: semgrep.version });
+  const runtime = await prepareRuntimeArtifact({
+    buildRoot,
+    outputRoot,
+    releaseQualification,
+    targetName,
+    version: semgrep.version,
+  });
   let hydrationWorkspace = workspace;
   let result;
   let mode;
@@ -735,7 +852,7 @@ export function createWindowsStableToolchainEvidence(bytes) {
 
 async function command() {
   const [mode, ...args] = process.argv.slice(2);
-  if (mode === '--prepare' && args.length === 12) {
+  if ((mode === '--prepare' || mode === '--prepare-v1') && args.length === 12) {
     const values = Object.fromEntries(Array.from({ length: 6 }, (_, index) => [args[index * 2], args[index * 2 + 1]]));
     if (JSON.stringify(Object.keys(values).sort()) !== JSON.stringify([
       '--build-root', '--bundle-evidence', '--output-root', '--source-bundle', '--target', '--workspace',
@@ -744,6 +861,7 @@ async function command() {
       buildRoot: values['--build-root'],
       bundleEvidencePath: values['--bundle-evidence'],
       outputRoot: values['--output-root'],
+      releaseQualification: mode === '--prepare',
       sourceBundlePath: values['--source-bundle'],
       targetName: values['--target'],
       workspace: values['--workspace'],
@@ -761,7 +879,7 @@ async function command() {
     await writeFile(args[1], createWindowsStableToolchainEvidence(await readFile(args[0])), { flag: 'wx' });
     return;
   }
-  fail('usage: --prepare --workspace ROOT --target TARGET --build-root ROOT --output-root ROOT --source-bundle TAR --bundle-evidence JSON | --windows-evidence FACTS.json CYGCHECK.txt OUTPUT.json | --windows-stable-toolchain BUILDER.json OUTPUT.json');
+  fail('usage: --prepare|--prepare-v1 --workspace ROOT --target TARGET --build-root ROOT --output-root ROOT --source-bundle TAR --bundle-evidence JSON | --windows-evidence FACTS.json CYGCHECK.txt OUTPUT.json | --windows-stable-toolchain BUILDER.json OUTPUT.json');
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

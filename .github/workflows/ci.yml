@@ -5,82 +5,422 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      semgrep_artifact_run_id:
+        description: Reuse normal-V1 native artifacts from this prior CI run
+        type: string
+        default: ''
+      semgrep_artifact_commit:
+        description: Commit that produced the reused normal-V1 native artifacts
+        type: string
+        default: ''
+  workflow_call:
+    inputs:
+      semgrep_release_qualification:
+        type: boolean
+        default: false
+      semgrep_windows_only:
+        type: boolean
+        default: false
+      semgrep_artifact_run_id:
+        type: string
+        default: ''
+      semgrep_artifact_commit:
+        type: string
+        default: ''
 
 permissions:
+  actions: read
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  ORDINARY_RUST_FEATURES: context-relay-core/test-support,context-relay-local-ipc/test-support,context-relay-contextd/test-support,context-relay-context-mcp/test-support
 
 jobs:
+  # Apple qualification is deferred by the approved Windows/shared acceptance plan.
   rust:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with:
-          node-version-file: .node-version
-      - run: npm install --global pnpm@11.9.0
-      - run: rustup show
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
-      - run: node --test scripts/check-daemon-boundary.test.mjs
-      - run: node scripts/check-daemon-boundary.mjs
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm check:bindings
-      - run: pnpm check:schemas
-      - run: pnpm license:check
-      - run: cargo install cargo-deny --version 0.20.2 --locked
-      - run: cargo deny check
-      - run: git diff --check
-
-  frontend:
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          node-version-file: .node-version
-      - run: npm install --global pnpm@11.9.0
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm lint
-      - run: pnpm typecheck
-      - run: pnpm test --run
-      - run: pnpm build
+          persist-credentials: false
+      - run: rustup show
+      - run: cargo fmt --all -- --check
 
-  native:
+  rust-lint:
+    name: Rust lint (${{ matrix.host }})
+    permissions:
+      contents: read
     strategy:
+      fail-fast: false
       matrix:
-        include:
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-          - os: macos-14
-            target: aarch64-apple-darwin
+        include: [{ host: windows-x64, os: windows-2025 }]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - if: ${{ runner.os == 'Windows' }}
+        shell: pwsh
+        run: if ($env:RUNNER_ARCH -ne 'X64') { throw 'Windows x64 runner is required' }
+      - if: ${{ runner.os == 'macOS' }}
+        shell: bash
+        run: test "$(uname -m)" = arm64
+      - run: rustup show
+      - run: cargo clippy --workspace --all-targets --features "${{ env.ORDINARY_RUST_FEATURES }}" -- -D warnings
+
+  rust-tests:
+    name: Rust tests (${{ matrix.host }})
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{ host: windows-x64, os: windows-2025 }]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - if: ${{ runner.os == 'Windows' }}
+        shell: pwsh
+        run: if ($env:RUNNER_ARCH -ne 'X64') { throw 'Windows x64 runner is required' }
+      - if: ${{ runner.os == 'macOS' }}
+        shell: bash
+        run: test "$(uname -m)" = arm64
+      - if: ${{ runner.os == 'macOS' }}
+        name: Canonicalize the macOS temporary root
+        shell: bash
+        run: echo "TMPDIR=$(cd "${TMPDIR:-$RUNNER_TEMP}" && pwd -P)/" >> "$GITHUB_ENV"
+      - name: Mount canonical case-sensitive APFS root
+        if: ${{ runner.os == 'macOS' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Keep descendants below macOS's fixed AF_UNIX SUN_LEN limit.
+          image="$RUNNER_TEMP/cr-ws-cs.sparseimage"
+          mount="$RUNNER_TEMP/cr-ws-cs"
+          mkdir "$mount"
+          hdiutil create -size 4g -fs 'Case-sensitive APFS' -volname ContextRelayWorkspaceTests -type SPARSE "$image"
+          hdiutil attach -nobrowse -owners on -mountpoint "$mount" "$image"
+          printf x > "$mount/CaseProbe"
+          printf y > "$mount/caseprobe"
+          test "$(find "$mount" -maxdepth 1 -type f -iname caseprobe | wc -l | tr -d ' ')" = 2
+          rm "$mount/CaseProbe" "$mount/caseprobe"
+          root="$(cd "$mount" && pwd -P)"
+          printf 'CONTEXT_RELAY_CASE_SENSITIVE_APFS_ROOT=%s\n' "$root" >> "$GITHUB_ENV"
+      - run: rustup show
+      - if: ${{ runner.os == 'macOS' }}
+        run: cargo test --manifest-path crates/native-runner/tests/macos-launcher-harness/Cargo.toml --test guardian_native -- --nocapture
+      - run: cargo test --workspace --all-targets --features "${{ env.ORDINARY_RUST_FEATURES }}"
+
+  daemon-boundary:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+      - run: node --test scripts/check-daemon-boundary.test.mjs
+      - run: node scripts/check-daemon-boundary.mjs
+
+  bindings:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version-file: .node-version
       - run: npm install --global pnpm@11.9.0
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check:bindings
+
+  schemas:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+      - run: npm install --global pnpm@11.9.0
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check:schemas
+
+  licenses:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+      - run: npm install --global pnpm@11.9.0
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm license:check
+
+  dependency-policy:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: cargo install cargo-deny --version 0.20.2 --locked
+      - run: cargo deny check
+
+  node-dependency-policy:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+      - run: npm install --global pnpm@11.9.0
+      - run: pnpm install --frozen-lockfile
+      - run: node --test scripts/dependency-policy.test.mjs
+      # The audit endpoint is a remote registry call that intermittently
+      # times out on hosted runners; retry before failing the gate. The
+      # gate itself is unchanged - any attempt that completes must pass.
+      - run: |
+          for attempt in 1 2 3; do
+            if pnpm audit --audit-level low; then exit 0; fi
+            echo "audit attempt $attempt failed; retrying after backoff"
+            sleep $((attempt * 15))
+          done
+          pnpm audit --audit-level low
+
+  whitespace:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check committed whitespace
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          readonly zero_sha=0000000000000000000000000000000000000000
+
+          require_sha() {
+            local label="$1"
+            local value="$2"
+            if [[ ! "$value" =~ ^[0-9a-f]{40}$ ]]; then
+              printf 'invalid %s: expected a lowercase 40-hex SHA\n' "$label" >&2
+              exit 1
+            fi
+          }
+
+          require_commit() {
+            local label="$1"
+            local value="$2"
+            require_sha "$label" "$value"
+            if ! git cat-file -e "${value}^{commit}" 2>/dev/null; then
+              printf 'missing %s commit: %s\n' "$label" "$value" >&2
+              exit 1
+            fi
+          }
+
+          check_latest_commit() {
+            local head="$1"
+            local parent
+            if parent="$(git rev-parse --verify "${head}^" 2>/dev/null)"; then
+              require_commit DERIVED_PARENT_SHA "$parent"
+              git diff --check "$parent" "$head"
+            else
+              git diff-tree -r --check --root --no-commit-id "$head"
+            fi
+          }
+
+          require_commit CURRENT_SHA "$CURRENT_SHA"
+          case "$EVENT_NAME" in
+            pull_request)
+              require_commit PR_BASE_SHA "$PR_BASE_SHA"
+              require_commit PR_HEAD_SHA "$PR_HEAD_SHA"
+              git diff --check "$PR_BASE_SHA" "$PR_HEAD_SHA"
+              ;;
+            push)
+              require_sha PUSH_BEFORE_SHA "$PUSH_BEFORE_SHA"
+              if [[ "$PUSH_BEFORE_SHA" == "$zero_sha" ]]; then
+                if git rev-parse --verify "${CURRENT_SHA}^" >/dev/null 2>&1; then
+                  printf 'zero PUSH_BEFORE_SHA has no exact non-root comparison range\n' >&2
+                  exit 1
+                fi
+                git diff-tree -r --check --root --no-commit-id "$CURRENT_SHA"
+              else
+                require_commit PUSH_BEFORE_SHA "$PUSH_BEFORE_SHA"
+                git diff --check "$PUSH_BEFORE_SHA" "$CURRENT_SHA"
+              fi
+              ;;
+            workflow_dispatch|workflow_call)
+              check_latest_commit "$CURRENT_SHA"
+              ;;
+            *)
+              printf 'unsupported whitespace event: %s\n' "$EVENT_NAME" >&2
+              exit 1
+              ;;
+          esac
+
+  frontend:
+    name: Frontend (${{ matrix.gate }})
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - gate: lint
+            command: pnpm lint
+          - gate: typecheck
+            command: pnpm typecheck
+          - gate: tests
+            command: pnpm test --run
+          - gate: build
+            command: pnpm build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+      - run: npm install --global pnpm@11.9.0
+      - run: pnpm install --frozen-lockfile
+      - run: ${{ matrix.command }}
+
+  native:
+    name: Native build (${{ matrix.host }})
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{ host: windows-x64, os: windows-2025, target: x86_64-pc-windows-msvc }]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+      - run: npm install --global pnpm@11.9.0
+      - if: ${{ runner.os == 'Windows' }}
+        shell: pwsh
+        run: if ($env:RUNNER_ARCH -ne 'X64') { throw 'Windows x64 runner is required' }
+      - if: ${{ runner.os == 'macOS' }}
+        shell: bash
+        run: test "$(uname -m)" = arm64
+      - name: Verify macOS library constraint enforcement
+        if: ${{ runner.os == 'macOS' }}
+        run: |
+          cargo build --locked --release --target aarch64-apple-darwin -p context-relay-native-runner --features test-support --example macos-library-constraint-probe
+          python3 scripts/test_macos_signing.py
+          python3 scripts/verify-macos-library-constraints.py target/aarch64-apple-darwin/release/examples/macos-library-constraint-probe
+      - run: node --test scripts/fetch-macos-search-resources.test.mjs
+      - name: Verify macOS search input acquisition
+        if: ${{ runner.os == 'macOS' }}
+        shell: bash
+        run: node scripts/fetch-macos-search-resources.mjs "$RUNNER_TEMP/macos-search-resources"
       - run: rustup target add ${{ matrix.target }}
       - run: pnpm install --frozen-lockfile
-      - run: cargo test -p context-relay-protocol --all-features
-      - run: cargo test -p context-relay-local-ipc --target ${{ matrix.target }} --all-features
-      - run: cargo test -p context-relay-contextd --target ${{ matrix.target }} --all-features
-      - run: pnpm --filter @context-relay/desktop tauri build --target ${{ matrix.target }}
+      - run: node --test scripts/package-macos.test.mjs
+      - if: ${{ runner.os == 'Windows' }}
+        run: pnpm --filter @context-relay/desktop tauri build --target ${{ matrix.target }}
+      - name: Assemble macOS app candidate
+        if: ${{ runner.os == 'macOS' }}
+        run: pnpm package:macos
+        env:
+          CONTEXT_RELAY_SEARCH_ASSETS: ${{ runner.temp }}/macos-search-resources
+          CONTEXT_RELAY_MACOS_SIGNING_IDENTITY: "-"
+
+  semgrep-materials:
+    runs-on: ubuntu-24.04
+    outputs:
+      changed: ${{ steps.changes.outputs.changed }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: changes
+        name: Detect native Semgrep material changes
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          FORCE: ${{ inputs.semgrep_release_qualification || (github.event_name == 'workflow_dispatch' && inputs.semgrep_artifact_run_id == '') }}
+          REUSE_COMMIT: ${{ inputs.semgrep_artifact_commit }}
+          REUSE_RUN_ID: ${{ inputs.semgrep_artifact_run_id }}
+        run: |
+          set -euo pipefail
+          changed=false
+          if { test -n "$REUSE_RUN_ID" && test -z "$REUSE_COMMIT"; } || { test -z "$REUSE_RUN_ID" && test -n "$REUSE_COMMIT"; }; then
+            echo 'artifact run and commit must be supplied together' >&2
+            exit 1
+          elif test -n "$REUSE_RUN_ID"; then
+            [[ "$REUSE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+            [[ "$REUSE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+            test '${{ inputs.semgrep_release_qualification }}' != true
+          elif test "$FORCE" = true || test -z "$BASE_SHA" || test "$BASE_SHA" = 0000000000000000000000000000000000000000; then
+            changed=true
+          else
+            while IFS= read -r path; do
+              case "$path" in
+                third_party/sidecars/semgrep/native-build-evidence.v1.json) ;;
+                .github/workflows/ci.yml|Cargo.lock|Cargo.toml|crates/native-runner/*|scripts/apply-semgrep-source-patches.mjs|scripts/hydrate-sidecars.mjs|scripts/native-smoke-evidence.mjs|scripts/prepare-semgrep-runtime.mjs|scripts/semgrep-source-bundle.mjs|scripts/semgrep-source-inventory.mjs|third_party/sidecars/manifest.v1.json|third_party/sidecars/policies/semgrep-package.yml|third_party/sidecars/semgrep/*)
+                  changed=true
+                  break
+                  ;;
+              esac
+            done < <(git diff --name-only "$BASE_SHA" "$GITHUB_SHA")
+          fi
+          printf 'changed=%s\n' "$changed" >> "$GITHUB_OUTPUT"
 
   native-semgrep-windows-x64-builders:
+    needs: semgrep-materials
+    if: ${{ needs.semgrep-materials.outputs.changed == 'true' }}
     name: Native Semgrep Windows x64 build-${{ matrix.build }}
     strategy:
       fail-fast: false
       matrix:
-        build: [a, b]
+        build: ${{ fromJSON(inputs.semgrep_release_qualification && '["a","b"]' || '["a"]') }}
     runs-on: windows-2022
     timeout-minutes: 360
     env:
       CONTEXT_RELAY_BUILD_SLOT: ${{ matrix.build }}
+      CONTEXT_RELAY_RELEASE_QUALIFICATION: ${{ inputs.semgrep_release_qualification }}
       CONTEXT_RELAY_RUNNER_IMAGE: windows-2022
       CONTEXT_RELAY_SETUP_NODE_ACTION_SHA: 49933ea5288caeca8642d1e84afbd3f7d6820020
       CONTEXT_RELAY_SETUP_OCAML_ACTION_SHA: 3e4c6ff8c9a04c9ec8f6f87701cd4b661b0f1f18
@@ -114,6 +454,33 @@ jobs:
           opam-repositories: |
             default: https://github.com/ocaml/opam-repository.git#78d29aba187e8362b8ab86c189790c0af9153d4b
           save-opam-post-run: false
+      - name: Provision locked Cygwin MinGW system dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $cygwinSetup = 'C:\cygwin\setup-x86_64.exe'
+          if (-not (Test-Path -LiteralPath $cygwinSetup -PathType Leaf)) { throw 'the pinned setup-ocaml Cygwin installer is missing' }
+          $packages = @(
+            'cygwin=3.6.10-1',
+            'mingw64-i686-curl',
+            'mingw64-i686-gmp',
+            'mingw64-i686-pcre2',
+            'mingw64-x86_64-curl',
+            'mingw64-x86_64-gmp',
+            'mingw64-x86_64-pcre2',
+            'pkgconf'
+          )
+          $arguments = @(
+            '--quiet-mode',
+            '--symlink-type=sys',
+            '--local-package-dir=C:\cygwin\packages',
+            "--packages=$($packages -join ',')",
+            '--root=C:\cygwin',
+            '--site=https://mirrors.kernel.org/sourceware/cygwin/'
+          )
+          $process = Start-Process -FilePath $cygwinSetup -ArgumentList $arguments -Wait -PassThru -WindowStyle Hidden
+          if ($process.ExitCode -ne 0) { throw "Cygwin dependency provisioning failed with exit code $($process.ExitCode)" }
       - name: Verify exact Windows AMD64 builder and fetch pins
         shell: pwsh
         run: |
@@ -140,7 +507,7 @@ jobs:
             if ((git -C $destination rev-parse HEAD).Trim() -ne $pin.revision) { throw "pin revision mismatch: $($pin.revision)" }
           }
           "CONTEXT_RELAY_SEMGREP_PINS_ROOT=$pins" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
-      - name: Build one independently identified offline Windows runtime
+      - name: Build one pinned Windows runtime
         shell: pwsh
         env:
           CONTEXT_RELAY_CHECK_RUN_ID: ${{ job.check_run_id }}
@@ -152,6 +519,7 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           $slot = $env:CONTEXT_RELAY_BUILD_SLOT
           $label = "build-$slot"
+          $artifactAttempt = if ($env:CONTEXT_RELAY_RELEASE_QUALIFICATION -eq 'true') { "-$env:GITHUB_RUN_ATTEMPT" } else { '' }
           $lock = (Resolve-Path third_party/sidecars/semgrep/source-lock.v1.json).Path
           $evidence = (Resolve-Path third_party/sidecars/semgrep/bundle-evidence.v1.json).Path
           $cache = Join-Path $env:RUNNER_TEMP "context-relay-semgrep-cache-windows-$slot"
@@ -161,13 +529,14 @@ jobs:
           node scripts/semgrep-source-bundle.mjs --fetch $lock $cache
           node scripts/semgrep-source-bundle.mjs --build $lock (Resolve-Path task9-semgrep).Path (Resolve-Path task9-opam-repository).Path $env:CONTEXT_RELAY_SEMGREP_PINS_ROOT $cache $bundle $env:GITHUB_WORKSPACE
           node scripts/semgrep-source-bundle.mjs --verify-evidence $lock $bundle $evidence
-          ./third_party/sidecars/semgrep/build-public-source-windows.ps1 -SourceLock $lock -SourceBundle $bundle -WorkRoot $work -OutputRoot $output -BuildLabel $label
+          $offlineBuild = $env:CONTEXT_RELAY_RELEASE_QUALIFICATION -eq 'true'
+          ./third_party/sidecars/semgrep/build-public-source-windows.ps1 -SourceLock $lock -SourceBundle $bundle -WorkRoot $work -OutputRoot $output -BuildLabel $label -OfflineBuild:$offlineBuild
           Copy-Item -LiteralPath $bundle -Destination (Join-Path $output "source-$slot.tar")
           $identity = [ordered]@{
             schemaVersion = 1
             target = 'windows-x86_64'
             build = $label
-            artifactName = "task9-semgrep-windows-build-$slot-$env:GITHUB_SHA-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+            artifactName = "task9-semgrep-windows-build-$slot-$env:GITHUB_SHA-$env:GITHUB_RUN_ID$artifactAttempt"
             commit = $env:GITHUB_SHA
             runId = $env:GITHUB_RUN_ID
             runAttempt = [int]$env:GITHUB_RUN_ATTEMPT
@@ -209,18 +578,21 @@ jobs:
           node scripts/prepare-semgrep-runtime.mjs --windows-stable-toolchain $builderEvidence (Join-Path $output "$label.builder-toolchain.windows-x86_64.v1.json")
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: task9-semgrep-windows-build-${{ matrix.build }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: task9-semgrep-windows-build-${{ matrix.build }}-${{ github.sha }}-${{ github.run_id }}${{ inputs.semgrep_release_qualification && format('-{0}', github.run_attempt) || '' }}
           path: ${{ runner.temp }}/context-relay-semgrep-output-windows-${{ matrix.build }}
           if-no-files-found: error
           compression-level: 0
+          overwrite: ${{ !inputs.semgrep_release_qualification }}
           retention-days: 2
 
   native-isolation-windows-x64:
     needs:
+      - semgrep-materials
       - native-semgrep-windows-x64-builders
+    if: ${{ always() && !cancelled() && (needs.native-semgrep-windows-x64-builders.result == 'success' || inputs.semgrep_artifact_run_id != '') }}
     outputs:
       hydration_mode: ${{ steps.prepare.outputs.mode }}
-    runs-on: windows-2022
+    runs-on: windows-2025
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
@@ -230,14 +602,35 @@ jobs:
         with:
           node-version-file: .node-version
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        if: ${{ inputs.semgrep_artifact_run_id == '' }}
         with:
-          name: task9-semgrep-windows-build-a-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: task9-semgrep-windows-build-a-${{ github.sha }}-${{ github.run_id }}${{ inputs.semgrep_release_qualification && format('-{0}', github.run_attempt) || '' }}
           path: ${{ runner.temp }}/context-relay-semgrep-output-windows
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        if: ${{ inputs.semgrep_artifact_run_id != '' }}
+        with:
+          name: task9-semgrep-windows-build-a-${{ inputs.semgrep_artifact_commit }}-${{ inputs.semgrep_artifact_run_id }}
+          path: ${{ runner.temp }}/context-relay-semgrep-output-windows
+          run-id: ${{ inputs.semgrep_artifact_run_id }}
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        if: ${{ inputs.semgrep_release_qualification }}
         with:
           name: task9-semgrep-windows-build-b-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/context-relay-semgrep-output-windows
+      - name: Reseal reused Windows V1 source evidence
+        if: ${{ inputs.semgrep_artifact_run_id != '' }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'context-relay-semgrep-output-windows'
+          $input = Join-Path $root 'source-a.tar'
+          $output = Join-Path $root 'source-a.resealed.tar'
+          node --input-type=module -e "import{readFile}from'node:fs/promises';import{resealSemgrepSourceBundle as r}from'./scripts/reseal-semgrep-source-bundle.mjs';const[i,o,l]=process.argv.slice(1);console.log(JSON.stringify(await r({additions:[],inputPath:i,outputPath:o,replacements:[{bytes:await readFile(l),executable:false,path:'metadata/source-lock.v1.json'}]})))" $input $output (Resolve-Path third_party/sidecars/semgrep/source-lock.v1.json).Path
+          Remove-Item -LiteralPath $input
+          Move-Item -LiteralPath $output -Destination $input
       - name: Verify independent Windows build identities and source evidence
+        if: ${{ inputs.semgrep_release_qualification }}
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -250,10 +643,18 @@ jobs:
           node scripts/semgrep-source-bundle.mjs --verify-evidence (Resolve-Path third_party/sidecars/semgrep/source-lock.v1.json).Path (Join-Path $root 'source-a.tar') (Resolve-Path third_party/sidecars/semgrep/bundle-evidence.v1.json).Path
           node scripts/semgrep-source-bundle.mjs --verify-evidence (Resolve-Path third_party/sidecars/semgrep/source-lock.v1.json).Path (Join-Path $root 'source-b.tar') (Resolve-Path third_party/sidecars/semgrep/bundle-evidence.v1.json).Path
           foreach ($slot in @('a', 'b')) {
-            $offline = Get-Content -Raw (Join-Path $root "build-$slot.offline-egress.v1.json") | ConvertFrom-Json
-            if ($offline.schemaVersion -ne 1 -or $offline.mechanism -ne 'windows-firewall-default-outbound-block-runner-control-plane-allow' -or $offline.probe -ne 'hostile-outbound-tcp-denied') { throw 'invalid Windows offline evidence' }
+            node scripts/verify-native-builder-identities.mjs --windows-offline-evidence qualification (Join-Path $root "build-$slot.offline-egress.v1.json")
           }
           if ((Get-FileHash -Algorithm SHA256 (Join-Path $root 'build-a.builder-toolchain.windows-x86_64.v1.json')).Hash -ne (Get-FileHash -Algorithm SHA256 (Join-Path $root 'build-b.builder-toolchain.windows-x86_64.v1.json')).Hash) { throw 'independent Windows toolchains differ' }
+      - name: Verify single-build Windows V1 source and runtime-smoke evidence
+        if: ${{ !inputs.semgrep_release_qualification }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $root = Join-Path $env:RUNNER_TEMP 'context-relay-semgrep-output-windows'
+          node scripts/semgrep-source-bundle.mjs --verify-evidence (Resolve-Path third_party/sidecars/semgrep/source-lock.v1.json).Path (Join-Path $root 'source-a.tar') (Resolve-Path third_party/sidecars/semgrep/bundle-evidence.v1.json).Path
+          node scripts/verify-native-builder-identities.mjs --windows-offline-evidence runtime-smoke (Join-Path $root 'build-a.offline-egress.v1.json')
       - name: Prepare strict Windows candidate
         id: prepare
         shell: pwsh
@@ -262,7 +663,8 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           $root = Join-Path $env:RUNNER_TEMP 'context-relay-semgrep-output-windows'
           $candidate = Join-Path $env:RUNNER_TEMP 'context-relay-semgrep-candidate-windows'
-          $result = node scripts/prepare-semgrep-runtime.mjs --prepare --workspace $env:GITHUB_WORKSPACE --target windows-x86_64 --build-root $root --output-root $candidate --source-bundle (Join-Path $root 'source-a.tar') --bundle-evidence (Resolve-Path third_party/sidecars/semgrep/bundle-evidence.v1.json).Path | ConvertFrom-Json
+          $prepareMode = if ('${{ inputs.semgrep_release_qualification }}' -eq 'true') { '--prepare' } else { '--prepare-v1' }
+          $result = node scripts/prepare-semgrep-runtime.mjs $prepareMode --workspace $env:GITHUB_WORKSPACE --target windows-x86_64 --build-root $root --output-root $candidate --source-bundle (Join-Path $root 'source-a.tar') --bundle-evidence (Resolve-Path third_party/sidecars/semgrep/bundle-evidence.v1.json).Path | ConvertFrom-Json
           if ($result.mode -eq 'candidate') {
             if (-not $result.candidateWorkspace -or -not $result.candidateDocumentPath) { throw 'candidate verification workspace is missing' }
             "CONTEXT_RELAY_REAL_SIDECAR_MANIFEST_ROOT=$($result.candidateWorkspace)" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
@@ -271,7 +673,8 @@ jobs:
           "mode=$($result.mode)" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
           "CONTEXT_RELAY_REAL_SIDECAR_ROOT=$($result.hydrationRoot)" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
           "CONTEXT_RELAY_RUNTIME_ARTIFACT_ROOT=$($result.artifactRoot)" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
-          foreach ($slot in @('a', 'b')) {
+          $slots = if ('${{ inputs.semgrep_release_qualification }}' -eq 'true') { @('a', 'b') } else { @('a') }
+          foreach ($slot in $slots) {
             Copy-Item (Join-Path $root "source-$slot.tar") (Join-Path $result.artifactRoot "source-$slot.tar")
             Copy-Item (Join-Path $root "build-$slot.identity.v1.json") (Join-Path $result.artifactRoot "build-$slot.identity.v1.json")
             Copy-Item (Join-Path $root "build-$slot.offline-egress.v1.json") (Join-Path $result.artifactRoot "build-$slot.offline-egress.v1.json")
@@ -290,7 +693,7 @@ jobs:
           cargo test -p context-relay-native-runner
           cargo test -p context-relay-native-runner --test native_fs_windows_v1 -- --nocapture
           cargo test -p context-relay-native-runner --test windows_launcher_v1 -- --nocapture
-          cargo test --manifest-path crates/native-runner/tests/windows-launcher-harness/Cargo.toml -- --nocapture
+          cargo test --manifest-path crates/native-runner/tests/windows-launcher-harness/Cargo.toml -- --nocapture --test-threads=1
           $registered = cargo test -p context-relay-native-runner --test real_sidecars_windows_v1 -- --list
           $tests = @('real_rulesync_generates_only_the_validated_output_inside_appcontainer','real_rulesync_rejects_malformed_frontmatter_and_cleans_up','real_gitleaks_distinguishes_clean_and_findings_and_ignores_attacker_ignore_file','real_semgrep_clean_and_finding_use_the_closed_policy')
           foreach ($name in $tests) {
@@ -312,15 +715,18 @@ jobs:
           retention-days: 7
 
   native-semgrep-macos-arm64-builders:
+    needs: semgrep-materials
+    if: ${{ false }}
     name: Native Semgrep macOS arm64 build-${{ matrix.build }}
     strategy:
       fail-fast: false
       matrix:
-        build: [a, b]
+        build: ${{ fromJSON(inputs.semgrep_release_qualification && '["a","b"]' || '["a"]') }}
     runs-on: macos-15
     timeout-minutes: 360
     env:
       CONTEXT_RELAY_BUILD_SLOT: ${{ matrix.build }}
+      CONTEXT_RELAY_RELEASE_QUALIFICATION: ${{ inputs.semgrep_release_qualification }}
       CONTEXT_RELAY_RUNNER_IMAGE: macos-15
       CONTEXT_RELAY_SETUP_NODE_ACTION_SHA: 49933ea5288caeca8642d1e84afbd3f7d6820020
       CONTEXT_RELAY_SETUP_OCAML_ACTION_SHA: a739c5405d73c42ef15a9dc995efc0f87396cc36
@@ -354,6 +760,11 @@ jobs:
           opam-repositories: |
             default: https://github.com/ocaml/opam-repository.git#78d29aba187e8362b8ab86c189790c0af9153d4b
           save-opam-post-run: false
+      - name: Provision locked Homebrew system dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install curl dwarfutils gmp libev libunwind-headers pcre2 pkgconf zstd
       - name: Verify exact native arm64 builder and fetch pins
         shell: bash
         run: |
@@ -375,7 +786,7 @@ jobs:
             test "$(git -C "$destination" rev-parse HEAD)" = "$revision"
           done
           printf 'CONTEXT_RELAY_SEMGREP_PINS_ROOT=%s\n' "$pins" >> "$GITHUB_ENV"
-      - name: Build one independently identified offline macOS runtime
+      - name: Build one pinned macOS runtime
         shell: bash
         env:
           CONTEXT_RELAY_CHECK_RUN_ID: ${{ job.check_run_id }}
@@ -397,18 +808,22 @@ jobs:
           node scripts/semgrep-source-bundle.mjs --verify-evidence "$lock" "$bundle" "$evidence"
           /bin/sh third_party/sidecars/semgrep/build-public-source-macos.sh "$lock" "$bundle" "$work" "$output" "$label"
           cp "$bundle" "$output/source-$slot.tar"
-          node -e 'const fs=require("node:fs"); const p=process.argv[1]; const slot=process.env.CONTEXT_RELAY_BUILD_SLOT; const value={schemaVersion:1,target:"macos-aarch64",build:`build-${slot}`,artifactName:`task9-semgrep-macos-build-${slot}-${process.env.GITHUB_SHA}-${process.env.GITHUB_RUN_ID}-${process.env.GITHUB_RUN_ATTEMPT}`,commit:process.env.GITHUB_SHA,runId:process.env.GITHUB_RUN_ID,runAttempt:Number(process.env.GITHUB_RUN_ATTEMPT),checkRunId:Number(process.env.CONTEXT_RELAY_CHECK_RUN_ID),jobDefinition:process.env.CONTEXT_RELAY_JOB_DEFINITION,jobIndex:Number(process.env.CONTEXT_RELAY_JOB_INDEX),jobTotal:Number(process.env.CONTEXT_RELAY_JOB_TOTAL),runnerName:process.env.RUNNER_NAME,runnerOs:process.env.RUNNER_OS,runnerArch:process.env.RUNNER_ARCH,workflowRef:process.env.GITHUB_WORKFLOW_REF,workflowSha:process.env.GITHUB_WORKFLOW_SHA}; fs.writeFileSync(p,JSON.stringify(value)+"\n",{flag:"wx"});' "$output/$label.identity.v1.json"
+          node -e 'const fs=require("node:fs"); const p=process.argv[1]; const slot=process.env.CONTEXT_RELAY_BUILD_SLOT; const attempt=process.env.CONTEXT_RELAY_RELEASE_QUALIFICATION==="true"?`-${process.env.GITHUB_RUN_ATTEMPT}`:""; const value={schemaVersion:1,target:"macos-aarch64",build:`build-${slot}`,artifactName:`task9-semgrep-macos-build-${slot}-${process.env.GITHUB_SHA}-${process.env.GITHUB_RUN_ID}${attempt}`,commit:process.env.GITHUB_SHA,runId:process.env.GITHUB_RUN_ID,runAttempt:Number(process.env.GITHUB_RUN_ATTEMPT),checkRunId:Number(process.env.CONTEXT_RELAY_CHECK_RUN_ID),jobDefinition:process.env.CONTEXT_RELAY_JOB_DEFINITION,jobIndex:Number(process.env.CONTEXT_RELAY_JOB_INDEX),jobTotal:Number(process.env.CONTEXT_RELAY_JOB_TOTAL),runnerName:process.env.RUNNER_NAME,runnerOs:process.env.RUNNER_OS,runnerArch:process.env.RUNNER_ARCH,workflowRef:process.env.GITHUB_WORKFLOW_REF,workflowSha:process.env.GITHUB_WORKFLOW_SHA}; fs.writeFileSync(p,JSON.stringify(value)+"\n",{flag:"wx"});' "$output/$label.identity.v1.json"
+          node -e 'const fs=require("node:fs"); const p=process.argv[1]; let fd; try { fd=fs.openSync(p,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW); const s=fs.fstatSync(fd); if(!s.isFile()||s.nlink !== 1||(s.mode & 0o777) !== 0o755) throw new Error("macOS producer executable mode mismatch"); } finally { if(fd !== undefined) fs.closeSync(fd); }' "$output/build-$slot/osemgrep"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: task9-semgrep-macos-build-${{ matrix.build }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: task9-semgrep-macos-build-${{ matrix.build }}-${{ github.sha }}-${{ github.run_id }}${{ inputs.semgrep_release_qualification && format('-{0}', github.run_attempt) || '' }}
           path: ${{ runner.temp }}/context-relay-semgrep-output-macos-${{ matrix.build }}
           if-no-files-found: error
           compression-level: 0
+          overwrite: ${{ !inputs.semgrep_release_qualification }}
           retention-days: 2
 
   native-isolation-macos-arm64:
     needs:
+      - semgrep-materials
       - native-semgrep-macos-arm64-builders
+    if: ${{ false }}
     outputs:
       hydration_mode: ${{ steps.prepare.outputs.mode }}
     runs-on: macos-15
@@ -421,14 +836,33 @@ jobs:
         with:
           node-version-file: .node-version
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        if: ${{ inputs.semgrep_artifact_run_id == '' }}
         with:
-          name: task9-semgrep-macos-build-a-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: task9-semgrep-macos-build-a-${{ github.sha }}-${{ github.run_id }}${{ inputs.semgrep_release_qualification && format('-{0}', github.run_attempt) || '' }}
           path: ${{ runner.temp }}/context-relay-semgrep-output-macos
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        if: ${{ inputs.semgrep_artifact_run_id != '' }}
+        with:
+          name: task9-semgrep-macos-build-a-${{ inputs.semgrep_artifact_commit }}-${{ inputs.semgrep_artifact_run_id }}
+          path: ${{ runner.temp }}/context-relay-semgrep-output-macos
+          run-id: ${{ inputs.semgrep_artifact_run_id }}
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        if: ${{ inputs.semgrep_release_qualification }}
         with:
           name: task9-semgrep-macos-build-b-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/context-relay-semgrep-output-macos
+      - name: Reseal reused macOS V1 source evidence
+        if: ${{ inputs.semgrep_artifact_run_id != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/context-relay-semgrep-output-macos"
+          node --input-type=module -e "import{readFile}from'node:fs/promises';import{resealSemgrepSourceBundle as r}from'./scripts/reseal-semgrep-source-bundle.mjs';const[i,o,l]=process.argv.slice(1);console.log(JSON.stringify(await r({additions:[],inputPath:i,outputPath:o,replacements:[{bytes:await readFile(l),executable:false,path:'metadata/source-lock.v1.json'}]})))" "$root/source-a.tar" "$root/source-a.resealed.tar" "$GITHUB_WORKSPACE/third_party/sidecars/semgrep/source-lock.v1.json"
+          rm "$root/source-a.tar"
+          mv "$root/source-a.resealed.tar" "$root/source-a.tar"
       - name: Verify independent macOS build identities and source evidence
+        if: ${{ inputs.semgrep_release_qualification }}
         shell: bash
         run: |
           set -euo pipefail
@@ -438,6 +872,22 @@ jobs:
           node scripts/semgrep-source-bundle.mjs --verify-evidence "$GITHUB_WORKSPACE/third_party/sidecars/semgrep/source-lock.v1.json" "$root/source-a.tar" "$GITHUB_WORKSPACE/third_party/sidecars/semgrep/bundle-evidence.v1.json"
           node scripts/semgrep-source-bundle.mjs --verify-evidence "$GITHUB_WORKSPACE/third_party/sidecars/semgrep/source-lock.v1.json" "$root/source-b.tar" "$GITHUB_WORKSPACE/third_party/sidecars/semgrep/bundle-evidence.v1.json"
           node -e 'const fs=require("node:fs"); for(const p of process.argv.slice(1)){const v=JSON.parse(fs.readFileSync(p)); if(v.schemaVersion!==1||v.mechanism!=="macos-sandbox-exec-network-deny"||v.probe!=="hostile-outbound-tcp-denied-with-eperm-or-eacces") process.exit(1)}' "$root/build-a.offline-egress.v1.json" "$root/build-b.offline-egress.v1.json"
+      - name: Verify single-build macOS V1 source and runtime-smoke evidence
+        if: ${{ !inputs.semgrep_release_qualification }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/context-relay-semgrep-output-macos"
+          node scripts/semgrep-source-bundle.mjs --verify-evidence "$GITHUB_WORKSPACE/third_party/sidecars/semgrep/source-lock.v1.json" "$root/source-a.tar" "$GITHUB_WORKSPACE/third_party/sidecars/semgrep/bundle-evidence.v1.json"
+          node -e 'const fs=require("node:fs"); const v=JSON.parse(fs.readFileSync(process.argv[1])); if(v.schemaVersion!==1||v.mechanism!=="macos-sandbox-exec-network-deny"||v.probe!=="hostile-outbound-tcp-denied-with-eperm-or-eacces") process.exit(1)' "$root/build-a.offline-egress.v1.json"
+      - name: Restore exact macOS artifact transport modes
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/context-relay-semgrep-output-macos"
+          paths=("$root/build-a/osemgrep")
+          if test '${{ inputs.semgrep_release_qualification }}' = true; then paths+=("$root/build-b/osemgrep"); fi
+          node -e 'const fs=require("node:fs"); for(const p of process.argv.slice(1)){let fd; try { fd=fs.openSync(p,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW); const before=fs.fstatSync(fd); if(!before.isFile()||before.nlink !== 1||(before.mode & 0o777) !== 0o644) throw new Error(`macOS artifact transport mode mismatch: ${p}`); fs.fchmodSync(fd, 0o755); const after=fs.fstatSync(fd); if(!after.isFile()||after.nlink !== 1||(after.mode & 0o777) !== 0o755) throw new Error(`macOS artifact mode restoration failed: ${p}`); } finally { if(fd !== undefined) fs.closeSync(fd); }}' "${paths[@]}"
       - name: Prepare strict macOS candidate
         id: prepare
         shell: bash
@@ -445,7 +895,9 @@ jobs:
           set -euo pipefail
           root="$RUNNER_TEMP/context-relay-semgrep-output-macos"
           candidate="$RUNNER_TEMP/context-relay-semgrep-candidate-macos"
-          result="$(node scripts/prepare-semgrep-runtime.mjs --prepare --workspace "$GITHUB_WORKSPACE" --target macos-aarch64 --build-root "$root" --output-root "$candidate" --source-bundle "$root/source-a.tar" --bundle-evidence "$GITHUB_WORKSPACE/third_party/sidecars/semgrep/bundle-evidence.v1.json")"
+          prepare_mode=--prepare-v1
+          if test '${{ inputs.semgrep_release_qualification }}' = true; then prepare_mode=--prepare; fi
+          result="$(node scripts/prepare-semgrep-runtime.mjs "$prepare_mode" --workspace "$GITHUB_WORKSPACE" --target macos-aarch64 --build-root "$root" --output-root "$candidate" --source-bundle "$root/source-a.tar" --bundle-evidence "$GITHUB_WORKSPACE/third_party/sidecars/semgrep/bundle-evidence.v1.json")"
           mode="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).mode)' "$result")"
           hydration_root="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).hydrationRoot)' "$result")"
           artifact_root="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).artifactRoot)' "$result")"
@@ -464,7 +916,9 @@ jobs:
           printf 'mode=%s\n' "$mode" >> "$GITHUB_OUTPUT"
           printf 'CONTEXT_RELAY_REAL_SIDECAR_ROOT=%s\n' "$hydration_root" >> "$GITHUB_ENV"
           printf 'CONTEXT_RELAY_RUNTIME_ARTIFACT_ROOT=%s\n' "$artifact_root" >> "$GITHUB_ENV"
-          for slot in a b; do
+          slots=a
+          if test '${{ inputs.semgrep_release_qualification }}' = true; then slots='a b'; fi
+          for slot in $slots; do
             cp "$root/source-$slot.tar" "$artifact_root/source-$slot.tar"
             cp "$root/build-$slot.identity.v1.json" "$artifact_root/build-$slot.identity.v1.json"
             cp "$root/build-$slot.offline-egress.v1.json" "$artifact_root/build-$slot.offline-egress.v1.json"
@@ -477,8 +931,8 @@ jobs:
           image="$RUNNER_TEMP/context-relay-case-sensitive.sparseimage"
           mount="$RUNNER_TEMP/context-relay-case-sensitive"
           mkdir "$mount"
-          hdiutil create -quiet -size 4g -fs APFSX -volname ContextRelayCaseSensitive -type SPARSE "$image"
-          hdiutil attach -quiet -nobrowse -owners on -mountpoint "$mount" "$image"
+          hdiutil create -size 4g -fs 'Case-sensitive APFS' -volname ContextRelayCaseSensitive -type SPARSE "$image"
+          hdiutil attach -nobrowse -owners on -mountpoint "$mount" "$image"
           printf x > "$mount/CaseProbe"
           printf y > "$mount/caseprobe"
           test "$(find "$mount" -maxdepth 1 -type f -iname caseprobe | wc -l | tr -d ' ')" = 2
@@ -492,6 +946,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$(uname -m)" = arm64
+          export TMPDIR="$(cd "${TMPDIR:-$RUNNER_TEMP}" && pwd -P)"
           cargo test -p context-relay-native-runner
           cargo test -p context-relay-core --test native_filesystem_macos_v1 --test native_recovery_v1 --test native_recovery_crash_v1 -- --nocapture
           cargo test --manifest-path crates/native-runner/tests/macos-launcher-harness/Cargo.toml -- --nocapture
@@ -522,7 +977,7 @@ jobs:
     needs:
       - native-isolation-windows-x64
       - native-isolation-macos-arm64
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.ref_protected == true && needs.native-isolation-windows-x64.outputs.hydration_mode == 'candidate' && needs.native-isolation-macos-arm64.outputs.hydration_mode == 'candidate' }}
+    if: ${{ inputs.semgrep_release_qualification && !inputs.semgrep_windows_only && github.event_name == 'push' && github.ref == 'refs/heads/main' && github.ref_protected == true && needs.native-isolation-windows-x64.outputs.hydration_mode == 'candidate' && needs.native-isolation-macos-arm64.outputs.hydration_mode == 'candidate' }}
     runs-on: ubuntu-24.04
     permissions:
       contents: write

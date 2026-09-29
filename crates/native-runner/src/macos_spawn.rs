@@ -1,9 +1,9 @@
 use std::{
     ffi::{CStr, CString, OsStr, c_void},
-    fs::File,
+    fs::{File, OpenOptions},
     os::{
         fd::{AsRawFd, FromRawFd},
-        unix::{ffi::OsStrExt, process::ExitStatusExt},
+        unix::{ffi::OsStrExt, fs::OpenOptionsExt, process::ExitStatusExt},
     },
     path::{Path, PathBuf},
     process::ExitStatus,
@@ -66,10 +66,19 @@ impl MacProcessGuardian {
         lease_name: &CStr,
         hook: impl FnOnce(),
     ) -> Result<Self, MacPolicyError> {
-        let (lease, guardian_wait) = guardian_lease(lease_directory, lease_name, hook)?;
+        let (lease, guardian_wait) = guardian_lease(lease_directory, lease_name, hook)
+            .inspect_err(|_error| {
+                #[cfg(debug_assertions)]
+                eprintln!("macOS guardian startup failed at lease creation: {_error:?}");
+            })?;
         let guardian_wait_fd = guardian_wait.as_raw_fd();
         let descriptor_limit =
-            guardian_descriptor_limit([lease.as_raw_fd(), guardian_wait.as_raw_fd()])?;
+            guardian_descriptor_limit([lease.as_raw_fd(), guardian_wait.as_raw_fd()]).inspect_err(
+                |_error| {
+                    #[cfg(debug_assertions)]
+                    eprintln!("macOS guardian startup failed at descriptor census: {_error:?}");
+                },
+            )?;
 
         let mut blocked_signals = std::mem::MaybeUninit::<libc::sigset_t>::zeroed();
         let mut previous_signals = std::mem::MaybeUninit::<libc::sigset_t>::zeroed();
@@ -82,6 +91,8 @@ impl MacProcessGuardian {
                 )
             } != 0
         {
+            #[cfg(debug_assertions)]
+            eprintln!("macOS guardian startup failed while blocking signals");
             return Err(MacPolicyError::ProcessFailed);
         }
         let pid = unsafe { libc::fork() };
@@ -96,6 +107,15 @@ impl MacProcessGuardian {
             )
         } == 0;
         if pid == -1 || !restored {
+            #[cfg(debug_assertions)]
+            if pid == -1 {
+                eprintln!(
+                    "macOS guardian startup failed while forking: {:?}",
+                    std::io::Error::last_os_error()
+                );
+            } else {
+                eprintln!("macOS guardian startup failed while restoring signals");
+            }
             if pid > 0 {
                 kill_and_reap_exact(pid);
             }
@@ -107,7 +127,9 @@ impl MacProcessGuardian {
             lease: Some(lease),
             reaped: false,
         };
-        if wait_guardian_ready(&mut guardian).is_err() {
+        if let Err(_error) = wait_guardian_ready(&mut guardian) {
+            #[cfg(debug_assertions)]
+            eprintln!("macOS guardian startup failed at readiness: {_error:?}");
             let _ = guardian.kill_group_and_reap();
             return Err(MacPolicyError::ProcessFailed);
         }
@@ -129,6 +151,8 @@ impl MacProcessGuardian {
         }
         if result == self.pid {
             self.reaped = true;
+            #[cfg(debug_assertions)]
+            eprintln!("macOS guardian exited unexpectedly with wait status {status}");
         }
         Err(MacPolicyError::ProcessFailed)
     }
@@ -213,16 +237,23 @@ fn guardian_descriptor_limit<const N: usize>(
     }
     let limit = unsafe { limit.assume_init() };
     let hard_limit = limit.rlim_max;
-    if hard_limit == libc::RLIM_INFINITY
-        || hard_limit < limit.rlim_cur
-        || hard_limit > MAX_GUARDIAN_DESCRIPTORS
+    let allocation_limit = if hard_limit == libc::RLIM_INFINITY {
+        limit.rlim_cur
+    } else {
+        hard_limit
+    };
+    if allocation_limit == libc::RLIM_INFINITY
+        || allocation_limit < limit.rlim_cur
+        || allocation_limit > MAX_GUARDIAN_DESCRIPTORS
     {
         return Err(MacPolicyError::ProcessFailed);
     }
 
-    // The hard limit closes the race with other threads: any descriptor opened between this
-    // snapshot and fork must be below it. A process can retain descriptors above a subsequently
-    // lowered hard limit, so the /dev/fd snapshot extends the ceiling over those as well.
+    // The finite hard limit closes the race with other threads: any descriptor opened between
+    // this snapshot and fork must be below it. macOS can report an infinite hard limit alongside
+    // a finite soft allocation limit, so use that kernel-enforced ceiling instead. A process can
+    // retain descriptors above its current allocation limit, and the /dev/fd snapshot extends the
+    // close ceiling over those as well.
     let highest_open = std::fs::read_dir("/dev/fd")
         .map_err(|_| MacPolicyError::ProcessFailed)?
         .try_fold(0_u64, |highest, entry| {
@@ -240,7 +271,7 @@ fn guardian_descriptor_limit<const N: usize>(
         .try_fold(0_u64, |highest, descriptor| {
             descriptor.map(|value| highest.max(value))
         })?;
-    let descriptor_limit = hard_limit
+    let descriptor_limit = allocation_limit
         .max(highest_open.saturating_add(1))
         .max(highest_new.saturating_add(1));
     if descriptor_limit > MAX_GUARDIAN_DESCRIPTORS {
@@ -296,6 +327,37 @@ impl MacChild {
         }
         self.suspended = false;
         Ok(())
+    }
+
+    pub fn suspend_and_verify(&mut self, expected: &MacCodeIdentity) -> Result<(), MacPolicyError> {
+        if self.suspended || self.reaped {
+            return Err(MacPolicyError::InvalidTransition);
+        }
+        if unsafe { libc::kill(self.pid, libc::SIGSTOP) } != 0 {
+            return Err(MacPolicyError::ProcessFailed);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut status = 0;
+        loop {
+            let result =
+                unsafe { libc::waitpid(self.pid, &mut status, libc::WUNTRACED | libc::WNOHANG) };
+            if result == self.pid {
+                if libc::WIFSTOPPED(status) {
+                    self.suspended = true;
+                    break;
+                }
+                self.reaped = libc::WIFEXITED(status) || libc::WIFSIGNALED(status);
+                return Err(MacPolicyError::ProcessFailed);
+            }
+            if result == -1 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                return Err(MacPolicyError::ProcessFailed);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(MacPolicyError::ProcessFailed);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        wait_for_dynamic_code_identity(self.pid, expected, dynamic_code_identity)
     }
 
     pub fn try_wait(&mut self) -> Result<Option<ExitStatus>, MacPolicyError> {
@@ -356,13 +418,72 @@ impl Drop for MacChild {
     }
 }
 
-pub fn capture_code_identity(file: &File) -> Result<MacCodeIdentity, MacPolicyError> {
-    let path = PathBuf::from(format!("/dev/fd/{}", file.as_raw_fd()));
-    let url = CFURL::from_path(path, false).ok_or(MacPolicyError::IdentityMismatch)?;
-    let code = SecStaticCode::from_path(&url, Flags::NONE)
+pub fn capture_code_identity(
+    file: &File,
+    executable: &Path,
+) -> Result<MacCodeIdentity, MacPolicyError> {
+    let descriptor_path = PathBuf::from(format!("/dev/fd/{}", file.as_raw_fd()));
+    let descriptor_url =
+        CFURL::from_path(descriptor_path, false).ok_or(MacPolicyError::IdentityMismatch)?;
+    let descriptor_code = SecStaticCode::from_path(&descriptor_url, Flags::NONE)
         .map_err(|_| MacPolicyError::IdentityMismatch)?;
-    validate_static_code(&code)?;
-    signing_identity(code.as_concrete_TypeRef().cast())
+    let descriptor_identity = signing_identity(descriptor_code.as_concrete_TypeRef().cast())?;
+
+    let _before = open_bound_executable(file, executable)?;
+    let executable_url =
+        CFURL::from_path(executable, false).ok_or(MacPolicyError::IdentityMismatch)?;
+    let executable_code = SecStaticCode::from_path(&executable_url, Flags::NONE)
+        .map_err(|_| MacPolicyError::IdentityMismatch)?;
+    validate_static_code(&executable_code)?;
+    let executable_identity = signing_identity(executable_code.as_concrete_TypeRef().cast())?;
+    let _after = open_bound_executable(file, executable)?;
+    if descriptor_identity != executable_identity {
+        return Err(MacPolicyError::IdentityMismatch);
+    }
+    Ok(descriptor_identity)
+}
+
+fn open_bound_executable(file: &File, path: &Path) -> Result<File, MacPolicyError> {
+    if !path.is_absolute() {
+        return Err(MacPolicyError::InvalidConfiguration);
+    }
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    let reopened = options
+        .open(path)
+        .map_err(|_| MacPolicyError::IdentityMismatch)?;
+    let held = file_identity(file)?;
+    let observed = file_identity(&reopened)?;
+    if held != observed || held.links != 1 || held.kind != libc::S_IFREG as u32 {
+        return Err(MacPolicyError::IdentityMismatch);
+    }
+    Ok(reopened)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+    generation: u32,
+    kind: u32,
+    links: u64,
+}
+
+fn file_identity(file: &File) -> Result<FileIdentity, MacPolicyError> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    if unsafe { libc::fstat(file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return Err(MacPolicyError::IdentityMismatch);
+    }
+    let stat = unsafe { stat.assume_init() };
+    Ok(FileIdentity {
+        device: stat.st_dev as u64,
+        inode: stat.st_ino,
+        generation: stat.st_gen,
+        kind: u32::from(stat.st_mode) & libc::S_IFMT as u32,
+        links: u64::from(stat.st_nlink),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -461,15 +582,38 @@ pub fn spawn_suspended_verified(
         suspended: true,
         reaped: false,
     };
-    let actual = dynamic_code_identity(pid);
+    let identity = wait_for_dynamic_code_identity(pid, expected, dynamic_code_identity);
     let expected_pgid = process_group.map(|pgid| if pgid == 0 { pid } else { pgid });
-    if !matches!(actual, Ok(ref actual) if actual == expected)
-        || expected_pgid.is_some_and(|pgid| unsafe { libc::getpgid(pid) } != pgid)
-    {
+    if let Err(error) = identity {
+        child.kill_and_reap();
+        return Err(error);
+    }
+    if expected_pgid.is_some_and(|pgid| unsafe { libc::getpgid(pid) } != pgid) {
         child.kill_and_reap();
         return Err(MacPolicyError::IdentityMismatch);
     }
     Ok(child)
+}
+
+fn wait_for_dynamic_code_identity(
+    pid: libc::pid_t,
+    expected: &MacCodeIdentity,
+    mut inspect: impl FnMut(libc::pid_t) -> Result<MacCodeIdentity, MacPolicyError>,
+) -> Result<(), MacPolicyError> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match inspect(pid) {
+            Ok(actual) if &actual == expected => return Ok(()),
+            Ok(_) => return Err(MacPolicyError::IdentityMismatch),
+            Err(MacPolicyError::IdentityMismatch) if std::time::Instant::now() < deadline => {
+                if unsafe { libc::kill(pid, 0) } != 0 {
+                    return Err(MacPolicyError::IdentityMismatch);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn dynamic_code_identity(pid: libc::pid_t) -> Result<MacCodeIdentity, MacPolicyError> {
@@ -671,5 +815,43 @@ impl Drop for SpawnAttributes {
         unsafe {
             libc::posix_spawnattr_destroy(&mut self.0);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dynamic_code_identity_retries_transient_guest_registration() {
+        let expected = MacCodeIdentity::new(vec![0x11]).unwrap();
+        let mut attempts = 0;
+
+        wait_for_dynamic_code_identity(unsafe { libc::getpid() }, &expected, |_| {
+            attempts += 1;
+            if attempts < 3 {
+                Err(MacPolicyError::IdentityMismatch)
+            } else {
+                Ok(expected.clone())
+            }
+        })
+        .unwrap();
+
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn dynamic_code_identity_rejects_an_observed_mismatch_without_retrying() {
+        let expected = MacCodeIdentity::new(vec![0x11]).unwrap();
+        let mut attempts = 0;
+
+        assert_eq!(
+            wait_for_dynamic_code_identity(unsafe { libc::getpid() }, &expected, |_| {
+                attempts += 1;
+                Ok(MacCodeIdentity::new(vec![0x22]).unwrap())
+            }),
+            Err(MacPolicyError::IdentityMismatch)
+        );
+        assert_eq!(attempts, 1);
     }
 }

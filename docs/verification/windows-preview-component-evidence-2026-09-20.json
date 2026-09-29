@@ -1,0 +1,115 @@
+{
+  "source_commit": "ef2b657f97496a38f4b1347df748bcbfab9e18ab",
+  "environment": {
+    "os": "Windows 11 Home 10.0.26200 x64",
+    "rust": "1.97.1",
+    "cargo": "1.97.1",
+    "node": "24.14.0",
+    "pnpm": "11.9.0",
+    "postgres": "17.6 disposable minimal Supabase platform fixtures"
+  },
+  "evidence_logs": [
+    {
+      "name": "frontend-checks.log",
+      "sha256": "4691b4ba59ffd42c15eda1ec1d27aa9314d58636a585c65cb49649343d09b47a",
+      "bytes": 980
+    },
+    {
+      "name": "node-final-qualified.log",
+      "sha256": "3e76a2c95db71b384b89336ec7e3313f7a3e596da32ef128e8d241fece9a4f0d",
+      "bytes": 40528
+    },
+    {
+      "name": "membership-tests.log",
+      "sha256": "e18bb133c7ec8259820470b29a4b4e0b0265718c4a9f96d7bf42d5a045e3c0b0",
+      "bytes": 2781
+    },
+    {
+      "name": "lifecycle-tests.log",
+      "sha256": "ba53696c3a7682c4cb1773c641bb1f9feb7cba4d2c96b8827eb79b665950cda2",
+      "bytes": 3727
+    },
+    {
+      "name": "clippy.log",
+      "sha256": "3aa6332d18b02d0014511d70ce400bfdc14de0c633a59d19d07c06910c05987c",
+      "bytes": 10705
+    },
+    {
+      "name": "contracts.log",
+      "sha256": "c51b64ecef78941aea90551c0fede10d7cd744da3f27ca15721e0b7835b2c696",
+      "bytes": 1348
+    },
+    {
+      "name": "deny-check.log",
+      "sha256": "8870b77e582f9b9b3e7eecd25750056267510f0a20ca270b016cc6ebc0850606",
+      "bytes": 93650
+    },
+    {
+      "name": "rust-tests.log",
+      "sha256": "9a9740b1084b98111992dda618f3b2a4eca14b3a397d7e83b716be80736bcbcb",
+      "bytes": 485268
+    },
+    {
+      "name": "membership-restricted-tests.log",
+      "sha256": "0e235f76e430a059c9a54cf2eb56c61b767486c7f7ef65d587472475abcc6c03",
+      "bytes": 2790
+    },
+    {
+      "name": "lifecycle-restricted-tests.log",
+      "sha256": "748badf05b6eeb889b9da9d9c1c05a75f528812719014407a493868d11f93b83",
+      "bytes": 3728
+    },
+    {
+      "name": "revocation-restricted-tests.log",
+      "sha256": "ea8c9ec60e8f282e27ab54625b0148e49718e10f2f32016028f19192333e08c7",
+      "bytes": 341
+    }
+  ],
+  "results": {
+    "frontend_tests_passed": 389,
+    "node_tests_passed": 439,
+    "node_tests_skipped": 5,
+    "postgres_membership_passed": 26,
+    "postgres_lifecycle_passed": 38,
+    "postgres_revocation_passed": 2,
+    "clippy_exit": 0,
+    "format_exit": 0,
+    "bindings_exit": 0,
+    "schemas_exit": 0,
+    "daemon_boundary_exit": 0,
+    "cargo_deny_exit": 0,
+    "node_audit": "no known vulnerabilities",
+    "rust_workspace_exit": 0,
+    "rust_passing_summaries": 160,
+    "rust_passes_including_nested_summaries": 1793,
+    "rust_ignored_including_nested_summaries": 54,
+    "postgres_restricted_role_membership_passed": 26,
+    "postgres_restricted_role_lifecycle_passed": 38,
+    "postgres_restricted_role_revocation_passed": 2
+  },
+  "limitations": [
+    "Windows-only environment; POSIX verifier and Bash whitespace execution not qualified.",
+    "Five Node skips: three resource-dependent cases and two unavailable symlink-creation cases.",
+    "No actual installer hash, installed acceptance, authenticated hosted acceptance or four-hour fuzz qualification.",
+    "Revocation tests were rerun successfully after fixture repair; earlier failing log is preserved separately.",
+    "Rust ignored cases remain unexecuted; passing summary totals may include nested child test processes."
+  ],
+  "commands": {
+    "rust_workspace": "cargo test --workspace --all-targets --locked --features context-relay-core/test-support,context-relay-local-ipc/test-support,context-relay-contextd/test-support,context-relay-context-mcp/test-support -j6",
+    "postgres_restricted_role": {
+      "environment": {
+        "CONTEXT_RELAY_DISPOSABLE_POSTGRES": "1",
+        "PGUSER": "readiness_runner",
+        "PGHOST": "127.0.0.1",
+        "PGPORT": "55473",
+        "PGDATABASE": "readiness",
+        "CONTEXT_RELAY_PSQL": "scratch PostgreSQL 17.6 psql.exe"
+      },
+      "commands": [
+        "node scripts/verify-membership-postgres.mjs",
+        "node scripts/verify-account-lifecycle-postgres.mjs",
+        "node scripts/verify-revocation-postgres.mjs"
+      ]
+    }
+  }
+}

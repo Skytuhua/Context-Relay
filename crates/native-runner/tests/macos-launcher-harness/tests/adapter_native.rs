@@ -11,18 +11,18 @@ use std::{
         unix::{
             ffi::OsStrExt,
             fs::{PermissionsExt, symlink},
+            process::CommandExt,
         },
     },
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use context_relay_native_runner::macos::{
     GenerationId, GenerationJournal, GenerationState, MacOsSandboxLauncher, MacPolicyError,
-    MacRecoveryCleanup, MacRecoveryIdentity, MacRecoveryOutcome, MacRootIdentity,
-    SignedGeneration,
+    MacRecoveryCleanup, MacRecoveryIdentity, MacRecoveryOutcome, MacRootIdentity, SignedGeneration,
     cleanup_recovered_generation,
 };
 use context_relay_native_runner::{
@@ -41,6 +41,19 @@ const CI_CANDIDATE_DOCUMENT: &str = "CONTEXT_RELAY_CI_CANDIDATE_DOCUMENT";
 const EXPECTED_PROOF: &[u8] =
     b"ARGV_EXACT=1\nENV_EXACT=1\nFAKE_HOME_WRITE=1\nREAL_HOME_DENIED=1\nLOOPBACK_DENIED=1\nCLOSURE_DENIED=1\n";
 static NATIVE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn native_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    NATIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn unwrap_run(
+    result: Result<RunResponse, context_relay_native_runner::RunnerError>,
+    journal: &TestJournal,
+) -> RunResponse {
+    result.unwrap_or_else(|error| panic!("{error:?}; lifecycle={:?}", journal.events()))
+}
 
 fn set_immutable(path: &Path, symlink: bool) {
     let encoded = CString::new(path.as_os_str().as_bytes()).unwrap();
@@ -92,23 +105,24 @@ fn root_identity(path: &Path) -> MacRootIdentity {
 
 #[test]
 fn production_adapter_runs_one_bound_response_in_a_single_use_container() {
-    let _serial = NATIVE_TEST_LOCK.lock().unwrap();
+    let _serial = native_test_lock();
     let fixture = Fixture::new(Helper::Production);
     let journal = TestJournal::default();
     let launcher = fixture.launcher(journal.clone());
 
-    let response = launcher
-        .run(&fixture.closure, &fixture.request("SUCCESS"))
-        .unwrap();
+    let response = unwrap_run(
+        launcher.run(&fixture.closure, &fixture.request("SUCCESS")),
+        &journal,
+    );
     let RunResponse::Completed {
         disposition,
         outputs,
         ..
-    } = response
+    } = &response
     else {
-        panic!("production helper did not return its uniquely bound response");
+        panic!("production helper did not return its uniquely bound response: {response:?}");
     };
-    assert_eq!(disposition, RunDisposition::Generated);
+    assert_eq!(*disposition, RunDisposition::Generated);
     assert_eq!(outputs.len(), 1);
     assert_eq!(outputs[0].path().as_str(), "output/.claude/rules/probe.md");
     assert_eq!(outputs[0].bytes(), EXPECTED_PROOF);
@@ -129,7 +143,7 @@ fn production_adapter_runs_one_bound_response_in_a_single_use_container() {
 
 #[test]
 fn recovered_generation_cleanup_clears_immutable_app_and_container_trees() {
-    let _serial = NATIVE_TEST_LOCK.lock().unwrap();
+    let _serial = native_test_lock();
     let parent = case_sensitive_apfs_root();
     let suffix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -207,15 +221,15 @@ fn recovered_generation_cleanup_clears_immutable_app_and_container_trees() {
 
 #[test]
 fn valid_response_kills_closed_stdio_descendant_before_retiring() {
-    let _serial = NATIVE_TEST_LOCK.lock().unwrap();
+    let _serial = native_test_lock();
     let fixture = Fixture::new(Helper::ProtocolFault);
     let journal = TestJournal::default();
     let launcher = fixture.launcher(journal.clone());
 
-    let RunResponse::Completed { outputs, .. } = launcher
-        .run(&fixture.closure, &fixture.request("GUARDIAN_GROUP_CHILD"))
-        .unwrap()
-    else {
+    let RunResponse::Completed { outputs, .. } = unwrap_run(
+        launcher.run(&fixture.closure, &fixture.request("GUARDIAN_GROUP_CHILD")),
+        &journal,
+    ) else {
         panic!("fixture did not return its valid response");
     };
     assert_eq!(outputs.len(), 1);
@@ -236,19 +250,20 @@ fn valid_response_kills_closed_stdio_descendant_before_retiring() {
 
 #[test]
 fn production_sidecar_cannot_fork_or_posix_spawn_descendants() {
-    let _serial = NATIVE_TEST_LOCK.lock().unwrap();
+    let _serial = native_test_lock();
     let fixture = Fixture::new(Helper::Production);
     let journal = TestJournal::default();
     let launcher = fixture.launcher(journal.clone());
 
-    let RunResponse::Completed { outputs, .. } = launcher
-        .run(
+    let response = unwrap_run(
+        launcher.run(
             &fixture.closure,
             &fixture.request("PROCESS_CREATION_DENIED"),
-        )
-        .unwrap()
-    else {
-        panic!("process-creation probe did not return a valid response");
+        ),
+        &journal,
+    );
+    let RunResponse::Completed { outputs, .. } = &response else {
+        panic!("process-creation probe did not return a valid response: {response:?}");
     };
     let proof = std::str::from_utf8(outputs[0].bytes()).unwrap();
     assert!(proof.starts_with(std::str::from_utf8(EXPECTED_PROOF).unwrap()));
@@ -263,16 +278,17 @@ fn production_sidecar_cannot_fork_or_posix_spawn_descendants() {
 
 #[test]
 fn production_adapter_poisoned_unbound_trailing_or_stderr_helper_output() {
-    let _serial = NATIVE_TEST_LOCK.lock().unwrap();
+    let _serial = native_test_lock();
     for mode in ["WRONG_BINDING", "TRAILING", "STDERR"] {
         let fixture = Fixture::new(Helper::ProtocolFault);
         let journal = TestJournal::default();
         let launcher = fixture.launcher(journal.clone());
 
         assert_eq!(
-            launcher
-                .run(&fixture.closure, &fixture.request(mode))
-                .unwrap(),
+            unwrap_run(
+                launcher.run(&fixture.closure, &fixture.request(mode)),
+                &journal,
+            ),
             RunResponse::failed(FailureCode::ToolFailed),
             "mode {mode}"
         );
@@ -291,15 +307,16 @@ fn production_adapter_poisoned_unbound_trailing_or_stderr_helper_output() {
 
 #[test]
 fn production_adapter_poisoned_malformed_bound_helper_frame() {
-    let _serial = NATIVE_TEST_LOCK.lock().unwrap();
+    let _serial = native_test_lock();
     let fixture = Fixture::new(Helper::ProtocolFault);
     let journal = TestJournal::default();
     let launcher = fixture.launcher(journal.clone());
 
     assert_eq!(
-        launcher
-            .run(&fixture.closure, &fixture.request("MALFORMED"))
-            .unwrap(),
+        unwrap_run(
+            launcher.run(&fixture.closure, &fixture.request("MALFORMED")),
+            &journal,
+        ),
         RunResponse::failed(FailureCode::ToolFailed)
     );
     assert_eq!(
@@ -315,7 +332,7 @@ fn production_adapter_poisoned_malformed_bound_helper_frame() {
 
 #[test]
 fn production_helper_exact_kills_a_sidecar_that_escapes_the_original_group() {
-    let _serial = NATIVE_TEST_LOCK.lock().unwrap();
+    let _serial = native_test_lock();
     let fixture = Fixture::new(Helper::Production);
     let journal = TestJournal::default();
     let launcher = fixture.launcher(journal.clone());
@@ -329,6 +346,10 @@ fn production_helper_exact_kills_a_sidecar_that_escapes_the_original_group() {
         let (pid, pgid) = loop {
             if let Some(identity) = recorded_group(&journal) {
                 break identity;
+            }
+            if run.is_finished() {
+                let response = run.join().unwrap();
+                panic!("fixture exited before recording its child process group: {response:?}");
             }
             assert!(
                 Instant::now() < deadline,
@@ -357,7 +378,7 @@ fn production_helper_exact_kills_a_sidecar_that_escapes_the_original_group() {
 #[test]
 #[ignore = "requires exact hydrated sidecars and native arm64 App Sandbox"]
 fn real_sidecar_rulesync_generates_only_the_validated_output() {
-    let _serial = NATIVE_TEST_LOCK.lock().unwrap();
+    let _serial = native_test_lock();
     let fixture = RealFixture::new(SidecarId::RuleSync);
     let request = fixture.request(
         [0x51; 16],
@@ -391,7 +412,7 @@ fn real_sidecar_rulesync_generates_only_the_validated_output() {
 #[test]
 #[ignore = "requires exact hydrated sidecars and native arm64 App Sandbox"]
 fn real_sidecar_rulesync_rejects_malformed_frontmatter_and_cleans_up() {
-    let _serial = NATIVE_TEST_LOCK.lock().unwrap();
+    let _serial = native_test_lock();
     let fixture = RealFixture::new(SidecarId::RuleSync);
     let request = fixture.request(
         [0x52; 16],
@@ -415,7 +436,7 @@ fn real_sidecar_rulesync_rejects_malformed_frontmatter_and_cleans_up() {
 #[test]
 #[ignore = "requires exact hydrated sidecars and native arm64 App Sandbox"]
 fn real_sidecar_gitleaks_clean_and_finding_ignore_attacker_gitleaksignore() {
-    let _serial = NATIVE_TEST_LOCK.lock().unwrap();
+    let _serial = native_test_lock();
     let fixture = RealFixture::new(SidecarId::Gitleaks);
     let clean = fixture.request(
         [0x61; 16],
@@ -478,7 +499,7 @@ fn real_sidecar_gitleaks_clean_and_finding_ignore_attacker_gitleaksignore() {
 #[test]
 #[ignore = "requires exact hydrated sidecars and native arm64 App Sandbox"]
 fn real_sidecar_semgrep_clean_and_finding_use_the_closed_policy() {
-    let _serial = NATIVE_TEST_LOCK.lock().unwrap();
+    let _serial = native_test_lock();
     let fixture = RealFixture::new(SidecarId::Osemgrep);
     let clean = fixture.request(
         [0x71; 16],
@@ -488,13 +509,18 @@ fn real_sidecar_semgrep_clean_and_finding_use_the_closed_policy() {
             b"osemgrep\n",
         )],
     );
+    let clean_response = fixture.run(&clean);
     let RunResponse::Completed {
         disposition,
         outputs,
         ..
-    } = fixture.run(&clean)
+    } = clean_response
     else {
-        panic!("real Semgrep clean scan did not complete");
+        panic!(
+            "real Semgrep clean scan did not complete: {clean_response:?}; bounded direct diagnostics: nproc-zero=[{}], nproc-inherited=[{}]",
+            fixture.diagnose_semgrep(b"osemgrep\n", true),
+            fixture.diagnose_semgrep(b"osemgrep\n", false)
+        );
     };
     assert_eq!(disposition, RunDisposition::Clean);
     assert_eq!(outputs.len(), 1);
@@ -508,13 +534,18 @@ fn real_sidecar_semgrep_clean_and_finding_use_the_closed_policy() {
             b"python.exe\n",
         )],
     );
+    let finding_response = fixture.run(&finding);
     let RunResponse::Completed {
         disposition,
         outputs,
         ..
-    } = fixture.run(&finding)
+    } = finding_response
     else {
-        panic!("real Semgrep finding scan did not complete");
+        panic!(
+            "real Semgrep finding scan did not complete: {finding_response:?}; bounded direct diagnostics: nproc-zero=[{}], nproc-inherited=[{}]",
+            fixture.diagnose_semgrep(b"python.exe\n", true),
+            fixture.diagnose_semgrep(b"python.exe\n", false)
+        );
     };
     assert_eq!(disposition, RunDisposition::Findings(1));
     assert_eq!(outputs.len(), 1);
@@ -616,6 +647,87 @@ impl RealFixture {
         launcher
             .run(&self.closure, request)
             .unwrap_or_else(|error| panic!("{error:?}; lifecycle={:?}", self.journal.events()))
+    }
+
+    fn diagnose_semgrep(&self, input: &[u8], deny_children: bool) -> String {
+        assert_eq!(self.closure.sidecar(), SidecarId::Osemgrep);
+        let root = self.root.join(if deny_children {
+            "semgrep-bounded-direct-diagnostic-nproc-zero"
+        } else {
+            "semgrep-bounded-direct-diagnostic-nproc-inherited"
+        });
+        let config = root.join("config/semgrep/package.yml");
+        let target = root.join("input/semgrep-target/runtime-inventory.txt");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::copy(
+            workspace_root().join("third_party/sidecars/policies/semgrep-package.yml"),
+            &config,
+        )
+        .unwrap();
+        fs::write(&target, input).unwrap();
+        for directory in ["home", "data", "cache", "temp", "runtime"] {
+            fs::create_dir_all(root.join(directory)).unwrap();
+        }
+        let executable = self
+            .closure
+            .root()
+            .join(self.closure.executable().path().as_str());
+        let argv = SidecarCommand::OsemgrepScanPackage.argv();
+        let mut command = Command::new(executable);
+        command
+            .args(argv.iter().skip(1))
+            .current_dir(&root)
+            .env_clear()
+            .env("HOME", root.join("home"))
+            .env("USERPROFILE", root.join("home"))
+            .env("APPDATA", root.join("data"))
+            .env("LOCALAPPDATA", root.join("data"))
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("XDG_DATA_HOME", root.join("data"))
+            .env("XDG_CACHE_HOME", root.join("cache"))
+            .env("TMP", root.join("temp"))
+            .env("TEMP", root.join("temp"))
+            .env("TMPDIR", root.join("temp"))
+            .env("PATH", root.join("runtime"))
+            .env("LANG", "C.UTF-8")
+            .env("LC_ALL", "C.UTF-8")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if deny_children {
+            unsafe {
+                command.pre_exec(|| {
+                    let no_children = libc::rlimit {
+                        rlim_cur: 0,
+                        rlim_max: 0,
+                    };
+                    if libc::setrlimit(libc::RLIMIT_NPROC, &no_children) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        let mut child = command.spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let timed_out = loop {
+            if child.try_wait().unwrap().is_some() {
+                break false;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                break true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let output = child.wait_with_output().unwrap();
+        format!(
+            "timed_out={timed_out}, status={:?}, stdout={}, stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
     }
 
     fn assert_complete_lifecycles(&self, count: usize) {
@@ -879,9 +991,7 @@ impl GenerationJournal for TestJournal {
         if !state.seen.insert(id.clone()) {
             return Err(MacPolicyError::InvalidTransition);
         }
-        state
-            .states
-            .insert(id.clone(), GenerationState::Prepared);
+        state.states.insert(id.clone(), GenerationState::Prepared);
         state.last_id = Some(id.clone());
         state.events.push(GenerationState::Prepared);
         Ok(())

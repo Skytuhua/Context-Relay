@@ -1,5 +1,18 @@
 # Isolated Native Runner and Transaction Engine Implementation Plan
 
+## 2026-07-24 Task 9 scope amendment
+
+Task 9 V1 completes after one current-revision native build and network-denied
+runtime smoke succeeds on Windows x64 and macOS arm64, together with the normal
+JavaScript, Rust, schema, manifest-material, formatting, and Clippy gates. The
+runtime remains no-Python, hash-pinned, `--jobs=1`, bounded, private-rooted, and
+isolated by the existing platform boundary.
+
+Independent A/B native builds, byte reproducibility, same-attempt comparison,
+publication approval/release creation, final published-evidence binding, and
+release-grade attestation are deferred to **Task 9R — Semgrep release
+qualification**. V1 completion does not satisfy or claim those release gates.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development or superpowers:executing-plans to implement this plan task by task. Use superpowers:test-driven-development for each behavior change and superpowers:verification-before-completion before any completion claim.
 
 **Goal:** Implement roadmap Task 9: pinned RuleSync, Gitleaks, and public-source native Semgrep sidecars; strict staged execution in a real Windows AppContainer or single-use signed macOS App Sandbox; and an exact, crash-recoverable 20-step native transaction that never mutates live state outside the approved bytes.
@@ -38,7 +51,7 @@
 - Semgrep source commit: `bd614accba811b407ae5c9ec6f1eecd3bdc29911`; annotated tag object `ebb842c9cbc9cfad8fb3e6f9ac6d81b8b6443cf6`; LGPL-2.1-or-later.
 - Semgrep compiler fork `3499e5708b0637c12d24d973dd103406a32b8fe8`; opam repository `78d29aba187e8362b8ab86c189790c0af9153d4b`.
 - Research-only macOS bootstrap artifact: 209,002,504 bytes, SHA-256 `13484adba7c30b6ae0bf0fef45d674a0a7afdeea1ee345a35aa04bf11ad0e7dd`. It cannot become a release artifact until two clean public-source builds and inventories match.
-- Windows Semgrep remains disabled until two clean public-source builds produce byte-identical executable/DLL inventories and pass no-Python sandbox smoke tests. Task 9 cannot be closed while this gate is red.
+- Windows Semgrep V1 requires one native build with exact DLL closure and no-Python AppContainer smoke. Two byte-identical builds remain a Task 9R release-qualification gate.
 
 The command-template builders emit exactly these logical arrays, substituting only validated stage-relative paths and closed target/feature enums:
 

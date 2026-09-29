@@ -67,6 +67,7 @@ const GITLEAKS_EMPTY_IGNORE: &[u8] =
     include_bytes!("../../../../third_party/sidecars/policies/gitleaks.empty-ignore");
 const SEMGREP_POLICY: &[u8] =
     include_bytes!("../../../../third_party/sidecars/policies/semgrep-package.yml");
+const SEMGREP_CANARY_SUFFIX: &[u8] = b"\ncontext-relay-scan-canary";
 const DRAIN_LIMIT: usize = 8 * 1024 * 1024;
 
 fn main() -> ExitCode {
@@ -97,10 +98,12 @@ fn execute(helper_request: &HelperRunRequest) -> Result<RunResponse, RunnerError
     let target = RuntimeTarget::current()?;
     let executable = verified_executable(helper_request, target)?;
     let mut stage = prepare_stage(request.nonce(), target)?;
-    let config_inventory = install_trusted_config(&mut stage, request.command(), target)?;
-    let input_inventory = stage.write_and_seal_inputs(request.inputs())?;
     validate_pre_enumeration(request)?;
     let limits = RunLimits::for_command(request.command());
+    let staged_inputs = staged_inputs(request.command(), request.inputs(), limits)?;
+    let config_inventory =
+        install_trusted_config(&mut stage, request.command(), &staged_inputs, target)?;
+    let input_inventory = stage.write_and_seal_inputs(&staged_inputs)?;
     let environment = RestrictedEnvironment::for_stage(stage.layout(), target)?;
     let argv = request.command().argv();
     let started = Instant::now();
@@ -110,9 +113,13 @@ fn execute(helper_request: &HelperRunRequest) -> Result<RunResponse, RunnerError
         .current_dir(stage.layout().root())
         .env_clear()
         .envs(environment.iter())
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(target_os = "macos")]
+    if matches!(request.command(), SidecarCommand::OsemgrepScanPackage) {
+        command.arg0(&argv[0]);
+    }
     #[cfg(target_os = "macos")]
     unsafe {
         command.pre_exec(|| {
@@ -136,9 +143,12 @@ fn execute(helper_request: &HelperRunRequest) -> Result<RunResponse, RunnerError
             Ok(())
         });
     }
-    let mut child = command
-        .spawn()
-        .map_err(|_| RunnerError::SidecarUnavailable)?;
+    let mut child = command.spawn().map_err(|error| {
+        eprintln!("{}", spawn_failure_diagnostic(&error));
+        RunnerError::SidecarUnavailable
+    })?;
+    let stdin = child.stdin.take().ok_or(RunnerError::Io)?;
+    drop(stdin);
     let stdout = child.stdout.take().ok_or(RunnerError::Io)?;
     let stderr = child.stderr.take().ok_or(RunnerError::Io)?;
     let stdout = thread::spawn(move || drain_bounded(stdout, DRAIN_LIMIT));
@@ -203,7 +213,7 @@ fn execute(helper_request: &HelperRunRequest) -> Result<RunResponse, RunnerError
         }
         SidecarCommand::OsemgrepScanPackage => {
             let (disposition, report) =
-                validate_semgrep_report(exit, &stdout, &stderr, request.inputs())?;
+                validate_semgrep_report(exit, &stdout, &stderr, &staged_inputs)?;
             RunResponse::completed(
                 disposition,
                 vec![ContentFrame::new(
@@ -215,6 +225,34 @@ fn execute(helper_request: &HelperRunRequest) -> Result<RunResponse, RunnerError
             )
         }
     }
+}
+
+fn staged_inputs(
+    command: &SidecarCommand,
+    inputs: &[ContentFrame],
+    limits: RunLimits,
+) -> Result<Vec<ContentFrame>, RunnerError> {
+    if !matches!(command, SidecarCommand::OsemgrepScanPackage) {
+        return Ok(inputs.to_vec());
+    }
+    let staged = inputs
+        .iter()
+        .map(|input| {
+            let mut bytes = Vec::with_capacity(input.bytes().len() + SEMGREP_CANARY_SUFFIX.len());
+            bytes.extend_from_slice(input.bytes());
+            bytes.extend_from_slice(SEMGREP_CANARY_SUFFIX);
+            ContentFrame::new(input.path().clone(), bytes)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let total = staged.iter().try_fold(0_usize, |total, input| {
+        total
+            .checked_add(input.bytes().len())
+            .ok_or(RunnerError::LimitExceeded)
+    })?;
+    if total > limits.max_total_bytes() {
+        return Err(RunnerError::LimitExceeded);
+    }
+    Ok(staged)
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -1353,6 +1391,7 @@ impl LocalStage {
     fn install_trusted_config(
         &mut self,
         command: &SidecarCommand,
+        inputs: &[ContentFrame],
     ) -> Result<Option<LocalTreeInventory>, RunnerError> {
         match command {
             SidecarCommand::RuleSyncGenerate { .. } => {
@@ -1369,6 +1408,8 @@ impl LocalStage {
                 self.config.ensure_directory("semgrep")?;
                 self.config
                     .create_file("semgrep/package.yml", SEMGREP_POLICY)?;
+                self.config
+                    .create_file("semgrep/targets.json", &semgrep_targets_json(inputs)?)?;
                 self.seal_and_inventory_config().map(Some)
             }
         }
@@ -1738,12 +1779,13 @@ fn prepare_stage(_nonce: &[u8; 16], target: RuntimeTarget) -> Result<HelperStage
 fn install_trusted_config(
     stage: &mut HelperStage,
     command: &SidecarCommand,
+    inputs: &[ContentFrame],
     target: RuntimeTarget,
 ) -> Result<Option<HelperInventory>, RunnerError> {
     #[cfg(windows)]
     {
         let _ = target;
-        stage.install_trusted_config(command)
+        stage.install_trusted_config(command, inputs)
     }
     #[cfg(not(windows))]
     {
@@ -1763,10 +1805,36 @@ fn install_trusted_config(
                 let semgrep = config.join("semgrep");
                 fs::create_dir(&semgrep).map_err(|_| RunnerError::InvalidStage)?;
                 write_new(&semgrep.join("package.yml"), SEMGREP_POLICY)?;
+                write_new(
+                    &semgrep.join("targets.json"),
+                    &semgrep_targets_json(inputs)?,
+                )?;
                 inspect_helper_tree(&config, target).map(Some)
             }
         }
     }
+}
+
+fn semgrep_targets_json(inputs: &[ContentFrame]) -> Result<Vec<u8>, RunnerError> {
+    let targets = inputs
+        .iter()
+        .map(|input| {
+            let fpath = input.path().as_str();
+            serde_json::json!([
+                "CodeTarget",
+                {
+                    "path": {
+                        "fpath": fpath,
+                        "ppath": format!("/{fpath}")
+                    },
+                    "analyzer": "spacegrep",
+                    "products": ["sast"]
+                }
+            ])
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_vec(&serde_json::json!(["Targets", targets]))
+        .map_err(|_| RunnerError::InvalidStage)
 }
 
 #[cfg(not(windows))]
@@ -1826,11 +1894,119 @@ fn kill_child_tree(child: &mut std::process::Child) {
 
 fn failure_code(error: RunnerError) -> FailureCode {
     match error {
-        RunnerError::ClosureMismatch
-        | RunnerError::MissingMaterial
-        | RunnerError::SidecarUnavailable => FailureCode::ClosureMismatch,
+        RunnerError::ClosureMismatch | RunnerError::MissingMaterial => FailureCode::ClosureMismatch,
+        RunnerError::SidecarUnavailable => FailureCode::ToolFailed,
         RunnerError::LimitExceeded | RunnerError::FrameTooLarge => FailureCode::LimitExceeded,
         _ => FailureCode::InvalidOutput,
+    }
+}
+
+fn spawn_failure_diagnostic(error: &std::io::Error) -> String {
+    format!(
+        "context-relay-sidecar-spawn-os-error={}",
+        error.raw_os_error().unwrap_or(0)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unavailable_sidecar_is_not_a_closure_mismatch() {
+        assert_eq!(
+            failure_code(RunnerError::SidecarUnavailable),
+            FailureCode::ToolFailed
+        );
+    }
+
+    #[test]
+    fn spawn_failure_diagnostic_keeps_only_the_numeric_os_code() {
+        let error = std::io::Error::from_raw_os_error(5);
+        assert_eq!(
+            spawn_failure_diagnostic(&error),
+            "context-relay-sidecar-spawn-os-error=5"
+        );
+    }
+
+    #[test]
+    fn semgrep_stages_a_fixed_suffix_canary_without_changing_other_inputs() {
+        let input = ContentFrame::new(
+            StagePath::try_from("input/semgrep-target/runtime-inventory.txt").unwrap(),
+            b"osemgrep\n".to_vec(),
+        )
+        .unwrap();
+
+        let semgrep = staged_inputs(
+            &SidecarCommand::OsemgrepScanPackage,
+            std::slice::from_ref(&input),
+            RunLimits::for_command(&SidecarCommand::OsemgrepScanPackage),
+        )
+        .unwrap();
+        let gitleaks = staged_inputs(
+            &SidecarCommand::GitleaksScanPackage,
+            std::slice::from_ref(&input),
+            RunLimits::for_command(&SidecarCommand::GitleaksScanPackage),
+        )
+        .unwrap();
+
+        assert_eq!(input.bytes(), b"osemgrep\n");
+        assert_eq!(semgrep[0].bytes(), b"osemgrep\n\ncontext-relay-scan-canary");
+        assert_eq!(gitleaks, [input]);
+        let policy = std::str::from_utf8(SEMGREP_POLICY).unwrap();
+        assert!(policy.contains("languages: [generic]"));
+        assert!(
+            policy
+                .contains("pattern-regex: \"(?s)\\\\A(?=.*\\\\ncontext-relay-scan-canary\\\\z).\"")
+        );
+    }
+
+    #[test]
+    fn semgrep_targets_bind_each_staged_input_with_a_slash_rooted_ppath() {
+        let inputs = [
+            ContentFrame::new(
+                StagePath::try_from("input/semgrep-target/a.txt").unwrap(),
+                b"a".to_vec(),
+            )
+            .unwrap(),
+            ContentFrame::new(
+                StagePath::try_from("input/semgrep-target/nested/b.txt").unwrap(),
+                b"b".to_vec(),
+            )
+            .unwrap(),
+        ];
+
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&semgrep_targets_json(&inputs).unwrap())
+                .unwrap(),
+            serde_json::json!([
+                "Targets",
+                [
+                    [
+                        "CodeTarget",
+                        {
+                            "path": {
+                                "fpath": "input/semgrep-target/a.txt",
+                                "ppath": "/input/semgrep-target/a.txt"
+                            },
+                            "analyzer": "spacegrep",
+                            "products": ["sast"]
+                        }
+                    ],
+                    [
+                        "CodeTarget",
+                        {
+                            "path": {
+                                "fpath": "input/semgrep-target/nested/b.txt",
+                                "ppath": "/input/semgrep-target/nested/b.txt"
+                            },
+                            "analyzer": "spacegrep",
+                            "products": ["sast"]
+                        }
+                    ]
+                ]
+            ])
+        );
     }
 }
 

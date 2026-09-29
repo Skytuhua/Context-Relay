@@ -1,8 +1,20 @@
 # Replacing the native Semgrep sidecar
 
-Context Relay invokes Semgrep 1.170.0 as a separate, unmodified executable named
-exactly `osemgrep` (or `osemgrep.exe` on Windows). It does not link Semgrep
-into Context Relay.
+Context Relay builds Semgrep 1.170.0 and its dependencies from the pinned source
+with the modifications recorded in `patches.v1.json` and, on Windows,
+`patches.windows.v1.json`. It invokes the resulting separate executable named
+exactly `osemgrep` (or `osemgrep.exe` on Windows), without linking Semgrep into
+Context Relay.
+
+The common modifications defer certificate discovery until an HTTP client is
+created, run single-job maps in the current OCaml domain, and avoid initializing
+an unused proxy connection cache. Windows modifications adapt dependencies to
+the pinned OCaml/Cygwin/MinGW build. Each patch manifest records the affected
+source revision, path, exact replacements, rationale, and before/after SHA-256.
+The source bundle includes the original pinned sources and these manifests;
+`scripts/apply-semgrep-source-patches.mjs` verifies the input and result hashes.
+The target build scripts apply the common manifest first and the Windows
+manifest afterward on Windows. Do not describe their output as unmodified.
 
 First verify and extract the complete source archive described by
 `source-lock.v1.json`. Restore only its recorded Git symlinks:
@@ -51,6 +63,13 @@ The immutable final corresponding-source location is predeclared as
 Its exact digest, size, entry count, and completion status live in the external
 `bundle-evidence.v1.json`; the embedded source lock never contains the tar's
 own digest, avoiding a circular rebuild.
+
+Internal Windows qualification uses the bundled source companion at
+`compliance/semgrep/semgrep-1.170.0-corresponding-source.tar` and the separate
+`bundle-evidence.internal-windows.v2.json` record. Its presence and exact bytes
+must be verified in the installed package; the predeclared public URL is not
+proof of publication or an alternative delivery path. Apple native qualification
+remains deferred for that internal candidate.
 
 This is an engineering compliance posture, not legal advice. Confirm the
 release bundle with counsel before distribution.

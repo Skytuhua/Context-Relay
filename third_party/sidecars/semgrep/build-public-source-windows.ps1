@@ -3,14 +3,16 @@ param(
   [Parameter(Mandatory = $true)][string]$SourceBundle,
   [Parameter(Mandatory = $true)][string]$WorkRoot,
   [Parameter(Mandatory = $true)][string]$OutputRoot,
-  [Parameter(Mandatory = $true)][ValidateSet('build-a', 'build-b')][string]$BuildLabel
+  [Parameter(Mandatory = $true)][ValidateSet('build-a', 'build-b')][string]$BuildLabel,
+  [switch]$OfflineBuild
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+$PSNativeCommandUseErrorActionPreference = $false
 function Fail([string]$Message) { throw $Message }
 function Invoke-Checked([scriptblock]$Command, [string]$Label) {
-  & $Command
+  & $Command | Out-Host
   if ($LASTEXITCODE -ne 0) { Fail "$Label failed with exit code $LASTEXITCODE" }
 }
 
@@ -20,7 +22,12 @@ $CheckoutActionSha = 'df4cb1c069e1874edd31b4311f1884172cec0e10'
 $UploadActionSha = '043fb46d1a93c77aae656e7c1c64a875d1fc6a0a'
 $DownloadActionSha = '37930b1c2abaa49bbe596cd826c3c89aef350131'
 $SourceRevision = 'bd614accba811b407ae5c9ec6f1eecd3bdc29911'
+$CompilerRevision = '3499e5708b0637c12d24d973dd103406a32b8fe8'
 $TreeSitterSha = 'e2b687f74358ab6404730b7fb1a1ced7ddb3780202d37595ecd7b20a8f41861f'
+$AnsiTerminalArchiveSha256 = 'ab73b218b6a30267d2bbc43312dcf313981b8b0bec555d92b06b87664b2dd30e'
+$ParmapArchiveSha256 = '6709356e724436fba0b7a10f96f65a441c2b763832954707d5e30017e78fd285'
+$ParmapArchiveSha512 = '668e969a598cdb587597c7cabf7e299cfb4e3cc4cd229edf1888977f19bd5cdf169d39f5a6d923644bcd83f1ce1a3cfbd3a4e55ff59513736a9dc740a16b49d1'
+$OcurlArchiveSha256 = 'c65f01913270b674a0ca0f278f91bc1e368d7110e8308084bc2280b43a0bc258'
 $ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Workspace = [IO.Path]::GetFullPath((Join-Path $ScriptRoot '..\..\..'))
 $CiProvenance = Join-Path $ScriptRoot 'native-ci-provenance.v1.json'
@@ -30,6 +37,9 @@ $Bash = (Get-Command bash.exe -ErrorAction Stop).Source
 $Objdump = (Get-Command x86_64-w64-mingw32-objdump.exe -ErrorAction Stop).Source
 $Gcc = (Get-Command x86_64-w64-mingw32-gcc.exe -ErrorAction Stop).Source
 $Cygpath = (Get-Command cygpath.exe -ErrorAction Stop).Source
+$Tar = (Resolve-Path -LiteralPath (Join-Path ([Environment]::SystemDirectory) 'tar.exe') -ErrorAction Stop).Path
+$CygwinRoot = [IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $Bash) '..'))
+$MingwRootForward = (Join-Path $CygwinRoot 'usr\x86_64-w64-mingw32\sys-root\mingw').Replace('\', '/')
 
 $ClosedScanArguments = @(
   'scan',
@@ -43,6 +53,7 @@ $ClosedScanArguments = @(
   '--quiet',
   '--no-git-ignore',
   '--x-ignore-semgrepignore-files',
+  '--time',
   '--jobs=1',
   '--timeout=30',
   '--timeout-threshold=1',
@@ -59,6 +70,41 @@ function Invoke-ClosedScan(
   return $LASTEXITCODE
 }
 
+function Normalize-SmokeEvidence(
+  [string]$CleanPath,
+  [string]$FindingPath,
+  [string]$CleanStderrPath,
+  [string]$FindingStderrPath,
+  [string]$InvalidStderrPath
+) {
+  Invoke-Checked {
+    & $Node -e '
+      const fs = require("node:fs");
+      const [cleanPath, findingPath, ...stderrPaths] = process.argv.slice(1);
+      for (const path of [cleanPath, findingPath]) {
+        const report = JSON.parse(fs.readFileSync(path, "utf8"));
+        if (!Object.hasOwn(report, "time") || !report.time
+            || typeof report.time !== "object" || Array.isArray(report.time)) {
+          throw new Error(`missing volatile Semgrep timing object: ${path}`);
+        }
+        delete report.time;
+        fs.writeFileSync(path, `${JSON.stringify(report)}\n`, { encoding: "utf8", flag: "w" });
+      }
+      const elapsedPrefix = /^\[\d+\.\d+\][ \t]*/gm;
+      for (const path of stderrPaths) {
+        const content = fs.readFileSync(path, "utf8");
+        const matches = content.match(elapsedPrefix) ?? [];
+        if (matches.length !== 1) throw new Error(`unexpected Semgrep elapsed-prefix count: ${path}`);
+        const normalized = content.replace(elapsedPrefix, "");
+        if (/^\[\d+\.\d+\]/m.test(normalized)) {
+          throw new Error(`volatile Semgrep elapsed prefix remains: ${path}`);
+        }
+        fs.writeFileSync(path, normalized, { encoding: "utf8", flag: "w" });
+      }
+    ' $CleanPath $FindingPath $CleanStderrPath $FindingStderrPath $InvalidStderrPath
+  } 'smoke evidence normalization'
+}
+
 if ($env:CONTEXT_RELAY_SETUP_OCAML_ACTION_SHA -ne $ActionSha) { Fail 'setup action identity mismatch' }
 if ($env:CONTEXT_RELAY_SETUP_NODE_ACTION_SHA -ne $NodeActionSha) { Fail 'setup-node action identity mismatch' }
 if ($env:CONTEXT_RELAY_RUNNER_IMAGE -ne 'windows-2022') { Fail 'runner image identity mismatch' }
@@ -68,11 +114,15 @@ Invoke-Checked {
   & $Node -e '
     const fs = require("node:fs");
     const { createHash } = require("node:crypto");
-    const [path, sourceLockPath, checkout, setupNode, setupOcaml, upload, download] = process.argv.slice(1);
+    const [path, sourceLockPath, checkout, setupNode, setupOcaml, upload, download, compilerRevision] = process.argv.slice(1);
     const provenance = JSON.parse(fs.readFileSync(path, "utf8"));
-    const sourceLockHash = createHash("sha256").update(fs.readFileSync(sourceLockPath)).digest("hex");
+    const sourceLockBytes = fs.readFileSync(sourceLockPath);
+    const sourceLock = JSON.parse(sourceLockBytes);
+    const sourceLockHash = createHash("sha256").update(sourceLockBytes).digest("hex");
     if (provenance.schemaVersion !== 1 || provenance.sourceLock?.sha256 !== sourceLockHash
-        || provenance.sourceLock?.embeddedActionToolchainStatus !== "sealed-historical-metadata-non-authoritative-for-native-ci") {
+        || provenance.sourceLock?.embeddedActionToolchainStatus !== "sealed-historical-metadata-non-authoritative-for-native-ci"
+        || sourceLock.opam?.compiler?.package !== "ocaml-variants.5.3.0"
+        || sourceLock.opam?.compiler?.revision !== compilerRevision) {
       throw new Error("native CI source lock identity mismatch");
     }
     const actionKey = ({ action, distributionTarget = "" }) => `${action}\0${distributionTarget}`;
@@ -99,7 +149,7 @@ Invoke-Checked {
         || value.setupAction !== "semgrep/setup-ocaml@" + setupOcaml) {
       throw new Error("native CI toolchain provenance mismatch");
     }
-  ' $CiProvenance $SourceLock $CheckoutActionSha $NodeActionSha $ActionSha $UploadActionSha $DownloadActionSha
+  ' $CiProvenance $SourceLock $CheckoutActionSha $NodeActionSha $ActionSha $UploadActionSha $DownloadActionSha $CompilerRevision
 } 'native CI action/toolchain provenance verification'
 if ((& uname.exe -o) -ne 'Cygwin') { Fail 'the public Windows route requires Cygwin' }
 $CygwinRelease = (& uname.exe -r).Trim()
@@ -110,7 +160,7 @@ if ($SourceRevision -ne 'bd614accba811b407ae5c9ec6f1eecd3bdc29911') { Fail 'sour
 $WorkRoot = [IO.Path]::GetFullPath($WorkRoot)
 $OutputRoot = [IO.Path]::GetFullPath($OutputRoot)
 $forbidden = @([IO.Path]::GetPathRoot($WorkRoot), [Environment]::GetFolderPath('UserProfile'))
-if ($forbidden -contains $WorkRoot -or $WorkRoot -match '[\r\n]' -or $WorkRoot -match '\s') { Fail 'unsafe WorkRoot' }
+if ($forbidden -contains $WorkRoot -or $WorkRoot -match '[\r\n]' -or $WorkRoot -match '\s' -or $WorkRoot.Contains('#')) { Fail 'unsafe WorkRoot' }
 if (Test-Path -LiteralPath $WorkRoot) { Fail 'WorkRoot must not already exist' }
 if (Test-Path -LiteralPath $OutputRoot) { Fail 'OutputRoot must not already exist' }
 
@@ -122,6 +172,9 @@ $env:SOURCE_DATE_EPOCH = '0'
 $env:OPAMYES = '1'
 $env:OPAMCOLOR = 'never'
 $env:OPAMDOWNLOADJOBS = '1'
+$env:OPAMJOBS = '1'
+$env:DUNEJOBS = '1'
+$env:MAKEFLAGS = '-j1'
 $env:OPAMRETRIES = '0'
 $env:HTTP_PROXY = 'http://127.0.0.1:9'
 $env:HTTPS_PROXY = 'http://127.0.0.1:9'
@@ -132,49 +185,28 @@ function Add-Pin([string]$Package, [string]$Revision) {
   Invoke-Checked { & $Opam pin add --no-action $Package (Join-Path $script:Current "bundle\pins\$Revision") } "pin $Package"
 }
 
-function Test-OutboundTcp([Net.IPAddress]$Address) {
-  $Client = [Net.Sockets.TcpClient]::new($Address.AddressFamily)
-  try {
-    $Connect = $Client.ConnectAsync($Address, 443)
-    if (-not $Connect.Wait([TimeSpan]::FromSeconds(8))) { return $false }
-    return $Client.Connected
-  } catch {
-    return $false
-  } finally {
-    $Client.Dispose()
+function Assert-CompilerIdentity([string]$Revision) {
+  $ExpectedPinPath = [IO.Path]::GetFullPath((Join-Path $script:Current "bundle\pins\$Revision")).Replace('\', '/')
+  if ($ExpectedPinPath -notmatch '^[A-Za-z]:/') { Fail 'compiler pin path is not an absolute Windows drive path' }
+  $ExpectedPinUrl = "file://$ExpectedPinPath"
+  $PinOutput = @(& $Opam pin list --normalise)
+  if ($LASTEXITCODE -ne 0) { Fail 'compiler pin identity query failed' }
+  $CompilerPins = @($PinOutput | Where-Object { $_ -match '^ocaml-variants\.5\.3\.0\s+' })
+  if ($CompilerPins.Count -ne 1) { Fail 'compiler pin identity is missing or ambiguous' }
+  $PinFields = @($CompilerPins[0].Trim() -split '\s+')
+  if ($PinFields.Count -ne 3 -or $PinFields[1] -ne 'rsync') { Fail 'compiler pin transport mismatch' }
+  $PinUrl = $PinFields[2].Replace('\', '/')
+  if (-not $PinUrl.StartsWith('file://', [StringComparison]::Ordinal) -or
+      -not [string]::Equals($PinUrl, $ExpectedPinUrl, [StringComparison]::Ordinal)) { Fail 'compiler pin path mismatch' }
+  $CompilerVersion = (& $Opam exec -- ocamlc -version).Trim()
+  if ($LASTEXITCODE -ne 0) { Fail 'compiler embedded identity query failed' }
+  $ExpectedVersion = "5.3.0+semgrep-fork@$Revision"
+  if ($CompilerVersion -ne $ExpectedVersion) {
+    Fail "compiler embedded identity mismatch: expected '$ExpectedVersion', got '$CompilerVersion'"
   }
 }
 
-function Get-RunnerControlPlanePrograms {
-  $RequiredNames = @('Runner.Worker.exe', 'Runner.Listener.exe')
-  $Found = @{}
-  $Visited = [Collections.Generic.HashSet[uint32]]::new()
-  [uint32]$CurrentProcessId = $PID
-  while ($CurrentProcessId -ne 0 -and $Visited.Add($CurrentProcessId)) {
-    $Process = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $CurrentProcessId" -ErrorAction Stop
-    if ($null -eq $Process) { break }
-    $Name = [IO.Path]::GetFileName([string]$Process.ExecutablePath)
-    if ($RequiredNames -contains $Name) {
-      if ([string]::IsNullOrWhiteSpace([string]$Process.ExecutablePath)) { Fail "runner executable path is empty: $Name" }
-      $Resolved = (Resolve-Path -LiteralPath ([string]$Process.ExecutablePath) -ErrorAction Stop).Path
-      $Item = Get-Item -LiteralPath $Resolved -Force
-      if (-not $Item.PSIsContainer -and (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0)) {
-        $Found[$Name] = $Resolved
-      } else {
-        Fail "runner executable path is not a regular file: $Name"
-      }
-    }
-    [uint32]$ParentProcessId = $Process.ParentProcessId
-    if ($ParentProcessId -eq $CurrentProcessId) { break }
-    $CurrentProcessId = $ParentProcessId
-  }
-  foreach ($Name in $RequiredNames) {
-    if (-not $Found.ContainsKey($Name)) { Fail "runner control-plane ancestor not found: $Name" }
-  }
-  $Directories = @($RequiredNames | ForEach-Object { Split-Path -Parent $Found[$_] } | Select-Object -Unique)
-  if ($Directories.Count -ne 1) { Fail 'runner control-plane executables do not share one trusted directory' }
-  return [string[]]@($RequiredNames | ForEach-Object { $Found[$_] })
-}
+. (Join-Path $PSScriptRoot 'windows-offline-firewall.ps1')
 
 function Test-TrustedDllPath([string]$Path, [string[]]$TrustedDllRoots) {
   $Resolved = [IO.Path]::GetFullPath($Path)
@@ -190,15 +222,50 @@ function Build-Once([string]$Label) {
   if (Test-Path -LiteralPath $script:Current) { Remove-Item -LiteralPath $script:Current -Recurse -Force }
   $Bundle = Join-Path $script:Current 'bundle'
   New-Item -ItemType Directory -Path $Bundle, (Join-Path $script:Current 'home'), (Join-Path $script:Current 'tmp') | Out-Null
-  Invoke-Checked { & tar.exe -xf $SourceBundle -C $Bundle } 'source bundle extraction'
+  Invoke-Checked { & $Tar -xf $SourceBundle -C $Bundle } 'source bundle extraction'
   Invoke-Checked { & $Node (Join-Path $Workspace 'scripts\semgrep-source-bundle.mjs') --materialize-links $Bundle | Out-Null } 'source link materialization'
+  $OpamSources = Join-Path $Bundle 'sources\opam'
+  $AnsiArchive = Join-Path $Bundle "opam-repository\cache\sha256\ab\$AnsiTerminalArchiveSha256"
+  $ParmapArchive = Join-Path $Bundle "opam-repository\cache\sha512\66\$($ParmapArchiveSha512.Substring(0, 64))\$($ParmapArchiveSha512.Substring(64))"
+  $OcurlArchive = Join-Path $Bundle "opam-repository\cache\sha256\c6\$OcurlArchiveSha256"
+  $AnsiStage = Join-Path $OpamSources $AnsiTerminalArchiveSha256
+  $ParmapStage = Join-Path $OpamSources $ParmapArchiveSha256
+  $OcurlStage = Join-Path $OpamSources $OcurlArchiveSha256
+  foreach ($Archive in @(
+    @{ Path = $AnsiArchive; Sha256 = $AnsiTerminalArchiveSha256; Stage = $AnsiStage; Root = 'ANSITerminal-0.8.5' },
+    @{ Path = $ParmapArchive; Sha256 = $ParmapArchiveSha256; Stage = $ParmapStage; Root = 'parmap-1.2.5' },
+    @{ Path = $OcurlArchive; Sha256 = $OcurlArchiveSha256; Stage = $OcurlStage; Root = 'ocurl-0.9.1' }
+  )) {
+    if ((Get-FileHash -Algorithm SHA256 -LiteralPath $Archive.Path).Hash.ToLowerInvariant() -ne $Archive.Sha256) {
+      Fail "opam compatibility source archive hash mismatch: $($Archive.Root)"
+    }
+    New-Item -ItemType Directory -Path $Archive.Stage | Out-Null
+    Invoke-Checked { & $Tar -xf $Archive.Path -C $Archive.Stage } "opam compatibility source extraction: $($Archive.Root)"
+    if (-not (Test-Path -LiteralPath (Join-Path $Archive.Stage $Archive.Root) -PathType Container)) {
+      Fail "opam compatibility source root mismatch: $($Archive.Root)"
+    }
+  }
+  Invoke-Checked {
+    & $Node (Join-Path $Bundle 'support\scripts\apply-semgrep-source-patches.mjs') `
+      (Join-Path $Bundle 'support\third_party\sidecars\semgrep\patches.v1.json') `
+      $Bundle | Out-Null
+  } 'source patch application'
+  Invoke-Checked {
+    & $Node (Join-Path $Bundle 'support\scripts\apply-semgrep-source-patches.mjs') `
+      (Join-Path $Bundle 'support\third_party\sidecars\semgrep\patches.windows.v1.json') `
+      $Bundle | Out-Null
+  } 'Windows dependency patch application'
   $Project = Join-Path $Bundle 'sources\semgrep'
+  $TreeSitterRuntime = Join-Path $Project 'libs\ocaml-tree-sitter-core\tree-sitter-0.22.6\bin\libtree-sitter.dll'
+  $AnsiSource = Join-Path $AnsiStage 'ANSITerminal-0.8.5'
+  $ParmapSource = Join-Path $ParmapStage 'parmap-1.2.5'
+  $OcurlSource = Join-Path $OcurlStage 'ocurl-0.9.1'
   if (-not (Test-Path -LiteralPath (Join-Path $Project 'Makefile') -PathType Leaf)) { Fail 'Semgrep source is missing' }
 
   $TreeSitterDownloads = Join-Path $Project 'libs\ocaml-tree-sitter-core\downloads'
   New-Item -ItemType Directory -Force -Path $TreeSitterDownloads | Out-Null
   $TreeArchive = Join-Path $Bundle "opam-repository\cache\sha256\$($TreeSitterSha.Substring(0, 2))\$TreeSitterSha"
-  Invoke-Checked { & tar.exe -xf $TreeArchive -C $TreeSitterDownloads } 'tree-sitter source extraction'
+  Invoke-Checked { & $Tar -xf $TreeArchive -C $TreeSitterDownloads } 'tree-sitter source extraction'
   if (-not (Test-Path -LiteralPath (Join-Path $TreeSitterDownloads 'tree-sitter-0.22.6') -PathType Container)) { Fail 'tree-sitter source did not unpack as expected' }
 
   $env:HOME = Join-Path $script:Current 'home'
@@ -206,13 +273,22 @@ function Build-Once([string]$Label) {
   $env:TEMP = $env:TMP
   $env:OPAMROOT = Join-Path $script:Current 'opam'
   $Repository = Join-Path $Bundle 'opam-repository'
-  Invoke-Checked { & $Opam init --bare --no-setup default $Repository } 'opam init'
-  $CacheUri = ([Uri]((Join-Path $Repository 'cache') + [IO.Path]::DirectorySeparatorChar)).AbsoluteUri.TrimEnd('/')
-  Invoke-Checked { & $Opam option --global "archive-mirrors=$CacheUri" } 'offline archive mirror'
-  Invoke-Checked { & $Opam switch create (Join-Path $script:Current 'switch') --empty } 'empty switch creation'
+  Invoke-Checked { & $Opam init --bare --no-setup --no-cygwin-setup default $Repository } 'opam init'
+  $CachePath = (Join-Path $Repository 'cache').Replace('\', '/')
+  if ($CachePath -notmatch '^[A-Za-z]:/') { Fail 'offline archive mirror is not an absolute Windows drive path' }
+  $CacheUri = "file://$CachePath"
+  $ArchiveMirrorsOption = 'archive-mirrors=["{0}"]' -f $CacheUri
+  Invoke-Checked { & $Opam option --global $ArchiveMirrorsOption } 'offline archive mirror'
+  $Switch = Join-Path $script:Current 'switch'
+  Invoke-Checked { & $Opam switch create $Switch --empty } 'empty switch creation'
+  $env:OPAMSWITCH = $Switch
 
-  Add-Pin 'ocaml-variants.5.3.0' '3499e5708b0637c12d24d973dd103406a32b8fe8'
-  Invoke-Checked { & $Opam install --update-invariant 'ocaml-variants.5.3.0' 'ocaml-option-flambda' } 'compiler installation'
+  Add-Pin 'ocaml-variants.5.3.0' $CompilerRevision
+  Invoke-Checked { & $Opam install --update-invariant 'ocaml-variants.5.3.0' } 'compiler installation'
+  Assert-CompilerIdentity $CompilerRevision
+  Invoke-Checked { & $Opam pin add --no-action --kind=path 'ANSITerminal.0.8.5' $AnsiSource } 'pin patched ANSITerminal'
+  Invoke-Checked { & $Opam pin add --no-action --kind=path 'parmap.1.2.5' $ParmapSource } 'pin patched parmap'
+  Invoke-Checked { & $Opam pin add --no-action --kind=path 'ocurl.0.9.1' $OcurlSource } 'pin patched ocurl'
   Add-Pin 'pcre2.dev' '4e0a44486bb518b7a24ca11286c4b03a8d51e17e'
   Add-Pin 'tree-sitter.dev' 'c4baff8d83b2e1f83f247acb11d0c9dafa5e48f7'
   foreach ($Package in @('testo.dev', 'testo-util.dev', 'testo-diff.dev', 'testo-lwt.dev')) { Add-Pin $Package 'df18ea541c75c9acf75923218586c5ffe8915a04' }
@@ -225,10 +301,23 @@ function Build-Once([string]$Label) {
   Push-Location $Project
   try {
     Invoke-Checked { & $Bash './scripts/pick-lockfile.sh' '--strict' 'semgrep.opam' } 'lockfile selection'
-    Invoke-Checked { & $Bash '-lc' 'cd libs/ocaml-tree-sitter-core && ./configure && ./scripts/install-tree-sitter-lib' } 'tree-sitter build'
+    Invoke-Checked { & $Bash '-c' 'cd libs/ocaml-tree-sitter-core && patch -N -b -i patch/tree-sitter-0.22.6/0001-Makefile-backports.patch downloads/tree-sitter-0.22.6/Makefile' } 'tree-sitter source patch'
+    Invoke-Checked { & $Bash '-c' 'cd libs/ocaml-tree-sitter-core && ./configure && ./scripts/install-tree-sitter-lib' } 'tree-sitter build'
+    if (-not (Test-Path -LiteralPath $TreeSitterRuntime -PathType Leaf)) { Fail 'libtree-sitter.dll was not built' }
+    $env:PKG_CONFIG_LIBDIR = '/usr/x86_64-w64-mingw32/sys-root/mingw/lib/pkgconfig'
+    $env:PKG_CONFIG_PATH = $env:PKG_CONFIG_LIBDIR
+    $env:CPPFLAGS = "-I$MingwRootForward/include"
+    $env:LDFLAGS = "-L$MingwRootForward/lib"
+    $CurlCflags = (& $Bash '-c' 'pkg-config --cflags libcurl').Trim()
+    if ($LASTEXITCODE -ne 0 -or $CurlCflags -notmatch '/usr/x86_64-w64-mingw32/' -or $CurlCflags -match '/usr/i686-w64-mingw32/') {
+      Fail 'AMD64 libcurl metadata selection failed'
+    }
+    Invoke-Checked {
+      & $Bash '-c' 'printf "#include <curl/curl.h>\nint main(void) { return 0; }\n" | x86_64-w64-mingw32-gcc $CPPFLAGS -x c -c -o /dev/null -'
+    } 'AMD64 libcurl header preflight'
     $env:OPAMIGNOREPINDEPENDS = 'true'
-    Invoke-Checked { & $Opam install --locked --update-invariant --deps-only '.\semgrep.opam' '.\dev\required.opam' } 'dependency installation'
-    Invoke-Checked { & $Bash './scripts/validate-compiler-sha.sh' } 'compiler validation'
+    Invoke-Checked { & $Opam install --locked --update-invariant --deps-only '.\semgrep.opam' } 'dependency installation'
+    Assert-CompilerIdentity $CompilerRevision
     Invoke-Checked { & $Opam exec -- make core } 'osemgrep build'
   } finally {
     Pop-Location
@@ -241,11 +330,11 @@ function Build-Once([string]$Label) {
   New-Item -ItemType Directory -Path $Destination, $Evidence | Out-Null
   Copy-Item -LiteralPath $Executable -Destination (Join-Path $Destination 'osemgrep.exe')
 
-  $CygwinRoot = [IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $Bash) '..'))
   $TrustedDllRoots = [string[]]@(
     $Destination,
     (Join-Path $Project '_build'),
     (Join-Path $Project '_build\install\default\bin'),
+    (Split-Path -Parent $TreeSitterRuntime),
     (Join-Path $script:Current 'switch'),
     (Join-Path $script:Current 'switch\bin'),
     (Split-Path -Parent $Gcc),
@@ -256,8 +345,7 @@ function Build-Once([string]$Label) {
     (Resolve-Path -LiteralPath $_).Path
   } | Select-Object -Unique
 
-  $SystemDlls = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-  foreach ($Name in @('advapi32.dll','bcrypt.dll','crypt32.dll','dnsapi.dll','gdi32.dll','iphlpapi.dll','kernel32.dll','msvcrt.dll','ntdll.dll','ole32.dll','oleaut32.dll','secur32.dll','shell32.dll','user32.dll','userenv.dll','version.dll','winhttp.dll','winmm.dll','ws2_32.dll')) { [void]$SystemDlls.Add($Name) }
+  $SystemDllRoot = (Resolve-Path -LiteralPath ([Environment]::SystemDirectory)).Path
   $Queue = [Collections.Generic.Queue[string]]::new()
   $Queue.Enqueue((Join-Path $Destination 'osemgrep.exe'))
   $Seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
@@ -271,7 +359,14 @@ function Build-Once([string]$Label) {
       $Name = $Matches[1]
       [void]$Dependencies.Add($Name)
       if ($Name -match '(?i)python') { Fail 'Python runtime dependency detected' }
-      if ($SystemDlls.Contains($Name) -or $Name -match '^(?i)(api|ext)-ms-win-') { continue }
+      $SystemDllCandidate = Join-Path $SystemDllRoot $Name
+      if (Test-Path -LiteralPath $SystemDllCandidate -PathType Leaf) {
+        if ((Get-Item -LiteralPath $SystemDllCandidate).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+          Fail "untrusted system DLL path: $SystemDllCandidate"
+        }
+        continue
+      }
+      if ($Name -match '^(?i)(api|ext)-ms-win-') { continue }
       if (-not $Seen.Add($Name)) { continue }
       $Candidate = $null
       foreach ($Directory in $TrustedDllRoots) {
@@ -319,6 +414,21 @@ function Build-Once([string]$Label) {
   [IO.File]::WriteAllLines((Join-Path $SmokeFixtures 'invalid-rule.yml'), [string[]]@('rules: ['), $Utf8NoBom)
   [IO.File]::WriteAllLines((Join-Path $SmokeFixtures 'clean.txt'), [string[]]@('clean target'), $Utf8NoBom)
   [IO.File]::WriteAllLines((Join-Path $SmokeFixtures 'finding.txt'), [string[]]@('context-relay-finding'), $Utf8NoBom)
+  return [pscustomobject]@{
+    Destination = $Destination
+    Evidence = $Evidence
+    SmokeFixtures = $SmokeFixtures
+    SmokeHome = $SmokeHome
+    SmokeTmp = $SmokeTmp
+  }
+}
+
+function Invoke-RuntimeSmoke([pscustomobject]$Build) {
+  $Destination = $Build.Destination
+  $Evidence = $Build.Evidence
+  $SmokeFixtures = $Build.SmokeFixtures
+  $SmokeHome = $Build.SmokeHome
+  $SmokeTmp = $Build.SmokeTmp
   $SavedEnvironment = [Collections.Generic.Dictionary[string,string]]::new([StringComparer]::OrdinalIgnoreCase)
   foreach ($Entry in Get-ChildItem Env:) { $SavedEnvironment[$Entry.Name] = $Entry.Value }
   $EnvironmentNames = [string[]]@(Get-ChildItem Env: | ForEach-Object Name)
@@ -356,7 +466,7 @@ function Build-Once([string]$Label) {
     Push-Location -LiteralPath $SmokeFixtures
     $SmokeLocationPushed = $true
     $RuntimeExecutable = Join-Path $Destination 'osemgrep.exe'
-    $VersionOutput = [string[]]@(& $RuntimeExecutable --version)
+    $VersionOutput = [string[]]@(& $RuntimeExecutable --experimental --version)
     if ($LASTEXITCODE -ne 0) { Fail "no-Python version smoke failed with exit code $LASTEXITCODE" }
     [IO.File]::WriteAllLines((Join-Path $Evidence 'version.txt'), $VersionOutput, [Text.Encoding]::ASCII)
 
@@ -377,6 +487,7 @@ function Build-Once([string]$Label) {
     if ($InvalidStatus -eq 0 -or $InvalidStatus -eq 1) { Fail 'invalid rule did not produce a distinct config failure' }
     $InvalidEvidence = [IO.File]::ReadAllText((Join-Path $Evidence 'invalid.json')) + [IO.File]::ReadAllText((Join-Path $Evidence 'invalid.stderr'))
     if ($InvalidEvidence -notmatch '(?i)invalid|error|parse|config|yaml') { Fail 'invalid rule evidence lacks a parse or config error' }
+    Normalize-SmokeEvidence $CleanJson $FindingJson (Join-Path $Evidence 'clean.stderr') (Join-Path $Evidence 'finding.stderr') (Join-Path $Evidence 'invalid.stderr')
   } finally {
     if ($SmokeLocationPushed) { Pop-Location }
     foreach ($Name in [string[]]@(Get-ChildItem Env: | ForEach-Object Name)) {
@@ -394,113 +505,18 @@ function Build-Once([string]$Label) {
   [IO.File]::WriteAllLines((Join-Path $Evidence 'MANIFEST.sha256'), $ManifestLines, [Text.Encoding]::ASCII)
 }
 
-$ProbeAddress = [Net.Dns]::GetHostAddresses('github.com') |
-  Where-Object AddressFamily -eq ([Net.Sockets.AddressFamily]::InterNetwork) |
-  Select-Object -First 1
-if ($null -eq $ProbeAddress -or -not (Test-OutboundTcp $ProbeAddress)) {
-  Fail 'outbound TCP preflight failed before enabling offline firewall policy'
+$Build = if ($OfflineBuild) { $null } else { Build-Once $BuildLabel }
+Invoke-WindowsOfflineFirewall {
+  if ($OfflineBuild) { $Build = Build-Once $BuildLabel }
+  Invoke-RuntimeSmoke $Build
 }
-$RunnerPrograms = @(Get-RunnerControlPlanePrograms)
-$RunnerProgramHashes = @{}
-foreach ($Program in $RunnerPrograms) {
-  $RunnerProgramHashes[$Program] = (Get-FileHash -Algorithm SHA256 -LiteralPath $Program).Hash
+[IO.File]::WriteAllText(
+  (Join-Path $OutputRoot "$BuildLabel.offline-egress.v1.json"),
+  '{"mechanism":"' + $(if ($OfflineBuild) { 'windows-firewall-default-outbound-block-ancestor-runner-hca-tcp443-hca-imds80-experiment' } else { 'windows-firewall-runtime-smoke-network-deny' }) + '","probe":"hostile-outbound-tcp443-and-imds-tcp80-denied","schemaVersion":1}' + "`n",
+  [Text.UTF8Encoding]::new($false)
+)
+if ($OfflineBuild) {
+  Write-Output "Windows Cygwin/MinGW public-source $BuildLabel build and runtime smoke completed with network denial."
+} else {
+  Write-Output "Windows Cygwin/MinGW public-source $BuildLabel runtime smoke completed with network denial."
 }
-$ProfileSnapshots = @(foreach ($ProfileName in @('Domain', 'Private', 'Public')) {
-  $Profile = Get-NetFirewallProfile -Profile $ProfileName -ErrorAction Stop
-  [pscustomobject]@{
-    Name = $Profile.Name
-    DefaultOutboundAction = [string]$Profile.DefaultOutboundAction
-  }
-})
-$FirewallPrefix = "ContextRelaySemgrepOffline-$PID-$([Guid]::NewGuid().ToString('N'))"
-$RunnerRuleNames = [Collections.Generic.List[string]]::new()
-$DisabledOutboundRuleNames = [Collections.Generic.List[string]]::new()
-try {
-  $RuleIndex = 0
-  foreach ($Program in $RunnerPrograms) {
-    $RuleIndex += 1
-    $RuleName = "$FirewallPrefix-Runner-$RuleIndex"
-    $RunnerRuleNames.Add($RuleName)
-    New-NetFirewallRule -Name $RuleName -DisplayName $RuleName -Direction Outbound -Program $Program -RemoteAddress Any -Protocol Any -Action Allow -Profile Any -ErrorAction Stop | Out-Null
-    $Rule = Get-NetFirewallRule -Name $RuleName -PolicyStore ActiveStore -ErrorAction Stop
-    $Application = $Rule | Get-NetFirewallApplicationFilter
-    if ($Rule.Enabled -ne 'True' -or
-        $Rule.Direction -ne 'Outbound' -or
-        $Rule.Action -ne 'Allow' -or
-        [IO.Path]::GetFullPath($Application.Program) -ne [IO.Path]::GetFullPath($Program)) {
-      Fail 'runner control-plane firewall allow rule is not exact and active'
-    }
-  }
-
-  $ExistingOutboundAllows = @(Get-NetFirewallRule -PolicyStore ActiveStore -Direction Outbound -Action Allow -Enabled True |
-    Where-Object { $RunnerRuleNames -notcontains $_.Name })
-  foreach ($ExistingRule in $ExistingOutboundAllows) {
-    if ([string]$ExistingRule.PolicyStoreSourceType -ne 'Local' -or [string]::IsNullOrWhiteSpace($ExistingRule.Name)) {
-      Fail "non-local outbound allow rule prevents fail-closed isolation: $($ExistingRule.DisplayName)"
-    }
-    $DisabledOutboundRuleNames.Add($ExistingRule.Name)
-    Disable-NetFirewallRule -Name $ExistingRule.Name -ErrorAction Stop | Out-Null
-  }
-  $RemainingBroadAllows = @(Get-NetFirewallRule -PolicyStore ActiveStore -Direction Outbound -Action Allow -Enabled True |
-    Where-Object { $RunnerRuleNames -notcontains $_.Name })
-  if ($RemainingBroadAllows.Count -ne 0) { Fail 'outbound allow rules remain outside the runner control-plane carveout' }
-
-  foreach ($ProfileSnapshot in $ProfileSnapshots) {
-    Set-NetFirewallProfile -Profile $ProfileSnapshot.Name -DefaultOutboundAction Block -ErrorAction Stop
-  }
-  foreach ($ProfileSnapshot in $ProfileSnapshots) {
-    $Effective = Get-NetFirewallProfile -Profile $ProfileSnapshot.Name -ErrorAction Stop
-    if ([string]$Effective.DefaultOutboundAction -ne 'Block') { Fail "offline default outbound policy is not active: $($ProfileSnapshot.Name)" }
-  }
-  if (Test-OutboundTcp $ProbeAddress) { Fail 'hostile outbound TCP probe bypassed the offline firewall policy' }
-  Build-Once $BuildLabel
-  foreach ($Program in $RunnerPrograms) {
-    if ((Get-FileHash -Algorithm SHA256 -LiteralPath $Program).Hash -ne $RunnerProgramHashes[$Program]) {
-      Fail "runner control-plane executable changed during the native build: $Program"
-    }
-  }
-  foreach ($ProfileSnapshot in $ProfileSnapshots) {
-    $Effective = Get-NetFirewallProfile -Profile $ProfileSnapshot.Name -ErrorAction Stop
-    if ([string]$Effective.DefaultOutboundAction -ne 'Block') { Fail "offline firewall policy changed during the native build: $($ProfileSnapshot.Name)" }
-  }
-  if (Test-OutboundTcp $ProbeAddress) { Fail 'offline firewall policy was removed during the native build' }
-  [IO.File]::WriteAllText(
-    (Join-Path $OutputRoot "$BuildLabel.offline-egress.v1.json"),
-    '{"mechanism":"windows-firewall-default-outbound-block-runner-control-plane-allow","probe":"hostile-outbound-tcp-denied","schemaVersion":1}' + "`n",
-    [Text.UTF8Encoding]::new($false)
-  )
-} finally {
-  $RestoreFailures = [Collections.Generic.List[string]]::new()
-  foreach ($ProfileSnapshot in $ProfileSnapshots) {
-    try {
-      Set-NetFirewallProfile -Profile $ProfileSnapshot.Name -DefaultOutboundAction $ProfileSnapshot.DefaultOutboundAction -ErrorAction Stop
-      $Restored = Get-NetFirewallProfile -Profile $ProfileSnapshot.Name -ErrorAction Stop
-      if ([string]$Restored.DefaultOutboundAction -ne $ProfileSnapshot.DefaultOutboundAction) {
-        throw "restored value differs: $($Restored.DefaultOutboundAction)"
-      }
-    } catch {
-      $RestoreFailures.Add("profile $($ProfileSnapshot.Name): $($_.Exception.Message)")
-    }
-  }
-  foreach ($RuleName in $DisabledOutboundRuleNames) {
-    try {
-      Enable-NetFirewallRule -Name $RuleName -ErrorAction Stop | Out-Null
-      $RestoredRule = Get-NetFirewallRule -Name $RuleName -PolicyStore ActiveStore -ErrorAction Stop
-      if ($RestoredRule.Enabled -ne 'True') { throw 'rule is not enabled' }
-    } catch {
-      $RestoreFailures.Add("outbound rule ${RuleName}: $($_.Exception.Message)")
-    }
-  }
-  foreach ($RuleName in $RunnerRuleNames) {
-    try {
-      if (Get-NetFirewallRule -Name $RuleName -ErrorAction SilentlyContinue) {
-        Remove-NetFirewallRule -Name $RuleName -ErrorAction Stop
-      }
-      if (Get-NetFirewallRule -Name $RuleName -ErrorAction SilentlyContinue) { throw 'rule still exists' }
-    } catch {
-      $RestoreFailures.Add("runner allow rule ${RuleName}: $($_.Exception.Message)")
-    }
-  }
-  if ($RestoreFailures.Count -ne 0) { Fail "firewall restoration failed: $($RestoreFailures -join '; ')" }
-}
-Write-Output "Windows Cygwin/MinGW public-source $BuildLabel completed with runner-safe firewall-enforced network denial."

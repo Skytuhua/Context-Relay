@@ -4,21 +4,33 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use context_relay_core::{
+    native_transaction::{
+        MutationKind as NativeMutationKind, NativeApplyReceipt, NativeObjectToken,
+        NativeTransactionPlan, RestorableStateFingerprint, TransactionStep,
+    },
     search::Embedding384,
-    vault::{DatabaseKeyStore, VaultError},
+    vault::{
+        BeforeImagePolicy, BeforeImageWrite, DatabaseKeyStore, NativePlanWrite,
+        NativeSandboxIdentity, NativeTransactionStatus, NativeWalState, NativeWalWrite, Vault,
+        VaultError,
+    },
 };
 use context_relay_protocol::{
-    AccountId, ApplyReceipt, BoundedCiphertext, CandidateId, CandidateState, CheckpointV1,
-    DeviceId, Ed25519SignatureBytes, HarnessId, HybridLogicalClock, InstructionRecord,
-    MemoryCandidate, MemoryId, MemoryKind, MemoryOrigin, MemoryRecord, MutationKind,
-    NativePlatform, OperationId, PlanId, ProjectId, Provenance, RecordId, RecordKind, ScopeRef,
-    Sha256Digest, SyncOperationV1, TaskId, TaskRecord, TaskStatus, WireNativeValue, WorkspaceId,
-    XChaChaNonce,
+    AccountId, ApplyReceipt, BoundedCiphertext, CHECKPOINT_SCHEMA_VERSION, CandidateId,
+    CandidateState, CheckpointV1, DeviceId, Ed25519SignatureBytes, HarnessId, HybridLogicalClock,
+    InstructionRecord, MemoryCandidate, MemoryId, MemoryKind, MemoryOrigin, MemoryRecord,
+    MutationKind, NativePlatform, OperationId, PlanId, ProjectId, Provenance, RecordId, RecordKind,
+    ScopeRef, Sha256Digest, SyncOperationV1, TaskId, TaskRecord, TaskStatus, WireNativeValue,
+    WorkspaceId, XChaChaNonce,
 };
+use rusqlite::Connection;
 use zeroize::Zeroizing;
 
 pub const ID_1: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073981";
@@ -30,6 +42,8 @@ pub const ID_6: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073986";
 pub const ID_7: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073987";
 pub const ID_8: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073988";
 pub const ID_9: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073989";
+
+static NEXT_TEMP_VAULT: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Default)]
 pub struct MemoryKeyStore(Mutex<HashMap<String, Vec<u8>>>);
@@ -79,12 +93,13 @@ pub struct TempVault(PathBuf);
 impl TempVault {
     pub fn new(name: &str) -> Self {
         let unique = format!(
-            "context-relay-{name}-{}-{}.db",
+            "context-relay-{name}-{}-{}-{}.db",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT_TEMP_VAULT.fetch_add(1, Ordering::Relaxed),
         );
         Self(std::env::temp_dir().join(unique))
     }
@@ -106,8 +121,160 @@ impl Drop for TempVault {
     }
 }
 
+pub fn remove_membership_material_migration(connection: &Connection) {
+    // Downgrade fixtures must also remove all tables introduced after schema41.
+    connection.execute_batch("DROP TABLE IF EXISTS recovery_v2_supplemental_history_keys; DROP TABLE IF EXISTS recovery_v2_conflict; DROP TABLE IF EXISTS recovery_history_selection; DROP TABLE IF EXISTS recovery_history_targets; DROP TABLE IF EXISTS recovery_v2_admission; DROP TABLE IF EXISTS recovery_v2_history_keys; DROP TABLE IF EXISTS recovery_v2_parent_objects; DROP TABLE IF EXISTS recovery_v2_prepared;").unwrap();
+    connection.execute_batch("DROP TABLE IF EXISTS pairing_v2_public_objects; DROP TABLE IF EXISTS pairing_v2_transcripts;").unwrap();
+    // Migration 0048 only adds columns to the schema-37 intents table; the replay
+    // below user_version 40 reruns 0037, so the table itself must be dropped to
+    // reach the pre-0048 column set.
+    // Migration 0048 only adds columns to the schema-37 intents table. Drop it and
+    // recreate the exact pre-0048 shape so the downgrade post-condition holds for
+    // fixtures that replay from any version >= 37 (where 0037 is not rerun).
+    connection
+        .execute_batch("DROP TABLE IF EXISTS device_revocation_intents;")
+        .unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE device_revocation_intents (             operation_id TEXT PRIMARY KEY NOT NULL CHECK (typeof(operation_id) = 'text' AND length(CAST(operation_id AS BLOB)) = 36),             project_url TEXT NOT NULL CHECK (typeof(project_url) = 'text' AND length(CAST(project_url AS BLOB)) BETWEEN 1 AND 2048),             user_id TEXT NOT NULL CHECK (typeof(user_id) = 'text' AND length(CAST(user_id AS BLOB)) = 36),             session_id TEXT NOT NULL CHECK (typeof(session_id) = 'text' AND length(CAST(session_id AS BLOB)) = 36),             issuer_certificate BLOB NOT NULL CHECK (length(issuer_certificate) BETWEEN 1 AND 512),             statement BLOB NOT NULL CHECK (length(statement) = 197),             transition BLOB NOT NULL CHECK (length(transition) BETWEEN 1 AND 8388608),             signature BLOB NOT NULL CHECK (length(signature) = 64));",
+        )
+        .unwrap();
+    connection.execute_batch("DROP TABLE IF EXISTS historical_verified_operations; DROP TABLE IF EXISTS historical_reconstructions; DROP TABLE IF EXISTS historical_operation_evidence; DROP TABLE IF EXISTS membership_current_activation; DROP TABLE IF EXISTS historical_transfer_selection; DROP TABLE IF EXISTS historical_transfer_pages; DROP TABLE IF EXISTS historical_transfers; DROP TABLE IF EXISTS membership_confirmed_admission; DROP TABLE IF EXISTS membership_root_material_seed; DROP TABLE IF EXISTS membership_epoch_secrets;").unwrap();
+}
+
+pub fn remove_native_memory_migrations_after_schema_23(connection: &Connection) {
+    remove_membership_material_migration(connection);
+    connection
+        .execute_batch(
+            "DROP TABLE IF EXISTS membership_events; DROP TABLE IF EXISTS accepted_membership; DROP TABLE IF EXISTS revocation_genesis_anchor; DROP TABLE IF EXISTS revocation_control_history; DROP TABLE IF EXISTS device_revocation_intents; DROP TABLE IF EXISTS candidate_aliases; DROP TABLE account_lifecycle_intents; DROP TABLE pairing_request_reviews; DROP TABLE hosted_pairing_intents;
+             DROP TABLE hosted_restore_intent;
+             DROP TABLE hosted_enrollment_intent;
+             DROP TRIGGER semantic_document_insert;
+             DROP TRIGGER semantic_document_update;
+             DROP TABLE semantic_embeddings;
+             DROP TABLE semantic_index_queue;
+             DROP TABLE semantic_index_model;
+             ALTER TABLE search_documents DROP COLUMN input_digest;
+             ALTER TABLE search_documents DROP COLUMN tags;
+             DROP TABLE desktop_writes;
+             DROP TABLE native_memory_source_supersessions;
+             ALTER TABLE native_memory_sources DROP COLUMN last_applied_managed_digest;",
+        )
+        .unwrap();
+}
+
 pub fn clock(physical_ms: u64) -> HybridLogicalClock {
     HybridLogicalClock::new(physical_ms, 0, ID_9.parse::<DeviceId>().unwrap())
+}
+
+pub fn persist_native_terminal(
+    vault: &mut Vault,
+    plan: &NativeTransactionPlan,
+    sealed_plan: &[u8],
+    created_ms: u64,
+    applied_ms: u64,
+    status: NativeTransactionStatus,
+) {
+    let transaction_id = format!("bridge-setup-{}", plan.setup.plan_id);
+    vault
+        .begin_native_transaction(
+            &transaction_id,
+            NativePlanWrite {
+                plan_id: &plan.setup.plan_id,
+                approval_hash: &plan.setup.batch_hash,
+                payload: sealed_plan,
+                created_ms,
+                expires_ms: plan.setup.expires_at,
+            },
+            NativeSandboxIdentity::Windows {
+                moniker: "context-relay.native.0123456789abcdef0123456789abcdef".to_owned(),
+                sid: b"S-1-15-2-3872518810-2985098273-1912316193-2655983105-1250049442-371239648-1157085541".to_vec(),
+            },
+        )
+        .unwrap();
+    match status {
+        NativeTransactionStatus::Pending => return,
+        NativeTransactionStatus::Restored => {
+            vault.begin_native_recovery(&transaction_id).unwrap();
+            vault
+                .finish_native_recovery(&transaction_id, false)
+                .unwrap();
+        }
+        NativeTransactionStatus::Conflict => {
+            let before_id = format!("bridge-conflict-{}", plan.setup.plan_id);
+            vault
+                .put_before_images_batch(
+                    &[BeforeImageWrite {
+                        id: &before_id,
+                        plan_id: Some(&plan.setup.plan_id),
+                        payload: b"before",
+                        created_ms,
+                    }],
+                    BeforeImagePolicy::new(1024, 100),
+                )
+                .unwrap();
+            let target = WireNativeValue {
+                platform: NativePlatform::Macos,
+                bytes: b"/fixture/conflict".to_vec(),
+                display: None,
+            };
+            let token = NativeObjectToken {
+                volume: vec![1],
+                object: vec![2],
+                topology: vec![3],
+            };
+            let expected = RestorableStateFingerprint(Sha256Digest([1; 32]));
+            let applied = RestorableStateFingerprint(Sha256Digest([2; 32]));
+            vault
+                .prepare_native_wal(
+                    &transaction_id,
+                    &NativeWalWrite {
+                        target_sequence: 0,
+                        target: &target,
+                        object_token: &token,
+                        before_image_id: &before_id,
+                        operation_kind: NativeMutationKind::Payload,
+                        expected: &expected,
+                        intended_applied: &applied,
+                        intended_restored: &expected,
+                    },
+                )
+                .unwrap();
+            vault
+                .transition_native_wal(&transaction_id, 0, NativeWalState::Conflict)
+                .unwrap();
+            vault.begin_native_recovery(&transaction_id).unwrap();
+            vault.finish_native_recovery(&transaction_id, true).unwrap();
+        }
+        NativeTransactionStatus::Committed => {
+            for step in &TransactionStep::ORDER[..18] {
+                vault.enter_native_step(&transaction_id, *step).unwrap();
+                vault.complete_native_step(&transaction_id, *step).unwrap();
+            }
+            vault
+                .enter_native_step(&transaction_id, TransactionStep::CommitOwnershipAndReceipt)
+                .unwrap();
+            vault
+                .commit_native_success(
+                    &transaction_id,
+                    &NativeApplyReceipt {
+                        legacy: ApplyReceipt {
+                            plan_id: plan.setup.plan_id,
+                            applied_hlc: clock(applied_ms),
+                            resulting_digests: vec![],
+                        },
+                        targets: vec![],
+                    },
+                    &[],
+                )
+                .unwrap();
+        }
+        NativeTransactionStatus::Restoring => {
+            vault.begin_native_recovery(&transaction_id).unwrap();
+            return;
+        }
+    }
+    vault.finish_native_cleanup(&transaction_id).unwrap();
 }
 
 pub fn provenance() -> Provenance {
@@ -196,7 +363,9 @@ pub fn task() -> TaskRecord {
 
 pub fn checkpoint() -> CheckpointV1 {
     CheckpointV1 {
-        schema_version: 1,
+        schema_version: CHECKPOINT_SCHEMA_VERSION,
+        account_id: ID_1.parse().unwrap(),
+        workspace_id: ID_2.parse().unwrap(),
         previous_checkpoint_hash: Sha256Digest([4; 32]),
         causal_frontier: Vec::new(),
         state_hash: Sha256Digest([5; 32]),

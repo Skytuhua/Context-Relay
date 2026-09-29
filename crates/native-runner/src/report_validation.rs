@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Map, Value};
 
@@ -27,17 +27,22 @@ const GITLEAKS_KEYS: [&str; 18] = [
     "Tags",
     "Fingerprint",
 ];
-const SEMGREP_KEYS: [&str; 8] = [
+const SEMGREP_CORE_KEYS: [&str; 10] = [
     "version",
     "results",
     "errors",
     "paths",
     "time",
+    "rules_by_engine",
     "engine_requested",
+    "interfile_languages_used",
     "skipped_rules",
     "profiling_results",
 ];
-const SEMGREP_WARNING: &str = "!!! You're using one or more options starting with '--x-'. These options are not part of the semgrep API. They will change or will be removed without notice !!! ";
+const SEMGREP_RULE_ID: &str = "config.semgrep.context-relay-no-python-runtime";
+const SEMGREP_BARE_RULE_ID: &str = "context-relay-no-python-runtime";
+const SEMGREP_CANARY_RULE_ID: &str = "config.semgrep.context-relay-scan-canary";
+const SEMGREP_BARE_CANARY_RULE_ID: &str = "context-relay-scan-canary";
 
 pub fn validate_gitleaks_report(
     exit: i32,
@@ -168,18 +173,31 @@ pub fn validate_semgrep_report(
     stderr: &[u8],
     inputs: &[ContentFrame],
 ) -> Result<(RunDisposition, Vec<u8>), RunnerError> {
-    if !matches!(exit, 0 | 1) || !valid_semgrep_warning(stderr) {
+    if !stderr.is_empty() {
         return invalid();
     }
-    let report: Value =
+    validate_semgrep_core_report(exit, stdout, inputs)
+}
+
+fn validate_semgrep_core_report(
+    exit: i32,
+    stdout: &[u8],
+    inputs: &[ContentFrame],
+) -> Result<(RunDisposition, Vec<u8>), RunnerError> {
+    if exit != 0 {
+        return invalid();
+    }
+    let mut report: Value =
         serde_json::from_slice(stdout).map_err(|_| RunnerError::InvalidToolOutput)?;
     let object = report.as_object().ok_or(RunnerError::InvalidToolOutput)?;
-    if !exact_keys(object, &SEMGREP_KEYS)
+    if !exact_keys(object, &SEMGREP_CORE_KEYS)
         || object.get("version").and_then(Value::as_str) != Some("1.170.0")
         || object.get("engine_requested").and_then(Value::as_str) != Some("OSS")
         || !empty_array(object.get("errors"))
+        || !empty_array(object.get("interfile_languages_used"))
         || !empty_array(object.get("skipped_rules"))
         || !empty_array(object.get("profiling_results"))
+        || !valid_semgrep_rules_by_engine(object.get("rules_by_engine"))
     {
         return invalid();
     }
@@ -188,12 +206,80 @@ pub fn validate_semgrep_report(
             .get("time")
             .and_then(Value::as_object)
             .ok_or(RunnerError::InvalidToolOutput)?,
+        inputs,
     )?;
     let expected = inputs
         .iter()
         .map(|input| input.path().as_str().to_owned())
         .collect::<BTreeSet<_>>();
-    let paths = object
+    validate_semgrep_paths(object, &expected)?;
+    let results = object
+        .get("results")
+        .and_then(Value::as_array)
+        .ok_or(RunnerError::InvalidToolOutput)?;
+    let mut identities = BTreeSet::new();
+    let mut canaries = BTreeSet::new();
+    let mut findings = Vec::new();
+    for result in results {
+        let result = result.as_object().ok_or(RunnerError::InvalidToolOutput)?;
+        match validate_semgrep_result(result, &expected, &mut identities)? {
+            SemgrepResultKind::Canary(path) => {
+                if !canaries.insert(path) {
+                    return invalid();
+                }
+            }
+            SemgrepResultKind::Finding => {
+                let mut result = result.clone();
+                result["extra"]["metavars"] = Value::Object(Map::new());
+                findings.push(Value::Object(result));
+            }
+        }
+    }
+    if canaries != expected {
+        return invalid();
+    }
+    let count = u32::try_from(findings.len()).map_err(|_| RunnerError::LimitExceeded)?;
+    report["results"] = Value::Array(findings);
+    Ok((
+        if count == 0 {
+            RunDisposition::Clean
+        } else {
+            RunDisposition::Findings(count)
+        },
+        serde_json::to_vec(&report).map_err(|_| RunnerError::InvalidToolOutput)?,
+    ))
+}
+
+fn valid_semgrep_rules_by_engine(value: Option<&Value>) -> bool {
+    let Some(entries) = value.and_then(Value::as_array) else {
+        return false;
+    };
+    let rules = entries
+        .iter()
+        .map(|entry| {
+            let pair = entry.as_array().filter(|pair| pair.len() == 2)?;
+            (pair[1].as_str() == Some("OSS"))
+                .then(|| pair[0].as_str())
+                .flatten()
+        })
+        .collect::<Option<BTreeSet<_>>>();
+    rules.is_some_and(|rules| {
+        entries.len() == 2
+            && rules.len() == 2
+            && rules
+                .iter()
+                .any(|rule| matches!(*rule, SEMGREP_RULE_ID | SEMGREP_BARE_RULE_ID))
+            && rules
+                .iter()
+                .any(|rule| matches!(*rule, SEMGREP_CANARY_RULE_ID | SEMGREP_BARE_CANARY_RULE_ID))
+    })
+}
+
+fn validate_semgrep_paths(
+    report: &Map<String, Value>,
+    expected: &BTreeSet<String>,
+) -> Result<(), RunnerError> {
+    let paths = report
         .get("paths")
         .and_then(Value::as_object)
         .ok_or(RunnerError::InvalidToolOutput)?;
@@ -206,35 +292,18 @@ pub fn validate_semgrep_report(
         .get("scanned")
         .and_then(Value::as_array)
         .ok_or(RunnerError::InvalidToolOutput)?;
-    let mut scanned = BTreeSet::new();
-    for value in scanned_values {
-        let path = scanner_path(value.as_str().ok_or(RunnerError::InvalidToolOutput)?)?;
-        if !scanned.insert(path) {
-            return invalid();
-        }
-    }
-    if scanned != expected || scanned_values.len() != expected.len() {
-        return invalid();
-    }
-    let results = object
-        .get("results")
-        .and_then(Value::as_array)
-        .ok_or(RunnerError::InvalidToolOutput)?;
-    let mut identities = BTreeSet::new();
-    for result in results {
-        validate_semgrep_result(
-            result.as_object().ok_or(RunnerError::InvalidToolOutput)?,
-            &expected,
-            &mut identities,
-        )?;
-    }
-    let count = u32::try_from(results.len()).map_err(|_| RunnerError::LimitExceeded)?;
-    let disposition = match (exit, count) {
-        (0, 0) => RunDisposition::Clean,
-        (1, count) if count > 0 => RunDisposition::Findings(count),
-        _ => return invalid(),
-    };
-    Ok((disposition, stdout.to_vec()))
+    let scanned = scanned_values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or(RunnerError::InvalidToolOutput)
+                .and_then(scanner_path)
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    (scanned_values.len() == expected.len() && scanned == *expected)
+        .then_some(())
+        .ok_or(RunnerError::InvalidToolOutput)
 }
 
 pub fn validate_rulesync_outputs(
@@ -450,39 +519,24 @@ fn valid_duration(value: &str) -> bool {
         && matches!(unit, "ns" | "us" | "µs" | "ms" | "s")
 }
 
-fn valid_semgrep_warning(stderr: &[u8]) -> bool {
-    let Ok(text) = std::str::from_utf8(stderr) else {
-        return false;
-    };
-    let Some(line) = text.strip_suffix('\n') else {
-        return false;
-    };
-    if line.contains('\n') || line.contains('\r') {
-        return false;
-    }
-    let Some(rest) = line.strip_prefix('[') else {
-        return false;
-    };
-    let Some((timing, message)) = rest.split_once("][WARNING]: ") else {
-        return false;
-    };
-    timing.matches('.').count() == 1
-        && timing
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || byte == b'.')
-        && message == SEMGREP_WARNING
+enum SemgrepResultKind {
+    Canary(String),
+    Finding,
 }
 
 fn validate_semgrep_result(
     result: &Map<String, Value>,
     expected_paths: &BTreeSet<String>,
     identities: &mut BTreeSet<String>,
-) -> Result<(), RunnerError> {
-    if !exact_keys(result, &["check_id", "path", "start", "end", "extra"])
-        || result.get("check_id").and_then(Value::as_str) != Some("context-relay-no-python-runtime")
-    {
+) -> Result<SemgrepResultKind, RunnerError> {
+    if !exact_keys(result, &["check_id", "path", "start", "end", "extra"]) {
         return invalid();
     }
+    let rule_id = result
+        .get("check_id")
+        .and_then(Value::as_str)
+        .filter(|value| valid_semgrep_rule_id(Some(value)))
+        .ok_or(RunnerError::InvalidToolOutput)?;
     let path = scanner_path(
         result
             .get("path")
@@ -511,39 +565,118 @@ fn validate_semgrep_result(
         .get("extra")
         .and_then(Value::as_object)
         .ok_or(RunnerError::InvalidToolOutput)?;
-    if !exact_keys(
-        extra,
-        &[
-            "message",
-            "metadata",
-            "severity",
-            "fingerprint",
-            "lines",
-            "validation_state",
+    let is_canary = matches!(
+        rule_id,
+        SEMGREP_CANARY_RULE_ID | SEMGREP_BARE_CANARY_RULE_ID
+    );
+    const CORE_EXTRA_KEYS: [&str; 7] = [
+        "metavars",
+        "engine_kind",
+        "is_ignored",
+        "message",
+        "metadata",
+        "severity",
+        "validation_state",
+    ];
+    let valid_extra = extra
+        .keys()
+        .all(|key| CORE_EXTRA_KEYS.contains(&key.as_str()))
+        && [
+            "metavars",
             "engine_kind",
-        ],
-    ) || extra.get("message").and_then(Value::as_str)
-        != Some("Native Semgrep packages must not contain Pysemgrep or a Python runtime.")
+            "is_ignored",
+            "message",
+            "validation_state",
+        ]
+        .iter()
+        .all(|key| extra.contains_key(*key))
+        && valid_semgrep_core_metavars(extra.get("metavars"), is_canary, start, end)
+        && extra.get("is_ignored").and_then(Value::as_bool) == Some(false)
+        && extra.get("validation_state").and_then(Value::as_str) == Some("NO_VALIDATOR")
+        && extra.get("severity").is_none_or(|severity| {
+            severity.as_str() == Some(if is_canary { "INFO" } else { "ERROR" })
+        });
+    if !valid_extra
+        || extra.get("message").and_then(Value::as_str)
+            != Some(if is_canary {
+                "Context Relay scan coverage canary."
+            } else {
+                "Native Semgrep packages must not contain Pysemgrep or a Python runtime."
+            })
         || !extra
             .get("metadata")
-            .and_then(Value::as_object)
-            .is_some_and(Map::is_empty)
-        || extra.get("severity").and_then(Value::as_str) != Some("ERROR")
-        || extra.get("fingerprint").and_then(Value::as_str) != Some("requires login")
-        || extra.get("lines").and_then(Value::as_str) != Some("requires login")
-        || extra.get("validation_state").and_then(Value::as_str) != Some("NO_VALIDATOR")
+            .is_none_or(|metadata| metadata.as_object().is_some_and(Map::is_empty))
         || extra.get("engine_kind").and_then(Value::as_str) != Some("OSS")
     {
         return invalid();
     }
+    if is_canary {
+        return (start == (1, 1, 0) && end > start)
+            .then_some(SemgrepResultKind::Canary(path))
+            .ok_or(RunnerError::InvalidToolOutput);
+    }
     let identity = format!(
         "{}:{path}:{}:{}:{}:{}:{}:{}",
-        "context-relay-no-python-runtime", start.0, start.1, start.2, end.0, end.1, end.2
+        SEMGREP_RULE_ID, start.0, start.1, start.2, end.0, end.1, end.2
     );
     identities
         .insert(identity)
-        .then_some(())
+        .then_some(SemgrepResultKind::Finding)
         .ok_or(RunnerError::InvalidToolOutput)
+}
+
+fn valid_semgrep_core_metavars(
+    value: Option<&Value>,
+    is_canary: bool,
+    start: (u64, u64, u64),
+    end: (u64, u64, u64),
+) -> bool {
+    let Some(metavars) = value.and_then(Value::as_object) else {
+        return false;
+    };
+    if metavars.is_empty() {
+        return true;
+    }
+    let Some(capture) = (!is_canary && metavars.len() == 1)
+        .then(|| metavars.get("$1"))
+        .flatten()
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    if !exact_keys(capture, &["start", "end", "abstract_content"]) {
+        return false;
+    }
+    let capture_start = capture
+        .get("start")
+        .and_then(Value::as_object)
+        .and_then(|position| semgrep_position(position).ok());
+    let capture_end = capture
+        .get("end")
+        .and_then(Value::as_object)
+        .and_then(|position| semgrep_position(position).ok());
+    capture_start == Some(start)
+        && capture_end == Some(end)
+        && capture
+            .get("abstract_content")
+            .and_then(Value::as_str)
+            .is_some_and(valid_semgrep_policy_capture)
+}
+
+fn valid_semgrep_policy_capture(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    if matches!(value.as_str(), "pysemgrep" | "site-packages") {
+        return true;
+    }
+    let Some(mut suffix) = value.strip_prefix("python") else {
+        return false;
+    };
+    suffix = suffix.strip_suffix(".exe").unwrap_or(suffix);
+    suffix.is_empty()
+        || suffix == "3"
+        || suffix.strip_prefix("3.").is_some_and(|minor| {
+            !minor.is_empty() && minor.bytes().all(|byte| byte.is_ascii_digit())
+        })
 }
 
 fn semgrep_position(position: &Map<String, Value>) -> Result<(u64, u64, u64), RunnerError> {
@@ -559,70 +692,173 @@ fn semgrep_position(position: &Map<String, Value>) -> Result<(u64, u64, u64), Ru
     Ok((line, column, offset))
 }
 
-fn validate_semgrep_time(time: &Map<String, Value>) -> Result<(), RunnerError> {
-    if !exact_keys(
-        time,
-        &[
+fn validate_semgrep_time(
+    time: &Map<String, Value>,
+    inputs: &[ContentFrame],
+) -> Result<(), RunnerError> {
+    const KEYS: [&str; 12] = [
+        "rules",
+        "rules_parse_time",
+        "profiling_times",
+        "parsing_time",
+        "scanning_time",
+        "matching_time",
+        "tainting_time",
+        "fixpoint_timeouts",
+        "prefiltering",
+        "targets",
+        "total_bytes",
+        "max_memory_bytes",
+    ];
+    if !time.keys().all(|key| KEYS.contains(&key.as_str()))
+        || ![
             "rules",
             "rules_parse_time",
             "profiling_times",
-            "parsing_time",
-            "scanning_time",
-            "matching_time",
-            "tainting_time",
-            "fixpoint_timeouts",
-            "prefiltering",
             "targets",
             "total_bytes",
-            "max_memory_bytes",
-        ],
-    ) || !empty_array(time.get("rules"))
-        || !empty_array(time.get("fixpoint_timeouts"))
-        || !empty_array(time.get("targets"))
+        ]
+        .iter()
+        .all(|key| time.contains_key(*key))
+        || !time
+            .get("rules")
+            .and_then(Value::as_array)
+            .is_some_and(|rules| {
+                rules.len() <= 2
+                    && rules
+                        .iter()
+                        .all(|rule| valid_semgrep_rule_id(rule.as_str()))
+                    && rules
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<BTreeSet<_>>()
+                        .len()
+                        == rules.len()
+            })
+        || !time
+            .get("fixpoint_timeouts")
+            .is_none_or(|value| empty_array(Some(value)))
         || !nonnegative_number(time.get("rules_parse_time"))
-        || !nonnegative_number(time.get("total_bytes"))
-        || !nonnegative_number(time.get("max_memory_bytes"))
-        || !number_object(time.get("profiling_times"))
+        || !time
+            .get("max_memory_bytes")
+            .is_none_or(|value| value.as_u64().is_some())
+        || !empty_object(time.get("profiling_times"))
     {
         return invalid();
     }
-    validate_file_timing(time.get("parsing_time"), "per_file_time", "very_slow_files")?;
-    validate_file_timing(
-        time.get("scanning_time"),
-        "per_file_time",
-        "very_slow_files",
-    )?;
-    validate_file_timing(
-        time.get("matching_time"),
-        "per_file_and_rule_time",
-        "very_slow_rules_on_files",
-    )?;
-    validate_file_timing(
-        time.get("tainting_time"),
-        "per_def_and_rule_time",
-        "very_slow_rules_on_defs",
-    )?;
-    let prefiltering = time
-        .get("prefiltering")
-        .and_then(Value::as_object)
-        .ok_or(RunnerError::InvalidToolOutput)?;
-    if !exact_keys(
-        prefiltering,
-        &[
-            "project_level_time",
-            "file_level_time",
-            "rules_with_project_prefilters_ratio",
-            "rules_with_file_prefilters_ratio",
-            "rules_selected_ratio",
-            "rules_matched_ratio",
-        ],
-    ) || !prefiltering
-        .values()
-        .all(|value| nonnegative_number(Some(value)))
-    {
-        return invalid();
+    validate_semgrep_targets(time, inputs)?;
+    for (key, average_key, slow_key) in [
+        ("parsing_time", "per_file_time", "very_slow_files"),
+        ("scanning_time", "per_file_time", "very_slow_files"),
+        (
+            "matching_time",
+            "per_file_and_rule_time",
+            "very_slow_rules_on_files",
+        ),
+        (
+            "tainting_time",
+            "per_def_and_rule_time",
+            "very_slow_rules_on_defs",
+        ),
+    ] {
+        if let Some(value) = time.get(key) {
+            validate_file_timing(Some(value), average_key, slow_key)?;
+        }
+    }
+    if let Some(prefiltering) = time.get("prefiltering") {
+        let prefiltering = prefiltering
+            .as_object()
+            .ok_or(RunnerError::InvalidToolOutput)?;
+        if !exact_keys(
+            prefiltering,
+            &[
+                "project_level_time",
+                "file_level_time",
+                "rules_with_project_prefilters_ratio",
+                "rules_with_file_prefilters_ratio",
+                "rules_selected_ratio",
+                "rules_matched_ratio",
+            ],
+        ) || !prefiltering
+            .values()
+            .all(|value| nonnegative_number(Some(value)))
+        {
+            return invalid();
+        }
     }
     Ok(())
+}
+
+fn validate_semgrep_targets(
+    time: &Map<String, Value>,
+    inputs: &[ContentFrame],
+) -> Result<(), RunnerError> {
+    let rule_count = time
+        .get("rules")
+        .and_then(Value::as_array)
+        .ok_or(RunnerError::InvalidToolOutput)?
+        .len();
+    let expected = inputs
+        .iter()
+        .map(|input| {
+            (
+                input.path().as_str().to_owned(),
+                u64::try_from(input.bytes().len()).map_err(|_| RunnerError::LimitExceeded),
+            )
+        })
+        .map(|(path, size)| size.map(|size| (path, size)))
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    if expected.len() != inputs.len() {
+        return invalid();
+    }
+    if time.get("total_bytes").and_then(Value::as_u64).is_none() {
+        return invalid();
+    }
+    let targets = time
+        .get("targets")
+        .and_then(Value::as_array)
+        .ok_or(RunnerError::InvalidToolOutput)?;
+    let mut seen = BTreeSet::new();
+    for target in targets {
+        let target = target.as_object().ok_or(RunnerError::InvalidToolOutput)?;
+        if !exact_keys(
+            target,
+            &[
+                "path",
+                "num_bytes",
+                "match_times",
+                "parse_times",
+                "run_time",
+            ],
+        ) || !nonnegative_number(target.get("run_time"))
+            || !nonnegative_numbers(target.get("match_times"), rule_count)
+            || !nonnegative_numbers(target.get("parse_times"), rule_count)
+        {
+            return invalid();
+        }
+        let path = scanner_path(
+            target
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or(RunnerError::InvalidToolOutput)?,
+        )?;
+        let Some(expected_size) = expected.get(&path) else {
+            return invalid();
+        };
+        if target.get("num_bytes").and_then(Value::as_u64) != Some(*expected_size)
+            || !seen.insert(path)
+        {
+            return invalid();
+        }
+    }
+    Ok(())
+}
+
+fn nonnegative_numbers(value: Option<&Value>, expected_len: usize) -> bool {
+    value.and_then(Value::as_array).is_some_and(|values| {
+        (values.len() == expected_len || (expected_len == 0 && values.len() == 1))
+            && values.iter().all(|value| nonnegative_number(Some(value)))
+    })
 }
 
 fn validate_file_timing(
@@ -666,6 +902,18 @@ fn scanner_path(value: &str) -> Result<String, RunnerError> {
         .map_err(|_| RunnerError::InvalidToolOutput)
 }
 
+fn valid_semgrep_rule_id(value: Option<&str>) -> bool {
+    matches!(
+        value,
+        Some(
+            SEMGREP_RULE_ID
+                | SEMGREP_BARE_RULE_ID
+                | SEMGREP_CANARY_RULE_ID
+                | SEMGREP_BARE_CANARY_RULE_ID
+        )
+    )
+}
+
 fn has_nonempty_bash_permissions(bytes: &[u8]) -> Result<bool, RunnerError> {
     let value: Value = serde_json::from_slice(bytes).map_err(|_| RunnerError::InvalidToolOutput)?;
     Ok(value
@@ -683,10 +931,8 @@ fn empty_array(value: Option<&Value>) -> bool {
     value.and_then(Value::as_array).is_some_and(Vec::is_empty)
 }
 
-fn number_object(value: Option<&Value>) -> bool {
-    value
-        .and_then(Value::as_object)
-        .is_some_and(|object| object.values().all(|value| nonnegative_number(Some(value))))
+fn empty_object(value: Option<&Value>) -> bool {
+    value.and_then(Value::as_object).is_some_and(Map::is_empty)
 }
 
 fn nonnegative_number(value: Option<&Value>) -> bool {

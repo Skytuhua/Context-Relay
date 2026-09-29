@@ -1,41 +1,18 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
-  "anyOf": [
-    {
-      "properties": {
-        "memoryIds": {
-          "minItems": 1,
-          "type": "array"
-        }
+  "if": {
+    "properties": {
+      "decisionIds": {
+        "maxItems": 0,
+        "type": "array"
       },
-      "required": [
-        "memoryIds"
-      ]
-    },
-    {
-      "properties": {
-        "decisionIds": {
-          "minItems": 1,
-          "type": "array"
-        }
-      },
-      "required": [
-        "decisionIds"
-      ]
-    },
-    {
-      "properties": {
-        "taskIds": {
-          "minItems": 1,
-          "type": "array"
-        }
-      },
-      "required": [
-        "taskIds"
-      ]
+      "memoryIds": {
+        "maxItems": 0,
+        "type": "array"
+      }
     }
-  ],
+  },
   "properties": {
     "decisionIds": {
       "items": {
@@ -83,5 +60,13 @@
     "taskIds",
     "summary"
   ],
+  "then": {
+    "properties": {
+      "taskIds": {
+        "minItems": 1,
+        "type": "array"
+      }
+    }
+  },
   "type": "object"
 }

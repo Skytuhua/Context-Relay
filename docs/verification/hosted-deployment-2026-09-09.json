@@ -1,0 +1,193 @@
+{
+  "project": "brvzuycnxoswdzzipgvx",
+  "date": "2026-09-09",
+  "migrations": [
+    {
+      "source": "supabase/migrations/20260804000000_context_relay_ciphertext_boundary.sql",
+      "name": "context_relay_ciphertext_boundary",
+      "remoteVersion": "20260805153409",
+      "exact": true
+    },
+    {
+      "source": "supabase/migrations/20260805170000_revoke_context_relay_internal_execute.sql",
+      "name": "revoke_context_relay_internal_execute",
+      "remoteVersion": "20260805155753",
+      "exact": true
+    },
+    {
+      "source": "supabase/migrations/20260810070712_signed_sync_cloud_admission.sql",
+      "name": "signed_sync_cloud_admission",
+      "remoteVersion": "20260909021340",
+      "exact": true
+    },
+    {
+      "source": "supabase/migrations/20260831051540_account_lifecycle.sql",
+      "name": "account_lifecycle",
+      "remoteVersion": "20260909021359",
+      "exact": true
+    },
+    {
+      "source": "supabase/migrations/20260908000000_hosted_enrollment.sql",
+      "name": "hosted_enrollment",
+      "remoteVersion": "20260909021404",
+      "exact": true
+    },
+    {
+      "source": "supabase/migrations/20260908010000_commit_hosted_enrollment.sql",
+      "name": "commit_hosted_enrollment",
+      "remoteVersion": "20260909021409",
+      "exact": true
+    },
+    {
+      "source": "supabase/migrations/20260908020000_read_hosted_enrollment.sql",
+      "name": "read_hosted_enrollment",
+      "remoteVersion": "20260909021413",
+      "exact": true
+    },
+    {
+      "source": "supabase/migrations/20260909000000_renew_hosted_enrollment.sql",
+      "name": "renew_hosted_enrollment",
+      "remoteVersion": "20260909021418",
+      "exact": true
+    },
+    {
+      "source": "supabase/migrations/20260909010000_recovery_snapshot.sql",
+      "name": "recovery_snapshot",
+      "remoteVersion": "20260909021422",
+      "exact": true
+    },
+    {
+      "source": "supabase/migrations/20260909020000_commit_hosted_recovery.sql",
+      "name": "commit_hosted_recovery",
+      "remoteVersion": "20260909021427",
+      "exact": true
+    },
+    {
+      "source": "supabase/migrations/20260909030000_hosted_pairing_invites.sql",
+      "name": "hosted_pairing_invites",
+      "remoteVersion": "20260909021431",
+      "exact": true
+    },
+    {
+      "source": "supabase/migrations/20260909040000_resolve_hosted_pairing.sql",
+      "name": "resolve_hosted_pairing",
+      "remoteVersion": "20260909021436",
+      "exact": true
+    },
+    {
+      "source": "supabase/migrations/20260909050000_control_hosted_pairing.sql",
+      "name": "control_hosted_pairing",
+      "remoteVersion": "20260909021440",
+      "exact": true
+    },
+    {
+      "source": "supabase/migrations/20260909060000_submit_hosted_pairing.sql",
+      "name": "submit_hosted_pairing",
+      "remoteVersion": "20260909021445",
+      "exact": true
+    },
+    {
+      "source": "supabase/migrations/20260909070000_decide_hosted_pairing.sql",
+      "name": "decide_hosted_pairing",
+      "remoteVersion": "20260909021452",
+      "exact": true
+    },
+    {
+      "source": "supabase/migrations/20260909080000_pairing_verification_context.sql",
+      "name": "pairing_verification_context",
+      "remoteVersion": "20260909021457",
+      "exact": true
+    },
+    {
+      "source": "supabase/migrations/20260909090000_prune_expired_pairing.sql",
+      "name": "prune_expired_pairing",
+      "remoteVersion": "20260909021501",
+      "exact": true
+    }
+  ],
+  "functions": [
+    {
+      "name": "sync",
+      "id": "1c204c5c-b594-4920-afb0-52f0a24e9b2b",
+      "version": 1,
+      "status": "ACTIVE",
+      "verifyJwt": false,
+      "bundleSha256": "c087f4269d43789d690381fa82e742ec1aba800a5f0e816af1f1188c346ba2bc"
+    },
+    {
+      "name": "account-lifecycle",
+      "id": "e8dd5986-ea64-464a-95ca-f558ddb1d43a",
+      "version": 1,
+      "status": "ACTIVE",
+      "verifyJwt": false,
+      "bundleSha256": "d65cc293cfbd85aa2a6370d5be4f1d6525b21a443016054393a46d08328a84b4"
+    },
+    {
+      "name": "enrollment",
+      "id": "5461d842-5148-44d8-b021-e79090140f74",
+      "version": 1,
+      "status": "ACTIVE",
+      "verifyJwt": false,
+      "bundleSha256": "fc87a24760b3f957902abacdf781ec7c9a30b6ee8ca701492762f63aab433e72"
+    }
+  ],
+  "checks": {
+    "tablesWithoutRls": [],
+    "publicServiceFunctions": 32,
+    "publicServiceFunctionsExecutableByAnonOrAuthenticated": 0,
+    "authUsers": 0,
+    "accounts": 0,
+    "syncOperations": 0,
+    "syncCheckpoints": 0,
+    "securityAdvisorErrors": 0,
+    "securityAdvisorWarnings": 0,
+    "securityAdvisorInfo": {
+      "name": "rls_enabled_no_policy",
+      "count": 12,
+      "reason": "Private/service-only tables intentionally deny direct client access."
+    }
+  },
+  "authProbes": [
+    {
+      "name": "sync",
+      "auth": "missing",
+      "status": 401,
+      "error": "auth_required"
+    },
+    {
+      "name": "sync",
+      "auth": "invalid",
+      "status": 401,
+      "error": "auth_required"
+    },
+    {
+      "name": "account-lifecycle",
+      "auth": "missing",
+      "status": 401,
+      "error": "auth_required"
+    },
+    {
+      "name": "account-lifecycle",
+      "auth": "invalid",
+      "status": 401,
+      "error": "auth_required"
+    },
+    {
+      "name": "enrollment",
+      "auth": "missing",
+      "status": 401,
+      "error": "auth_required"
+    },
+    {
+      "name": "enrollment",
+      "auth": "invalid",
+      "status": 401,
+      "error": "auth_required"
+    }
+  ],
+  "remaining": [
+    "Configure persistent random pairing pepper through authenticated dashboard, then deploy pairing.",
+    "Complete real OAuth and authenticated installed workflows.",
+    "Full product, signing, clean-machine, security and beta release gates remain open."
+  ]
+}

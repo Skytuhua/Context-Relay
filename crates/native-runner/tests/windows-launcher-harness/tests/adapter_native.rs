@@ -117,7 +117,7 @@ fn production_adapter_rejects_unbound_trailing_or_stderr_output() {
 }
 
 #[test]
-fn helper_protocol_handles_are_not_reinherited_by_a_sidecar_child() {
+fn helper_protocol_handles_are_noninheritable_before_sidecar_launch() {
     let fixture = Fixture::new();
     let journal = TestJournal::default();
     let launcher = launcher(journal.clone(), &fixture.root);
@@ -127,7 +127,7 @@ fn helper_protocol_handles_are_not_reinherited_by_a_sidecar_child() {
             &launcher,
             &journal,
             &fixture.closure,
-            &fixture.request("NO_PROTOCOL_HANDLE_LEAK"),
+            &fixture.request("NONINHERITABLE_PROTOCOL_HANDLES"),
         )
         .unwrap(),
         RunResponse::failed(FailureCode::InvalidOutput)
@@ -203,8 +203,8 @@ fn timeout_terminates_the_job_before_profile_cleanup() {
         .unwrap(),
         RunResponse::failed(FailureCode::TimedOut)
     );
-    assert!(started.elapsed() >= Duration::from_secs(29));
-    assert!(started.elapsed() < Duration::from_secs(40));
+    assert!(started.elapsed() >= Duration::from_secs(34));
+    assert!(started.elapsed() < Duration::from_secs(50));
     assert_eq!(journal.events().last(), Some(&"deleted"));
 }
 

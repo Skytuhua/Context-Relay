@@ -1,12 +1,15 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
+import * as sourceBundle from './semgrep-source-bundle.mjs';
 
 import {
+  archiveCacheLinks,
   buildDeterministicTar,
   buildSemgrepSourceBundle,
   collectGitRepository,
@@ -58,6 +61,34 @@ test('writeAll retries partial FileHandle writes without dropping bytes', async 
   const expected = Buffer.from('partial writes must be retried');
   await writeAll(handle, expected);
   assert.deepEqual(Buffer.concat(written), expected);
+});
+
+test('locked compiler identity can be supplied without modifying source', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'context-relay-compiler-identity-'));
+  t.after(() => rm(root, { force: true, recursive: true }));
+  const gitDir = join(root, 'compiler-git');
+  const source = join(root, 'source');
+  const revision = '3499e5708b0637c12d24d973dd103406a32b8fe8';
+  await mkdir(source);
+  execFileSync('git', ['init', '--bare', gitDir], { stdio: 'ignore' });
+  await writeFile(join(gitDir, 'HEAD'), `${revision}\n`);
+  const actual = execFileSync('git', ['rev-parse', 'HEAD'], {
+    cwd: source,
+    encoding: 'utf8',
+    env: { ...process.env, GIT_DIR: gitDir },
+  });
+  assert.equal(actual.trim(), revision);
+  assert.deepEqual(await readdir(source), []);
+});
+
+test('the manifest-bound Windows builder has checkout-stable LF bytes', async () => {
+  const path = 'third_party/sidecars/semgrep/build-public-source-windows.ps1';
+  const bytes = await readFile(new URL(`../${path}`, import.meta.url));
+  assert.equal(bytes.includes(Buffer.from('\r\n')), false);
+  assert.equal(
+    execFileSync('git', ['check-attr', 'eol', '--', path], { encoding: 'utf8' }).trim(),
+    `${path}: eol: lf`,
+  );
 });
 
 test('deterministic source tar is byte-identical and contains no link members', async (t) => {
@@ -220,6 +251,56 @@ test('verified materialization restores official long SHA-512 opam cache names',
   assert.deepEqual(await readFile(join(root, ...official.split('/'))), bytes);
 });
 
+test('verified materialization restores every declared opam checksum alias as a hard link', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'context-relay-semgrep-checksum-links-'));
+  t.after(() => rm(root, { force: true, recursive: true }));
+  const bytes = Buffer.from('mixed-checksum archive\n');
+  const md5 = digest('md5', bytes);
+  const sha256 = digest('sha256', bytes);
+  const links = archiveCacheLinks({
+    opam: {
+      resolvedSourceArchives: [{
+        package: 'fixture',
+        version: '1',
+        targets: ['aarch64-apple-darwin'],
+        opamPath: 'packages/fixture/fixture.1/opam',
+        opamSha256: '1'.repeat(64),
+        licenses: ['MIT'],
+        source: {
+          checksums: [
+            { algorithm: 'md5', digest: md5 },
+            { algorithm: 'sha256', digest: sha256 },
+          ],
+          supplementalChecksums: [],
+          mirrors: [],
+          url: 'https://example.invalid/fixture.tar.gz',
+        },
+        extraSources: [],
+      }],
+    },
+  });
+  const stored = `opam-repository/cache/sha256/${sha256.slice(0, 2)}/${sha256}`;
+  const alias = `opam-repository/cache/md5/${md5.slice(0, 2)}/${md5}`;
+  assert.deepEqual(links, [{
+    path: alias,
+    target: `../../sha256/${sha256.slice(0, 2)}/${sha256}`,
+  }]);
+  await mkdir(join(root, ...stored.split('/').slice(0, -1)), { recursive: true });
+  await writeFile(join(root, ...stored.split('/')), bytes);
+  await writeFile(join(root, 'SYMLINKS.v1.json'), `${JSON.stringify({ links, schemaVersion: 1 })}\n`);
+  await writeFile(join(root, 'MANIFEST.sha256'), `${sha256}  ${stored}\n`);
+
+  assert.equal(await materializeBundleLinks(root), 1);
+  assert.deepEqual(await readFile(join(root, ...alias.split('/'))), bytes);
+  const [storedInfo, aliasInfo] = await Promise.all([
+    lstat(join(root, ...stored.split('/'))),
+    lstat(join(root, ...alias.split('/'))),
+  ]);
+  assert.equal(aliasInfo.isSymbolicLink(), false);
+  assert.equal(aliasInfo.dev, storedInfo.dev);
+  assert.equal(aliasInfo.ino, storedInfo.ino);
+});
+
 test('verified materialization restores USTAR-unrepresentable source paths', async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'context-relay-semgrep-long-path-'));
   t.after(() => rm(root, { force: true, recursive: true }));
@@ -251,7 +332,23 @@ test('public-source build scripts consume the verified bundle through closed nat
     assert.match(script, /build-a/);
     assert.match(script, /build-b/);
     assert.match(script, /python/i);
+    assert.match(script, /3499e5708b0637c12d24d973dd103406a32b8fe8/);
+    assert.match(script, /5\.3\.0\+semgrep-fork@/);
+    assert.match(script, /ocamlc -version/);
+    assert.match(script, /sourceLock\.opam\?\.compiler/);
+    assert.doesNotMatch(script, /scripts[\\/]validate-compiler-sha\.sh/);
+    assert.doesNotMatch(script, /(?:sed|patch)[^\r\n]*(?:configure|VERSION)/i);
+    assert.doesNotMatch(script, /--inplace-build/);
+    assert.doesNotMatch(script, /dev[\\/]required\.opam/);
     assert.doesNotMatch(script, /pypi|pysemgrep|dumpbin|cl\.exe|visual studio/i);
+    const treeSitterPatch = script.indexOf('0001-Makefile-backports.patch');
+    const treeSitterConfigure = script.indexOf('./configure');
+    const treeSitterInstall = script.indexOf('install-tree-sitter-lib');
+    assert.ok(
+      treeSitterPatch >= 0
+        && treeSitterPatch < treeSitterConfigure
+        && treeSitterConfigure < treeSitterInstall,
+    );
   }
   assert.match(mac, /Darwin/);
   assert.match(mac, /arm64/);
@@ -259,6 +356,83 @@ test('public-source build scripts consume the verified bundle through closed nat
   assert.doesNotMatch(mac, /macos-15-xlarge/);
   assert.match(mac, /a739c5405d73c42ef15a9dc995efc0f87396cc36/);
   assert.match(mac, /2\.5\.0/);
+  assert.match(mac, /archive-mirrors=\[\\"\$ARCHIVE_MIRROR\\"\]/);
+  assert.doesNotMatch(mac, /archive-mirrors=\$ARCHIVE_MIRROR/);
+  assert.match(mac, /cp -RL "\$CURRENT\/bundle\/pins" "\$CURRENT\/pins"/);
+  assert.match(mac, /test -z "\$\(find "\$CURRENT\/pins" -type l -print -quit\)"/);
+  assert.match(mac, /HOMEBREW_NO_AUTO_UPDATE=1/);
+  assert.match(mac, /brew list --versions/);
+  assert.match(mac, /test -x \/usr\/bin\/curl-config/);
+  assert.match(mac, /\/usr\/bin\/curl-config --libs/);
+  for (const archive of ['libgmp.a', 'libpcre2-8.a', 'libdwarf.a', 'libzstd.a', 'libev.a']) {
+    assert.match(mac, new RegExp(archive.replace('.', '\\.')));
+  }
+  assert.match(mac, /opam pin add --no-action "\$1" "\$CURRENT\/pins\/\$2"/);
+  assert.match(mac, /git init --bare "\$compiler_git_dir"/);
+  assert.match(mac, /prepare_compiler_identity "\$COMPILER_GIT_DIR" "\$COMPILER_REVISION"/);
+  assert.match(mac, /GIT_DIR="\$COMPILER_GIT_DIR" opam install --update-invariant/);
+  assert.equal((mac.match(/(?:^|\s)GIT_DIR=/g) ?? []).length, 1);
+  assert.match(mac, /rsync file:\/\/\$CURRENT\/pins\/\$revision/);
+  assert.doesNotMatch(mac, /opam pin add --no-action[^\n]+bundle\/pins/);
+  assert.match(
+    mac,
+    /LWT_DISCOVER_ARGUMENTS='--use-libev true'/,
+  );
+  assert.match(mac, /LIBRARY_PATH="\$\(brew --prefix\)\/lib:\$\{LIBRARY_PATH:-\}"/);
+  assert.equal((mac.match(/PATH="\/usr\/bin:\/bin"/g) ?? []).length, 2);
+  assert.doesNotMatch(mac, /PATH="\$CURRENT\/empty-path"/);
+  const zeroedDebugMapTime = mac.indexOf('ZERO_AR_DATE=1');
+  const nativeLink = mac.indexOf('opam exec -- make core');
+  assert.ok(
+    zeroedDebugMapTime >= 0 && zeroedDebugMapTime < nativeLink,
+    'macOS must zero N_OSO debug-map mtimes before the content-derived UUID and ad-hoc signature are linked',
+  );
+  assert.doesNotMatch(mac, /-no_uuid|strip\s+-S|codesign/);
+  const invalidEvidenceValidated = mac.indexOf('invalid rule evidence lacks a parse or config error');
+  const normalizedSmokeEvidence = mac.lastIndexOf('normalize_smoke_evidence');
+  const evidenceManifest = mac.indexOf('find . -type f ! -name MANIFEST.sha256', normalizedSmokeEvidence);
+  assert.ok(
+    invalidEvidenceValidated >= 0
+      && normalizedSmokeEvidence > invalidEvidenceValidated
+      && evidenceManifest > normalizedSmokeEvidence,
+    'volatile smoke fields must be normalized only after semantic validation and before evidence hashing',
+  );
+  assert.match(mac, /for \(const path of \[cleanPath, findingPath\]\)/);
+  assert.match(mac, /Object\.hasOwn\(report, "time"\)/);
+  assert.match(mac, /delete report\.time/);
+  assert.match(mac, /const elapsedPrefix = \/\^\\\[\\d\+\\\.\\d\+\\\]\[ \\t\]\*\/gm/);
+  assert.match(mac, /matches\.length !== 1/);
+  assert.match(mac, /content\.replace\(elapsedPrefix, ""\)/);
+  assert.match(
+    mac,
+    /"\$EVIDENCE\/clean\.json" "\$EVIDENCE\/finding\.json"[\s\\]+"\$EVIDENCE\/clean\.stderr" "\$EVIDENCE\/finding\.stderr" "\$EVIDENCE\/invalid\.stderr"/,
+  );
+  const windowsInvalidEvidenceValidated = windows.indexOf('invalid rule evidence lacks a parse or config error');
+  const windowsNormalizedSmokeEvidence = windows.lastIndexOf('Normalize-SmokeEvidence');
+  const windowsEvidenceManifest = windows.indexOf('$ManifestLines', windowsNormalizedSmokeEvidence);
+  assert.ok(
+    windowsInvalidEvidenceValidated >= 0
+      && windowsNormalizedSmokeEvidence > windowsInvalidEvidenceValidated
+      && windowsEvidenceManifest > windowsNormalizedSmokeEvidence,
+    'Windows volatile smoke fields must be normalized only after semantic validation and before evidence hashing',
+  );
+  for (const script of [mac, windows]) {
+    assert.match(script, /for \(const path of \[cleanPath, findingPath\]\)/);
+    assert.match(script, /Object\.hasOwn\(report, "time"\)/);
+    assert.match(script, /delete report\.time/);
+    assert.match(script, /const elapsedPrefix = \/\^\\\[\\d\+\\\.\\d\+\\\]\[ \\t\]\*\/gm/);
+    assert.match(script, /matches\.length !== 1/);
+    assert.match(script, /content\.replace\(elapsedPrefix, ""\)/);
+  }
+  assert.match(mac, /"\$DESTINATION\/osemgrep" --experimental --version/);
+  assert.match(
+    mac,
+    /opam install --locked --update-invariant --assume-depexts --deps-only \.\/semgrep\.opam/,
+  );
+  assert.match(
+    mac,
+    /opam install --locked --update-invariant --assume-depexts --deps-only \.\/semgrep\.opam[\s\S]+validate_compiler_identity "\$COMPILER_REVISION"/,
+  );
   assert.match(mac, /otool/);
   assert.match(mac, /if ! otool -L[^\n]+>[^\n]+; then/);
   assert.doesNotMatch(mac, /otool -L[^\n]*\|/);
@@ -267,6 +441,54 @@ test('public-source build scripts consume the verified bundle through closed nat
   assert.match(windows, /Cygwin/);
   assert.match(windows, /3e4c6ff8c9a04c9ec8f6f87701cd4b661b0f1f18/);
   assert.match(windows, /2\.5\.2/);
+  assert.match(windows, /archive-mirrors=\["\{0\}"\]/);
+  assert.doesNotMatch(windows, /archive-mirrors=\$CacheUri/);
+  assert.match(
+    windows,
+    /\$CachePath = \(Join-Path \$Repository 'cache'\)\.Replace\('\\', '\/'\)/,
+  );
+  assert.match(windows, /\$CacheUri = "file:\/\/\$CachePath"/);
+  assert.doesNotMatch(windows, /\$CacheUri = \(\[Uri\]/);
+  assert.match(
+    windows,
+    /& \$Bash '-c' 'cd libs\/ocaml-tree-sitter-core && \.\/configure && \.\/scripts\/install-tree-sitter-lib'/,
+  );
+  assert.doesNotMatch(windows, /& \$Bash '-lc'/);
+  assert.match(windows, /& \$RuntimeExecutable --experimental --version/);
+  assert.doesNotMatch(windows, /Initialize-CompilerGitIdentity|GIT_DIR/);
+  assert.match(windows, /StartsWith\('file:\/\/'/);
+  assert.match(windows, /\$ExpectedPinUrl = "file:\/\/\$ExpectedPinPath"/);
+  assert.match(
+    windows,
+    /& \$Opam init --bare --no-setup --no-cygwin-setup default \$Repository/,
+  );
+  assert.match(
+    windows,
+    /& \$Opam switch create \$Switch --empty[^\r\n]*\r?\n\s*\$env:OPAMSWITCH = \$Switch/,
+  );
+  assert.match(windows, /\$env:OPAMJOBS = '1'/);
+  assert.match(windows, /\$env:DUNEJOBS = '1'/);
+  assert.match(windows, /\$env:MAKEFLAGS = '-j1'/);
+  assert.match(
+    windows,
+    /\$env:MAKEFLAGS = '-j1'[\s\S]+& \$Opam install --update-invariant 'ocaml-variants\.5\.3\.0'/,
+  );
+  assert.match(
+    windows,
+    /'compiler installation'\r?\n\s+Assert-CompilerIdentity \$CompilerRevision/,
+  );
+  assert.doesNotMatch(windows, /ocaml-option-flambda/);
+  assert.match(
+    windows,
+    /& \$Opam install --locked --update-invariant --deps-only '\.\\semgrep\.opam' \} 'dependency installation'/,
+  );
+  assert.match(
+    windows,
+    /'dependency installation'\r?\n\s+Assert-CompilerIdentity \$CompilerRevision/,
+  );
+  assert.match(windows, /\[Environment\]::SystemDirectory/);
+  assert.equal((windows.match(/& \$Tar /g) ?? []).length, 3);
+  assert.doesNotMatch(windows, /& tar\.exe\b/i);
   assert.match(windows, /3\.6\.10/);
   assert.match(windows, /x86_64-w64-mingw32-(?:gcc|objdump)/);
 });
@@ -288,6 +510,7 @@ test('native public-source builds smoke the literal closed scan template outside
     '--quiet',
     '--no-git-ignore',
     '--x-ignore-semgrepignore-files',
+    '--time',
     '--jobs=1',
     '--timeout=30',
     '--timeout-threshold=1',
@@ -465,6 +688,37 @@ test('archive fetch verifies before atomic persistence and reuses a valid cache'
   await assert.rejects(() => readFile(join(root, 'sha256', sha256)), /ENOENT/i);
 });
 
+test('archive fetch retries transient HTTP failures within a bounded attempt count', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'context-relay-semgrep-fetch-retry-'));
+  t.after(() => rm(root, { force: true, recursive: true }));
+  const bytes = Buffer.from('pinned retry archive');
+  const sha256 = digest('sha256', bytes);
+  const source = { url: 'https://example.invalid/archive', mirrors: [], supplementalChecksums: [], checksums: [{ algorithm: 'sha256', digest: sha256 }] };
+  const lock = { opam: { resolvedSourceArchives: [{ package: 'a', version: '1', targets: ['windows-x86_64'], opamPath: 'packages/a/a.1/opam', opamSha256: 'a'.repeat(64), licenses: ['MIT'], source, extraSources: [] }] } };
+  let calls = 0;
+  const failedBody = new Response('temporary failure', { status: 500 });
+  await fetchArchiveCache(lock, join(root, 'success'), {
+    fetchImpl: async () => ++calls === 1 ? failedBody : new Response(bytes),
+  });
+  assert.equal(calls, 2);
+  assert.deepEqual(await readFile(join(root, 'success', 'sha256', sha256)), bytes);
+  assert.equal((await failedBody.body.getReader().read()).done, true);
+  for (const [label, status, expectedCalls] of [['unavailable', 503, 3], ['missing', 404, 1]]) {
+    calls = 0;
+    await assert.rejects(() => fetchArchiveCache(lock, join(root, label), {
+      fetchImpl: async () => { calls += 1; return new Response('error', { status }); },
+    }), /HTTP/);
+    assert.equal(calls, expectedCalls);
+    await assert.rejects(() => readFile(join(root, label, 'sha256', sha256)), /ENOENT/);
+  }
+  calls = 0;
+  await assert.rejects(() => fetchArchiveCache(lock, join(root, 'drift'), {
+    fetchImpl: async () => ++calls === 1 ? new Response('retry', { status: 500 }) : new Response('drift'),
+  }), /checksum mismatch/);
+  assert.equal(calls, 2);
+  await assert.rejects(() => readFile(join(root, 'drift', 'sha256', sha256)), /ENOENT/);
+});
+
 test('archive fetch enforces one aggregate cache budget across downloads', async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'context-relay-semgrep-fetch-cap-'));
   t.after(() => rm(root, { force: true, recursive: true }));
@@ -600,6 +854,14 @@ test('complete bundle includes recursive git, opam records, pins, archives, and 
   await buildSemgrepSourceBundle({ ...options, outputPath: second });
   assert.deepEqual(await readFile(first), await readFile(second));
   const verified = await verifySemgrepSourceBundle({ bundlePath: first, sourceLockPath });
+  const supported = await buildSemgrepSourceBundle({
+    ...options,
+    outputPath: join(root, 'with-default-support.tar'),
+    supportPaths: undefined,
+    supportRoot: fileURLToPath(new URL('..', import.meta.url)),
+  });
+  const helperPath = 'third_party/sidecars/semgrep/windows-offline-firewall.ps1';
+  assert.equal(supported.digests[`support/${helperPath}`], digest('sha256', await readFile(new URL(`../${helperPath}`, import.meta.url))));
   for (const path of [
     'sources/semgrep/main.ml',
     'sources/semgrep/deps/sub/sub.ml',
@@ -631,6 +893,20 @@ test('complete bundle includes recursive git, opam records, pins, archives, and 
     (await verifyBundleEvidence({ bundlePath: first, evidencePath, sourceLockPath })).sha256,
     verified.sha256,
   );
+  Object.assign(evidence, {
+    byteIdentical: false,
+    independentBuilds: 1,
+    status: 'source_bundle_v1_native_builds_pending',
+  });
+  await writeFile(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`);
+  assert.equal(
+    (await verifyBundleEvidence({ bundlePath: first, evidencePath, sourceLockPath })).sha256,
+    verified.sha256,
+  );
+  Object.assign(evidence, {
+    byteIdentical: true,
+    independentBuilds: 2,
+  });
   evidence.status = 'complete_corresponding_source';
   await writeFile(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`);
   assert.equal(
@@ -651,4 +927,114 @@ test('complete bundle includes recursive git, opam records, pins, archives, and 
     () => verifyBundleEvidence({ bundlePath: first, evidencePath, sourceLockPath }),
     /evidence.*bundle|bundle.*evidence|size/i,
   );
+
+  await t.test('internal Windows source evidence binds completed bundled delivery without public promotion', async () => {
+    Object.assign(lock, {
+      completeCorrespondingSource: true,
+      missingMaterial: [],
+      targetStatus: [
+        { distributionTarget: 'windows-x86_64', enabled: true, reason: null },
+        { distributionTarget: 'aarch64-apple-darwin', enabled: false, reason: 'deferred_apple_native_qualification' },
+      ],
+    });
+    lock.opam.resolvedSourceArchivesComplete = true;
+    await writeFile(sourceLockPath, `${JSON.stringify(lock, null, 2)}\n`);
+    const bundlePath = join(root, 'internal.tar');
+    const built = await buildSemgrepSourceBundle({ ...options, outputPath: bundlePath });
+    const internal = {
+      schemaVersion: 2,
+      format: 'context-relay-semgrep-source-v1',
+      sourceLockSha256: digest('sha256', await readFile(sourceLockPath)),
+      bundleGeneratorSha256: digest('sha256', await readFile(new URL('./semgrep-source-bundle.mjs', import.meta.url))),
+      independentBuilds: 2,
+      byteIdentical: true,
+      status: 'complete_corresponding_source',
+      sourceDelivery: { kind: 'bundled', path: 'compliance/semgrep/semgrep-1.170.0-corresponding-source.tar' },
+      bundle: { sha256: built.sha256, size: built.size, payloadEntries: built.payloadEntries, recordedLinks: built.links },
+    };
+    const internalEvidencePath = join(root, 'bundle-evidence.internal-windows.v2.json');
+    const checkOptions = { bundlePath, evidencePath: internalEvidencePath, sourceLockPath };
+    const save = (value) => writeFile(internalEvidencePath, `${JSON.stringify(value, null, 2)}\n`);
+    await save(internal);
+    assert.equal(typeof sourceBundle.verifyInternalBundleEvidenceV2, 'function', 'completed internal bundled-source verification is required');
+    const actual = await sourceBundle.verifyInternalBundleEvidenceV2(checkOptions);
+    assert.equal(actual.sha256, digest('sha256', await readFile(bundlePath)));
+    await assert.rejects(() => verifyBundleEvidence(checkOptions), /fields|schema|asset/i);
+    await assert.rejects(
+      () => sourceBundle.verifyInternalBundleEvidenceV2({ ...checkOptions, evidencePath }),
+      /fields|schema|delivery/i,
+    );
+
+    for (const [label, change] of [
+      ['public delivery', (value) => { value.sourceAssetUrl = evidence.sourceAssetUrl; }],
+      ['alternate companion', (value) => { value.sourceDelivery.path = '../source.tar'; }],
+      ['missing delivery', (value) => { delete value.sourceDelivery; }],
+      ['unknown delivery field', (value) => { value.sourceDelivery.url = 'https://example.invalid/source.tar'; }],
+      ['wrong delivery kind', (value) => { value.sourceDelivery.kind = 'download'; }],
+      ['single build', (value) => { value.independentBuilds = 1; }],
+      ['pending source', (value) => { value.status = 'source_bundle_reproducible_native_builds_pending'; }],
+      ['unequal builds', (value) => { value.byteIdentical = false; }],
+      ['wrong schema', (value) => { value.schemaVersion = 1; }],
+      ['empty generator hash', (value) => { value.bundleGeneratorSha256 = '0'.repeat(64); }],
+      ['uppercase digest', (value) => { value.bundle.sha256 = 'A'.repeat(64); }],
+      ['oversized bundle', (value) => { value.bundle.size = 2147483649; }],
+      ['excessive entries', (value) => { value.bundle.payloadEntries = 1000001; }],
+      ['excessive links', (value) => { value.bundle.recordedLinks = 1000001; }],
+      ['wrong count', (value) => { value.bundle.payloadEntries += 1; }],
+      ['stale lock', (value) => { value.sourceLockSha256 = '1'.repeat(64); }],
+    ]) {
+      const invalid = structuredClone(internal);
+      change(invalid);
+      await save(invalid);
+      await assert.rejects(() => sourceBundle.verifyInternalBundleEvidenceV2(checkOptions), /bundle evidence|source delivery/i, label);
+    }
+    await writeFile(internalEvidencePath, `${JSON.stringify(internal, null, 2).slice(0, -1)},"schemaVersion":2}\n`);
+    await assert.rejects(() => sourceBundle.verifyInternalBundleEvidenceV2(checkOptions), /canonical|fields|JSON/i);
+    await writeFile(internalEvidencePath, `${JSON.stringify(internal, null, 2)}${' '.repeat(65536)}\n`);
+    await assert.rejects(() => sourceBundle.verifyInternalBundleEvidenceV2(checkOptions), /bounded|size/i);
+
+    for (const [label, change] of [
+      ['incomplete source', (value) => { value.completeCorrespondingSource = false; }],
+      ['pending material', (value) => { value.missingMaterial = ['native build']; }],
+      ['incomplete archive inventory', (value) => { value.opam.resolvedSourceArchivesComplete = false; }],
+      ['unqualified Windows', (value) => { value.targetStatus[0].enabled = false; }],
+      ['promoted Apple', (value) => { value.targetStatus[1].enabled = true; }],
+      ['missing deferral', (value) => { value.targetStatus[1].reason = null; }],
+      ['duplicate target', (value) => { value.targetStatus.push(value.targetStatus[0]); }],
+    ]) {
+      const invalidLock = structuredClone(lock);
+      change(invalidLock);
+      await writeFile(sourceLockPath, `${JSON.stringify(invalidLock, null, 2)}\n`);
+      await save({ ...internal, sourceLockSha256: digest('sha256', await readFile(sourceLockPath)) });
+      await assert.rejects(() => sourceBundle.verifyInternalBundleEvidenceV2(checkOptions), /source lock|target|incomplete/i, label);
+    }
+    await writeFile(sourceLockPath, `${JSON.stringify(lock, null, 2)}\n`);
+    await save(internal);
+    const changedLicensePath = join(root, 'changed-license.tar');
+    const changedLicense = await buildDeterministicTar({
+      outputPath: changedLicensePath,
+      entries: [
+        { path: 'metadata/source-lock.v1.json', bytes: await readFile(sourceLockPath), executable: false },
+        { path: `opam-repository/cache/sha256/${archiveSha256.slice(0, 2)}/${archiveSha256}`, bytes: archive, executable: false },
+        ...lock.licenseMaterials.map((material) => ({
+          path: material.path,
+          bytes: material.source === 'semgrep' ? Buffer.from('substituted license\n') : license,
+          executable: false,
+        })),
+      ],
+    });
+    await save({ ...internal, bundle: {
+      sha256: changedLicense.sha256,
+      size: changedLicense.size,
+      payloadEntries: changedLicense.payloadEntries,
+      recordedLinks: changedLicense.links,
+    } });
+    await assert.rejects(
+      () => sourceBundle.verifyInternalBundleEvidenceV2({ ...checkOptions, bundlePath: changedLicensePath }),
+      /license material/i,
+    );
+    await save(internal);
+    await writeFile(bundlePath, Buffer.from('substituted source'));
+    await assert.rejects(() => sourceBundle.verifyInternalBundleEvidenceV2(checkOptions), /bundle|tar/i);
+  });
 });

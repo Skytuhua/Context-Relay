@@ -15,7 +15,10 @@ CHECKOUT_ACTION_SHA=df4cb1c069e1874edd31b4311f1884172cec0e10
 UPLOAD_ACTION_SHA=043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
 DOWNLOAD_ACTION_SHA=37930b1c2abaa49bbe596cd826c3c89aef350131
 SOURCE_REVISION=bd614accba811b407ae5c9ec6f1eecd3bdc29911
+COMPILER_REVISION=3499e5708b0637c12d24d973dd103406a32b8fe8
 TREE_SITTER_SHA=e2b687f74358ab6404730b7fb1a1ced7ddb3780202d37595ecd7b20a8f41861f
+REQUIRED_HOMEBREW_FORMULAE='curl dwarfutils gmp libev libunwind-headers pcre2 pkgconf zstd'
+export HOMEBREW_NO_AUTO_UPDATE=1
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 WORKSPACE=$(CDPATH= cd -- "$SCRIPT_DIR/../../.." && pwd -P)
 CI_PROVENANCE=$SCRIPT_DIR/native-ci-provenance.v1.json
@@ -33,11 +36,15 @@ test "$(opam --version)" = 2.5.0 || die "opam 2.5.0 is required"
 "$NODE" -e '
   const fs = require("node:fs");
   const { createHash } = require("node:crypto");
-  const [path, sourceLockPath, checkout, setupNode, setupOcaml, upload, download] = process.argv.slice(1);
+  const [path, sourceLockPath, checkout, setupNode, setupOcaml, upload, download, formulae, compilerRevision] = process.argv.slice(1);
   const provenance = JSON.parse(fs.readFileSync(path, "utf8"));
-  const sourceLockHash = createHash("sha256").update(fs.readFileSync(sourceLockPath)).digest("hex");
+  const sourceLockBytes = fs.readFileSync(sourceLockPath);
+  const sourceLock = JSON.parse(sourceLockBytes);
+  const sourceLockHash = createHash("sha256").update(sourceLockBytes).digest("hex");
   if (provenance.schemaVersion !== 1 || provenance.sourceLock?.sha256 !== sourceLockHash
-      || provenance.sourceLock?.embeddedActionToolchainStatus !== "sealed-historical-metadata-non-authoritative-for-native-ci") {
+      || provenance.sourceLock?.embeddedActionToolchainStatus !== "sealed-historical-metadata-non-authoritative-for-native-ci"
+      || sourceLock.opam?.compiler?.package !== "ocaml-variants.5.3.0"
+      || sourceLock.opam?.compiler?.revision !== compilerRevision) {
     throw new Error("native CI source lock identity mismatch");
   }
   const actionKey = ({ action, distributionTarget = "" }) => `${action}\0${distributionTarget}`;
@@ -59,17 +66,33 @@ test "$(opam --version)" = 2.5.0 || die "opam 2.5.0 is required"
   if (provenance.toolchains.length !== 2 || toolchains.size !== 2 || !value || value.runner !== "macos-15"
       || value.ocamlCompiler !== "ocaml-variants.5.3.0+options,ocaml-option-flambda"
       || value.opamVersion !== "2.5.0" || value.nodeVersion !== "24.14.0"
+      || JSON.stringify(value.homebrewPackages) !== JSON.stringify(formulae.split(" "))
       || value.setupNodeAction !== `actions/setup-node@${setupNode}`
       || value.setupAction !== `semgrep/setup-ocaml@${setupOcaml}`) {
     throw new Error("native CI toolchain provenance mismatch");
   }
-' "$CI_PROVENANCE" "$SOURCE_LOCK" "$CHECKOUT_ACTION_SHA" "$NODE_ACTION_SHA" "$ACTION_SHA" "$UPLOAD_ACTION_SHA" "$DOWNLOAD_ACTION_SHA"
+' "$CI_PROVENANCE" "$SOURCE_LOCK" "$CHECKOUT_ACTION_SHA" "$NODE_ACTION_SHA" "$ACTION_SHA" "$UPLOAD_ACTION_SHA" "$DOWNLOAD_ACTION_SHA" "$REQUIRED_HOMEBREW_FORMULAE" "$COMPILER_REVISION"
 command -v otool >/dev/null
 command -v shasum >/dev/null
+command -v brew >/dev/null
+command -v git >/dev/null
+for formula in $REQUIRED_HOMEBREW_FORMULAE; do
+  brew list --versions "$formula" >/dev/null || die "required Homebrew formula is missing: $formula"
+done
+test -x /usr/bin/curl-config || die "the Apple system curl-config is required"
+/usr/bin/curl-config --libs >/dev/null || die "the Apple system libcurl configuration is unusable"
+for archive in \
+  "$(brew --prefix gmp)/lib/libgmp.a" \
+  "$(brew --prefix pcre2)/lib/libpcre2-8.a" \
+  "$(brew --prefix dwarfutils)/lib/libdwarf.a" \
+  "$(brew --prefix zstd)/lib/libzstd.a" \
+  "$(brew --prefix libev)/lib/libev.a"; do
+  test -f "$archive" || die "required static library is missing: $archive"
+done
 test -x /usr/bin/sandbox-exec || die "macOS sandbox-exec is required for an offline build"
 case "$WORK_ROOT" in /*) ;; *) die "WORK_ROOT must be absolute" ;; esac
 case "$OUTPUT_ROOT" in /*) ;; *) die "OUTPUT_ROOT must be absolute" ;; esac
-case "$WORK_ROOT" in /|"$HOME"|*[[:space:]]*) die "unsafe WORK_ROOT" ;; esac
+case "$WORK_ROOT" in /|"$HOME"|*[[:space:]]*|*'#'*) die "unsafe WORK_ROOT" ;; esac
 test ! -e "$WORK_ROOT" || die "WORK_ROOT must not already exist"
 test ! -e "$OUTPUT_ROOT" || die "OUTPUT_ROOT must not already exist"
 
@@ -106,13 +129,37 @@ assert_network_denied
 "$NODE" "$WORKSPACE/scripts/semgrep-source-bundle.mjs" --verify "$SOURCE_LOCK" "$SOURCE_BUNDLE" >/dev/null
 mkdir -p "$WORK_ROOT" "$OUTPUT_ROOT"
 umask 022
-export LC_ALL=C TZ=UTC SOURCE_DATE_EPOCH=0 OPAMYES=1 OPAMCOLOR=never OPAMDOWNLOADJOBS=1 OPAMRETRIES=0
+export LC_ALL=C TZ=UTC SOURCE_DATE_EPOCH=0 ZERO_AR_DATE=1 OPAMYES=1 OPAMCOLOR=never OPAMDOWNLOADJOBS=1 OPAMRETRIES=0
 export HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 ALL_PROXY=http://127.0.0.1:9
 export http_proxy=$HTTP_PROXY https_proxy=$HTTPS_PROXY all_proxy=$ALL_PROXY
-unset GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM
+unset GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_DIR
 
 pin() {
-  opam pin add --no-action "$1" "$CURRENT/bundle/pins/$2"
+  opam pin add --no-action "$1" "$CURRENT/pins/$2"
+}
+
+prepare_compiler_identity() {
+  compiler_git_dir=$1
+  compiler_revision=$2
+  # The verified local rsync pin intentionally has no VCS metadata, while the
+  # fork's configure script embeds `git rev-parse HEAD` in the compiler version.
+  git init --bare "$compiler_git_dir" >/dev/null
+  printf '%s\n' "$compiler_revision" > "$compiler_git_dir/HEAD"
+  test "$(git --git-dir="$compiler_git_dir" rev-parse HEAD)" = "$compiler_revision" ||
+    die "compiler Git identity preparation failed"
+}
+
+validate_compiler_identity() {
+  revision=$1
+  pin_identity=$(
+    opam pin list --normalise |
+      awk '$1 == "ocaml-variants.5.3.0" { print $2 " " $3 }'
+  )
+  test "$pin_identity" = "rsync file://$CURRENT/pins/$revision" ||
+    die "compiler pin identity mismatch"
+  compiler_version=$(opam exec -- ocamlc -version)
+  test "$compiler_version" = "5.3.0+semgrep-fork@$revision" ||
+    die "compiler embedded identity mismatch"
 }
 
 run_closed_scan() {
@@ -121,7 +168,7 @@ run_closed_scan() {
   target=$3
   stdout=$4
   stderr=$5
-  env -i HOME="$CURRENT/smoke-home" TMPDIR="$CURRENT/smoke-tmp" PATH="$CURRENT/empty-path" LC_ALL=C TZ=UTC \
+  env -i HOME="$CURRENT/smoke-home" TMPDIR="$CURRENT/smoke-tmp" PATH="/usr/bin:/bin" LC_ALL=C TZ=UTC \
     "$executable" scan \
       --experimental \
       --oss-only \
@@ -133,6 +180,7 @@ run_closed_scan() {
       --quiet \
       --no-git-ignore \
       --x-ignore-semgrepignore-files \
+      --time \
       --jobs=1 \
       --timeout=30 \
       --timeout-threshold=1 \
@@ -153,6 +201,35 @@ verify_smoke_results() {
   ' "$1" "$2" || die "closed scan result count mismatch"
 }
 
+normalize_smoke_evidence() {
+  "$NODE" -e '
+    const fs = require("node:fs");
+    const [cleanPath, findingPath, ...stderrPaths] = process.argv.slice(1);
+    for (const path of [cleanPath, findingPath]) {
+      const report = JSON.parse(fs.readFileSync(path, "utf8"));
+      if (!Object.hasOwn(report, "time") || !report.time
+          || typeof report.time !== "object" || Array.isArray(report.time)) {
+        throw new Error(`missing volatile Semgrep timing object: ${path}`);
+      }
+      delete report.time;
+      fs.writeFileSync(path, `${JSON.stringify(report)}\n`, { encoding: "utf8", flag: "w" });
+    }
+    const elapsedPrefix = /^\[\d+\.\d+\][ \t]*/gm;
+    for (const path of stderrPaths) {
+      const content = fs.readFileSync(path, "utf8");
+      const matches = content.match(elapsedPrefix) ?? [];
+      if (matches.length !== 1) throw new Error(`unexpected Semgrep elapsed-prefix count: ${path}`);
+      const normalized = content.replace(elapsedPrefix, "");
+      if (/^\[\d+\.\d+\]/m.test(normalized)) {
+        throw new Error(`volatile Semgrep elapsed prefix remains: ${path}`);
+      }
+      fs.writeFileSync(path, normalized, { encoding: "utf8", flag: "w" });
+    }
+  ' "$EVIDENCE/clean.json" "$EVIDENCE/finding.json" \
+    "$EVIDENCE/clean.stderr" "$EVIDENCE/finding.stderr" "$EVIDENCE/invalid.stderr" \
+    || die "smoke evidence normalization failed"
+}
+
 build_once() {
   label=$1
   CURRENT="$WORK_ROOT/current"
@@ -160,6 +237,11 @@ build_once() {
   mkdir -p "$CURRENT/bundle" "$CURRENT/home" "$CURRENT/tmp"
   tar -xf "$SOURCE_BUNDLE" -C "$CURRENT/bundle"
   "$NODE" "$WORKSPACE/scripts/semgrep-source-bundle.mjs" --materialize-links "$CURRENT/bundle" >/dev/null
+  "$NODE" "$CURRENT/bundle/support/scripts/apply-semgrep-source-patches.mjs" \
+    "$CURRENT/bundle/support/third_party/sidecars/semgrep/patches.v1.json" \
+    "$CURRENT/bundle" >/dev/null
+  cp -RL "$CURRENT/bundle/pins" "$CURRENT/pins"
+  test -z "$(find "$CURRENT/pins" -type l -print -quit)" || die "flattened pin sources retain symbolic links"
   PROJECT="$CURRENT/bundle/sources/semgrep"
   test -f "$PROJECT/Makefile" || die "Semgrep source is missing"
   test "$SOURCE_REVISION" = bd614accba811b407ae5c9ec6f1eecd3bdc29911
@@ -171,12 +253,15 @@ build_once() {
 
   export HOME="$CURRENT/home" TMPDIR="$CURRENT/tmp" OPAMROOT="$CURRENT/opam"
   opam init --bare --disable-sandboxing --no-setup default "$CURRENT/bundle/opam-repository"
-  opam option --global "archive-mirrors=file://$CURRENT/bundle/opam-repository/cache"
+  ARCHIVE_MIRROR="file://$CURRENT/bundle/opam-repository/cache"
+  opam option --global "archive-mirrors=[\"$ARCHIVE_MIRROR\"]"
   opam switch create "$CURRENT/switch" --empty
   eval "$(opam env --switch "$CURRENT/switch" --set-switch)"
 
-  pin ocaml-variants.5.3.0 3499e5708b0637c12d24d973dd103406a32b8fe8
-  opam install --update-invariant ocaml-variants.5.3.0 ocaml-option-flambda
+  COMPILER_GIT_DIR="$CURRENT/compiler-git"
+  prepare_compiler_identity "$COMPILER_GIT_DIR" "$COMPILER_REVISION"
+  pin ocaml-variants.5.3.0 "$COMPILER_REVISION"
+  GIT_DIR="$COMPILER_GIT_DIR" opam install --update-invariant ocaml-variants.5.3.0 ocaml-option-flambda
   pin pcre2.dev 4e0a44486bb518b7a24ca11286c4b03a8d51e17e
   pin tree-sitter.dev c4baff8d83b2e1f83f247acb11d0c9dafa5e48f7
   for package in testo.dev testo-util.dev testo-diff.dev testo-lwt.dev; do pin "$package" df18ea541c75c9acf75923218586c5ffe8915a04; done
@@ -190,11 +275,16 @@ build_once() {
   ./scripts/pick-lockfile.sh --strict semgrep.opam
   (
     cd libs/ocaml-tree-sitter-core
+    /usr/bin/patch -N -b -i patch/tree-sitter-0.22.6/0001-Makefile-backports.patch \
+      downloads/tree-sitter-0.22.6/Makefile
     ./configure
     ./scripts/install-tree-sitter-lib
   )
-  OPAMIGNOREPINDEPENDS=true opam install --locked --update-invariant --deps-only ./semgrep.opam ./dev/required.opam
-  ./scripts/validate-compiler-sha.sh
+  LWT_DISCOVER_ARGUMENTS='--use-libev true' \
+    LIBRARY_PATH="$(brew --prefix)/lib:${LIBRARY_PATH:-}" \
+    OPAMIGNOREPINDEPENDS=true \
+    opam install --locked --update-invariant --assume-depexts --deps-only ./semgrep.opam
+  validate_compiler_identity "$COMPILER_REVISION"
   opam exec -- make core
 
   EXECUTABLE="$PROJECT/_build/install/default/bin/osemgrep"
@@ -220,7 +310,7 @@ build_once() {
     esac
   done < "$EVIDENCE/runtime-dependencies.txt"
   SMOKE_FIXTURES="$CURRENT/smoke-fixtures"
-  mkdir -p "$CURRENT/empty-path" "$CURRENT/smoke-home" "$CURRENT/smoke-tmp" "$SMOKE_FIXTURES"
+  mkdir -p "$CURRENT/smoke-home" "$CURRENT/smoke-tmp" "$SMOKE_FIXTURES"
   printf '%s\n' \
     'rules:' \
     '  - id: context-relay-smoke' \
@@ -231,8 +321,8 @@ build_once() {
   printf '%s\n' 'rules: [' > "$SMOKE_FIXTURES/invalid-rule.yml"
   printf '%s\n' 'clean target' > "$SMOKE_FIXTURES/clean.txt"
   printf '%s\n' 'context-relay-finding' > "$SMOKE_FIXTURES/finding.txt"
-  env -i HOME="$CURRENT/smoke-home" TMPDIR="$CURRENT/smoke-tmp" PATH="$CURRENT/empty-path" \
-    "$DESTINATION/osemgrep" --version > "$EVIDENCE/version.txt"
+  env -i HOME="$CURRENT/smoke-home" TMPDIR="$CURRENT/smoke-tmp" PATH="/usr/bin:/bin" \
+    "$DESTINATION/osemgrep" --experimental --version > "$EVIDENCE/version.txt"
   if ! (cd "$SMOKE_FIXTURES" && run_closed_scan "$DESTINATION/osemgrep" rule.yml clean.txt \
       "$EVIDENCE/clean.json" "$EVIDENCE/clean.stderr"); then
     die "closed clean scan failed"
@@ -258,6 +348,7 @@ build_once() {
   if ! grep -Eiq 'invalid|error|parse|config|yaml' "$EVIDENCE/invalid.json" "$EVIDENCE/invalid.stderr"; then
     die "invalid rule evidence lacks a parse or config error"
   fi
+  normalize_smoke_evidence
   (
     cd "$DESTINATION"
     find . -type f ! -name MANIFEST.sha256 -print | sed 's#^\./##' | LC_ALL=C sort | while IFS= read -r file; do

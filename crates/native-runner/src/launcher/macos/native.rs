@@ -32,7 +32,7 @@ use super::{
     policy::{
         EntitlementSubject, EntitlementValue, GenerationJournal, GenerationLease,
         GenerationProcess, MachOInspection, ProcessOutcome, SignedGeneration,
-        validate_macho_closure,
+        validate_entitlements, validate_macho_closure,
     },
 };
 use crate::macos_spawn::{
@@ -45,12 +45,14 @@ const MAX_STDERR_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CODESIGN_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_TEMPLATE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_MATERIALS: usize = 64;
-const MAX_RUNTIME: Duration = Duration::from_secs(35);
+pub(super) const MAX_RUNTIME: Duration = Duration::from_secs(95);
 const MAX_CLEANUP_DEPTH: usize = 64;
 const MAX_CLEANUP_ENTRIES: usize = 100_000;
 const INFO_PLIST: &[u8] = include_bytes!("../../../resources/macos/Info.plist");
 const HELPER_ENTITLEMENTS: &[u8] =
     include_bytes!("../../../resources/macos/helper.entitlements.plist");
+const SIDECAR_ENTITLEMENTS: &[u8] =
+    include_bytes!("../../../resources/macos/sidecar.entitlements.plist");
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MacSourceMaterial {
@@ -58,6 +60,7 @@ pub struct MacSourceMaterial {
     source: PathBuf,
     size: u64,
     sha256: [u8; 32],
+    executable: bool,
 }
 
 impl MacSourceMaterial {
@@ -66,6 +69,7 @@ impl MacSourceMaterial {
         source: PathBuf,
         size: u64,
         sha256: [u8; 32],
+        executable: bool,
     ) -> Result<Self, MacPolicyError> {
         let relative_path = relative_path.into();
         validate_relative_path(&relative_path)?;
@@ -77,7 +81,34 @@ impl MacSourceMaterial {
             source,
             size,
             sha256,
+            executable,
         })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MacRuntimeMaterial {
+    relative_path: String,
+    size: u64,
+    sha256: [u8; 32],
+    executable: bool,
+}
+
+impl MacRuntimeMaterial {
+    pub fn relative_path(&self) -> &str {
+        &self.relative_path
+    }
+
+    pub const fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub const fn sha256(&self) -> &[u8; 32] {
+        &self.sha256
+    }
+
+    pub const fn executable(&self) -> bool {
+        self.executable
     }
 }
 
@@ -570,6 +601,7 @@ fn recovered_group_is_absent(pgid: Option<i32>) -> Result<bool, MacPolicyError> 
 pub struct PreparedGeneration {
     signed: SignedGeneration,
     inspections: Vec<NativeMachOInspection>,
+    runtime_materials: Vec<MacRuntimeMaterial>,
     process: MacGenerationProcess,
 }
 
@@ -584,6 +616,14 @@ impl PreparedGeneration {
 
     pub fn bundle_path(&self) -> &Path {
         &self.process.bundle
+    }
+
+    pub fn runtime_materials(&self) -> &[MacRuntimeMaterial] {
+        &self.runtime_materials
+    }
+
+    pub fn replace_input(&mut self, input: Vec<u8>) -> Result<(), MacPolicyError> {
+        self.process.replace_input(input)
     }
 
     pub fn into_process(self) -> MacGenerationProcess {
@@ -601,6 +641,7 @@ pub fn prepare_generation<J: GenerationJournal>(
     let mut guardian = None;
     let mut bundle_cleanup = None;
     let mut bundle_bound = false;
+    let mut stage = "guardian start";
 
     let prepared = (|| {
         let guardian_directory = open_absolute_directory(&private_root)?;
@@ -610,9 +651,12 @@ pub fn prepare_generation<J: GenerationJournal>(
             &guardian_name,
         )?);
         let guardian_ref = guardian.as_mut().ok_or(MacPolicyError::InvalidTransition)?;
+        stage = "guardian bind";
         journal.bind_guardian(&spec.id, guardian_ref.pgid())?;
+        stage = "helper template verification";
         verify_template(&spec.helper_template, spec.helper_sha256, guardian_ref)?;
 
+        stage = "bundle layout";
         let bundle = private_root.join(format!("{}.app", spec.id.as_str()));
         fs::create_dir(&bundle).map_err(|_| MacPolicyError::BundleIo)?;
         let bundle_name = c_name(&format!("{}.app", spec.id.as_str()))?;
@@ -636,9 +680,10 @@ pub fn prepare_generation<J: GenerationJournal>(
         }
         let contents = bundle.join("Contents");
         let macos = contents.join("MacOS");
-        let helpers = contents.join("Helpers/runtime");
+        let helpers_root = contents.join("Helpers");
+        let helpers = helpers_root.join("runtime");
         let resources = contents.join("Resources");
-        for directory in [&contents, &macos, &helpers, &resources] {
+        for directory in [&contents, &macos, &helpers_root, &helpers, &resources] {
             create_private_directory(directory)?;
         }
 
@@ -650,7 +695,10 @@ pub fn prepare_generation<J: GenerationJournal>(
         write_info_plist(&contents.join("Info.plist"), &spec.id)?;
         let entitlements = resources.join("helper.entitlements.plist");
         write_new(&entitlements, HELPER_ENTITLEMENTS)?;
+        let sidecar_entitlements = resources.join("sidecar.entitlements.plist");
+        write_new(&sidecar_entitlements, SIDECAR_ENTITLEMENTS)?;
 
+        stage = "sidecar material preparation";
         let mut sidecar_machos = Vec::new();
         for material in &spec.materials {
             let destination = helpers.join(&material.relative_path);
@@ -676,16 +724,22 @@ pub fn prepare_generation<J: GenerationJournal>(
         });
 
         for path in &sidecar_machos {
-            run_codesign(&MacCommand::sign_sidecar(path_text(path)?)?, guardian_ref)?;
+            run_codesign(
+                &MacCommand::sign_sidecar(path_text(path)?, path_text(&sidecar_entitlements)?)?,
+                guardian_ref,
+            )?;
             run_codesign(&MacCommand::verify_path(path_text(path)?)?, guardian_ref)?;
             let values = read_entitlements(path, guardian_ref)?;
-            if !values.is_empty() {
-                return Err(MacPolicyError::InvalidEntitlements);
-            }
+            let values = values
+                .iter()
+                .map(|(key, value)| (key.as_str(), *value))
+                .collect::<Vec<_>>();
+            validate_entitlements(EntitlementSubject::Sidecar, &values)?;
             fs::set_permissions(path, fs::Permissions::from_mode(0o500))
                 .map_err(|_| MacPolicyError::BundleIo)?;
         }
 
+        stage = "generation signing";
         fs::set_permissions(&helper, fs::Permissions::from_mode(0o500))
             .map_err(|_| MacPolicyError::BundleIo)?;
         let command_paths = MacCommandPaths::new(
@@ -700,6 +754,7 @@ pub fn prepare_generation<J: GenerationJournal>(
         run_codesign(&MacCommand::verify_strict(&command_paths), guardian_ref)?;
         verify_identity_and_runtime(&command_paths, &spec.id, guardian_ref)?;
 
+        stage = "Mach-O closure validation";
         let mut actual_machos = enumerate_machos(&bundle)?;
         actual_machos.sort();
         let helper_relative = relative_text(&bundle, &helper)?;
@@ -734,21 +789,41 @@ pub fn prepare_generation<J: GenerationJournal>(
             });
         }
         validate_macho_closure(&helper_relative, &expected, &policy_inspections)?;
+        stage = "runtime closure binding";
+        let runtime_materials = spec
+            .materials
+            .iter()
+            .map(|material| {
+                let path = helpers.join(&material.relative_path);
+                let (size, sha256) = digest_runtime_material(&path)?;
+                Ok(MacRuntimeMaterial {
+                    relative_path: material.relative_path.clone(),
+                    size,
+                    sha256,
+                    executable: material.executable,
+                })
+            })
+            .collect::<Result<Vec<_>, MacPolicyError>>()?;
+        stage = "bundle freeze";
         freeze_tree(&bundle)?;
         let signed_sha256 = generation_digest(&bundle)?;
+        stage = "container preflight";
         let container_parent = open_user_containers_directory()?;
         let container_name = c_name(spec.id.as_str())?;
         if HeldDirectory::open_at(&container_parent, &container_name)?.is_some() {
             return Err(MacPolicyError::InvalidTransition);
         }
+        stage = "helper code identity";
         let helper_file = open_verified_executable(&helper)?;
-        let helper_code_identity = capture_code_identity(&helper_file)?;
+        let helper_code_identity = capture_code_identity(&helper_file, &helper)?;
         let signed = SignedGeneration::new(spec.id.clone(), signed_sha256, bundle_identity);
+        stage = "journal finalize";
         journal.finalize(&signed)?;
 
         Ok(PreparedGeneration {
             signed,
             inspections,
+            runtime_materials,
             process: MacGenerationProcess::new(
                 bundle,
                 helper,
@@ -767,6 +842,8 @@ pub fn prepare_generation<J: GenerationJournal>(
     match prepared {
         Ok(prepared) => Ok(prepared),
         Err(original) => {
+            #[cfg(debug_assertions)]
+            eprintln!("macOS generation preparation failed at {stage}: {original:?}");
             let poison = journal.transition(
                 &spec.id,
                 GenerationState::Prepared,
@@ -831,6 +908,7 @@ pub struct MacGenerationProcess {
     container_directory: Option<HeldDirectory>,
     container_bound: bool,
     input: Option<Vec<u8>>,
+    input_replaced: bool,
     timeout: Duration,
     child: Option<MacChild>,
     guardian: Option<MacProcessGuardian>,
@@ -872,6 +950,7 @@ impl MacGenerationProcess {
             container_directory: None,
             container_bound: false,
             input: Some(input),
+            input_replaced: false,
             timeout,
             child: None,
             guardian: Some(guardian),
@@ -886,6 +965,21 @@ impl MacGenerationProcess {
             finished: false,
             cleaned: false,
         }
+    }
+
+    fn replace_input(&mut self, input: Vec<u8>) -> Result<(), MacPolicyError> {
+        if self.spawn_attempted
+            || self.resumed
+            || self.io_started
+            || self.input_replaced
+            || input.is_empty()
+            || input.len() > MAX_PROTOCOL_BYTES
+        {
+            return Err(MacPolicyError::InvalidTransition);
+        }
+        self.input = Some(input);
+        self.input_replaced = true;
+        Ok(())
     }
 
     fn capture_container(&mut self) -> Result<MacRootIdentity, MacPolicyError> {
@@ -945,15 +1039,28 @@ impl GenerationProcess for MacGenerationProcess {
 
     fn spawn_suspended(&mut self) -> Result<MacRootIdentity, MacPolicyError> {
         if self.spawn_attempted {
+            #[cfg(debug_assertions)]
+            eprintln!("macOS suspended spawn preflight failed: repeated attempt");
             return Err(MacPolicyError::InvalidTransition);
         }
         self.spawn_attempted = true;
-        let container_parent = self
-            .container_parent
-            .as_ref()
-            .ok_or(MacPolicyError::InvalidTransition)?;
-        if HeldDirectory::open_at(container_parent, &self.container_name)?.is_some() {
+        let Some(container_parent) = self.container_parent.as_ref() else {
+            #[cfg(debug_assertions)]
+            eprintln!("macOS suspended spawn preflight failed: missing container parent");
             return Err(MacPolicyError::InvalidTransition);
+        };
+        match HeldDirectory::open_at(container_parent, &self.container_name) {
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                #[cfg(debug_assertions)]
+                eprintln!("macOS suspended spawn preflight failed: container already exists");
+                return Err(MacPolicyError::InvalidTransition);
+            }
+            Err(error) => {
+                #[cfg(debug_assertions)]
+                eprintln!("macOS suspended spawn preflight failed: container lookup: {error:?}");
+                return Err(error);
+            }
         }
         let runtime = self.bundle.join("Contents/Helpers/runtime");
         let environment = [
@@ -973,10 +1080,41 @@ impl GenerationProcess for MacGenerationProcess {
             None,
             Some(pgid),
             &self.helper_code_identity,
-        )?;
-        guardian.ensure_alive()?;
+        )
+        .inspect_err(|_error| {
+            #[cfg(debug_assertions)]
+            eprintln!("macOS suspended spawn verification failed: {_error:?}");
+        })?;
+        guardian.ensure_alive().inspect_err(|_error| {
+            #[cfg(debug_assertions)]
+            eprintln!("macOS spawn guardian check failed: {_error:?}");
+        })?;
         self.child = Some(child);
-        self.capture_container()
+        self.child
+            .as_mut()
+            .ok_or(MacPolicyError::ProcessFailed)?
+            .resume()?;
+        let container_identity = self.capture_container().inspect_err(|_error| {
+            #[cfg(debug_assertions)]
+            eprintln!("macOS suspended container capture failed: {_error:?}");
+        })?;
+        self.child
+            .as_mut()
+            .ok_or(MacPolicyError::ProcessFailed)?
+            .suspend_and_verify(&self.helper_code_identity)
+            .inspect_err(|_error| {
+                #[cfg(debug_assertions)]
+                eprintln!("macOS container bootstrap suspension failed: {_error:?}");
+            })?;
+        self.guardian
+            .as_mut()
+            .ok_or(MacPolicyError::InvalidTransition)?
+            .ensure_alive()
+            .inspect_err(|_error| {
+                #[cfg(debug_assertions)]
+                eprintln!("macOS container bootstrap guardian check failed: {_error:?}");
+            })?;
+        Ok(container_identity)
     }
 
     fn confirm_container_bound(&mut self) {
@@ -1684,6 +1822,34 @@ fn copy_digest(
         return Err(MacPolicyError::TemplateMismatch);
     }
     Ok(digest)
+}
+
+fn digest_runtime_material(path: &Path) -> Result<(u64, [u8; 32]), MacPolicyError> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    let mut file = options.open(path).map_err(|_| MacPolicyError::BundleIo)?;
+    let metadata = file.metadata().map_err(|_| MacPolicyError::BundleIo)?;
+    if !metadata.file_type().is_file()
+        || metadata.nlink() != 1
+        || metadata.len() == 0
+        || metadata.len() > MAX_TEMPLATE_BYTES
+    {
+        return Err(MacPolicyError::InvalidMachOClosure);
+    }
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|_| MacPolicyError::BundleIo)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok((metadata.len(), hasher.finalize().into()))
 }
 
 fn run_codesign(
