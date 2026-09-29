@@ -230,9 +230,10 @@ original plan, and is recorded so the limit of this pass is visible:
   real response header. Worth keeping in mind that "the dev server looks broken"
   and "the app is broken" are separate claims, and measuring both is cheap.
 
-  One finding: `index.html` repeats the full CSP in a `<meta http-equiv>` tag, and
-  the browser logs an error for `frame-ancestors` because that directive is ignored
-  when delivered that way. Tauri injects a byte-identical policy as a real header
-  from `tauri.conf.json`, so the shipped app is protected and the meta tag is
-  redundant rather than dangerous. Worth knowing the browser ignores the directive
-  it looks like it is enforcing.
+  One finding, now fixed in #40: `index.html` repeats the full CSP in a
+  `<meta http-equiv>` tag, and browsers ignore `frame-ancestors` when it arrives that
+  way, so the document advertised clickjacking protection it did not have and logged
+  an error on every load. Tauri injects a byte-identical policy as a real header
+  from `tauri.conf.json`, so the shipped app was never actually exposed. #40 removes
+  the directive from the meta copy only, leaving the enforced policy untouched and
+  the misleading one gone.
