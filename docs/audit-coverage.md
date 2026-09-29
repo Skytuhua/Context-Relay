@@ -69,12 +69,43 @@ declared platform and reject NUL bytes, containment checks compare
 `canonicalize()`d paths rather than raw strings, and native-state writes are staged and
 `fsync`ed before rename.
 
+**Workspace parameter handling** (`contextd/src/lib.rs`, `core/src/service.rs`) —
+the 37 workspace-queue handlers were walked for the request types that carry
+attacker-influenced data. Registering a project validates both the identity and the
+path before touching the database, and refuses to rebind an existing project to a
+different path or name, so a repeated registration cannot redirect a bound project.
+`WireNativeValue::validate` is called on *deserialization* as well as on use, so an
+oversized path never reaches a handler. Memory search rejects an empty query,
+resolves and authorizes the scope before searching, and caps results at 100. The
+lexical half of the search goes through `quote_fts_query`, which wraps the query in
+double quotes and doubles any embedded quote — the documented FTS5 escape — so the
+`MATCH` clause is not injectable, and it is bound as a parameter rather than
+interpolated.
+
+**Recovery enrollment** (`contextd/src/recovery_enrollment*`, ~3.1k lines) — the
+phrase is BIP39 with a checksum: `from_words` parses through
+`Mnemonic::parse_in(Language::English)` and requires exactly 24 words, so a wrong
+phrase fails the checksum before any key derivation runs. Entropy is 256-bit and
+both the parsed and stored phrase live in `Zeroizing`, with an explicit `drop` of
+the phrase immediately after derivation. `authenticate_recovery_root` verifies
+entirely locally against the canonical record — digest, then derivation, then public
+key match — so there is no online oracle to rate-limit. The membership walk is
+fail-closed: a repeated `state_sha256` is rejected via a `BTreeSet` seen-set, and
+the object count is capped by `BUDGET.max_events`.
+
+**Ledger transaction integrity** (`vault/native_transactions.rs`,
+`native_transaction/journal.rs`) — every state change runs inside a SQL
+transaction, and the step transition uses a compare-and-swap `UPDATE` that fails if
+`changed != 1`, so a concurrent writer is detected rather than overwritten. Step
+entry is idempotent, which is what lets crash recovery re-enter a step it had
+already entered. `commit_native_success` cross-checks the legacy and native
+receipts against each other (target counts, per-target fingerprints, duplicate
+targets) and is idempotent on replay. The journal releases its profile lock on
+every error path and composes both the primary and the compensation error when a
+rollback also fails. The gap found here was in the tests rather than the code, and
+is now covered by #35.
+
 ## Not yet reviewed
 
-- Per-handler parameter validation inside `contextd`'s workspace queue. Command
-  *authorization* is verified (see above); the individual handlers were not each
-  walked for input validation.
-- `contextd` shutdown and ledger transaction integrity, including crash-during-write
-  behaviour.
 - `hosted_auth` / `hosted_sync` state machines and retry backoff.
-- `bridge_install` (2.1k lines) and `recovery_enrollment` (2.7k lines).
+- `bridge_install` (2.1k lines).
