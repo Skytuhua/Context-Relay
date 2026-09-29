@@ -1,0 +1,35 @@
+{
+  "version": "2.1.202",
+  "executableSha256": "7ff0787ebdc19fc509ccea8886ebf6a53ad8213407fa3a2b7c6d1446efc419f6",
+  "evidence": "Pure key helpers extracted from the pinned executable; no full session or repository-root qualification.",
+  "cases": [
+    {
+      "input": "C:\\Work\\project with spaces",
+      "key": "C--Work-project-with-spaces"
+    },
+    {
+      "input": "C:\\Work\\專案🚀",
+      "key": "C--Work-----"
+    },
+    {
+      "input": "/Users/test/project_é🚀",
+      "key": "-Users-test-project----"
+    },
+    {
+      "input": "C:\\aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "key": "C--aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "input": "C:\\aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "key": "C--aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-8x5zet"
+    },
+    {
+      "input": "C:\\long directory\\long directory\\long directory\\long directory\\long directory\\long directory\\long directory\\long directory\\long directory\\long directory\\long directory\\long directory\\long directory\\long directory\\long directory\\long directory\\long directory\\long directory\\long directory\\long directory\\專案🚀",
+      "key": "C--long-directory-long-directory-long-directory-long-directory-long-directory-long-directory-long-directory-long-directory-long-directory-long-directory-long-directory-long-directory-long-directory-lo-fvbrc"
+    },
+    {
+      "input": "/tmp/é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀é🚀",
+      "key": "-tmp-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------dkd71j"
+    }
+  ]
+}

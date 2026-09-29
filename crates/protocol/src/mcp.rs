@@ -209,9 +209,8 @@ impl HandoffPayload {
 
 impl StatusOutput {
     pub fn validate(&self) -> Result<(), ValidationError> {
-        if self.protocol.min.major != crate::PROTOCOL_MAJOR
-            || self.protocol.max.major != crate::PROTOCOL_MAJOR
-            || !(self.protocol.min.minor..=self.protocol.max.minor).contains(&crate::PROTOCOL_MINOR)
+        if self.protocol.min != crate::PROTOCOL_VERSION
+            || self.protocol.max != crate::PROTOCOL_VERSION
         {
             return Err(ValidationError::Invalid("status.protocol"));
         }
@@ -389,24 +388,17 @@ pub fn mcp_schema(name: &str) -> Option<McpToolSchema> {
         _ => return None,
     };
     let mut input = strict(required, properties);
+    // Claude drops MCP tools with root anyOf/oneOf/allOf. Conditional schemas
+    // preserve the same cross-field constraints without those root keywords.
     if name == "context_relay_upsert_task" {
-        input.as_object_mut().expect("schema object").insert(
-            "anyOf".into(),
-            json!([
-                {"properties":{"taskId":{"type":"null"},"expectedRevision":{"type":"null"}}},
-                {"properties":{"taskId":uuid(),"expectedRevision":uuid()},"required":["taskId","expectedRevision"]}
-            ]),
-        );
+        input["if"] = json!({"properties":{"taskId":uuid()},"required":["taskId"]});
+        input["then"] =
+            json!({"properties":{"expectedRevision":uuid()},"required":["expectedRevision"]});
+        input["else"] = json!({"properties":{"expectedRevision":{"type":"null"}}});
     }
     if name == "context_relay_create_handoff" {
-        input.as_object_mut().expect("schema object").insert(
-            "anyOf".into(),
-            json!([
-                {"properties":{"memoryIds":{"type":"array","minItems":1}},"required":["memoryIds"]},
-                {"properties":{"decisionIds":{"type":"array","minItems":1}},"required":["decisionIds"]},
-                {"properties":{"taskIds":{"type":"array","minItems":1}},"required":["taskIds"]}
-            ]),
-        );
+        input["if"] = json!({"properties":{"memoryIds":{"type":"array","maxItems":0},"decisionIds":{"type":"array","maxItems":0}}});
+        input["then"] = json!({"properties":{"taskIds":{"type":"array","minItems":1}}});
     }
     Some(McpToolSchema {
         input,
@@ -612,9 +604,8 @@ fn readable_record() -> Value {
     json!({"oneOf":[{"type":"object","properties":{"kind":{"const":"memory"},"record":memory()},"required":["kind","record"],"additionalProperties":false},{"type":"object","properties":{"kind":{"const":"instruction"},"record":instruction()},"required":["kind","record"],"additionalProperties":false}]})
 }
 fn protocol_range() -> Value {
-    let min = json!({"type":"object","properties":{"major":{"const":crate::PROTOCOL_MAJOR},"minor":{"type":"integer","minimum":0,"maximum":crate::PROTOCOL_MINOR}},"required":["major","minor"],"additionalProperties":false});
-    let max = json!({"type":"object","properties":{"major":{"const":crate::PROTOCOL_MAJOR},"minor":{"type":"integer","minimum":crate::PROTOCOL_MINOR,"maximum":65535}},"required":["major","minor"],"additionalProperties":false});
-    json!({"type":"object","properties":{"min":min,"max":max},"required":["min","max"],"additionalProperties":false})
+    let version = json!({"type":"object","properties":{"major":{"const":crate::PROTOCOL_MAJOR},"minor":{"const":crate::PROTOCOL_MINOR}},"required":["major","minor"],"additionalProperties":false});
+    json!({"type":"object","properties":{"min":version.clone(),"max":version},"required":["min","max"],"additionalProperties":false})
 }
 
 fn decimal_u64() -> Value {

@@ -1,0 +1,353 @@
+param([Parameter(Mandatory = $true)][string]$OutputRoot)
+
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+$PSNativeCommandUseErrorActionPreference = $false
+function Fail([string]$Message) { throw $Message }
+. (Join-Path $PSScriptRoot 'windows-offline-firewall.ps1')
+
+function Convert-WfpBlockedEvent([xml]$EventXml) {
+  $Fields = @{}
+  foreach ($Entry in $EventXml.Event.EventData.Data) { $Fields[[string]$Entry.Name] = [string]$Entry.InnerText }
+  $Result = [ordered]@{ timestamp = [string]$EventXml.Event.System.TimeCreated.SystemTime }
+  foreach ($Pair in ([ordered]@{
+    applicationPath = 'Application'; pid = 'ProcessID'; destinationIp = 'DestAddress'
+    destinationPort = 'DestPort'; protocol = 'Protocol'; filterId = 'FilterRTID'
+  }).GetEnumerator()) {
+    $Value = [string]$Fields[$Pair.Value]
+    $Result[$Pair.Key] = $Value.Substring(0, [Math]::Min(1024, $Value.Length))
+  }
+  return [pscustomobject]$Result
+}
+
+function Read-AuditPolicyCsv([string]$Csv) {
+  if ($Csv.Length -eq 0 -or $Csv.Length -gt 1048576 -or $Csv.Contains([char]0)) { throw 'invalid audit CSV size or content' }
+  if ($Csv.StartsWith([string][char]0xFEFF, [StringComparison]::Ordinal)) { $Csv = $Csv.Substring(1) }
+  # Exact seven-column Microsoft audit CSV header, including option and per-user rows:
+  # https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-gpac/6494a0f2-8a16-40e2-b87d-328be7d732e0
+  $Header = 'Machine Name,Policy Target,Subcategory,Subcategory GUID,Inclusion Setting,Exclusion Setting,Setting Value'
+  $Parser = [Microsoft.VisualBasic.FileIO.TextFieldParser]::new([IO.StringReader]::new($Csv))
+  $Parser.SetDelimiters(',')
+  $Parser.HasFieldsEnclosedInQuotes = $true
+  $Parser.TrimWhiteSpace = $false
+  $Rows = [Collections.Generic.Dictionary[string,string[]]]::new([StringComparer]::Ordinal)
+  try {
+    $Fields = $Parser.ReadFields()
+    if ($null -eq $Fields -or $Fields.Count -ne 7 -or
+        -not [string]::Equals(($Fields -join ','), $Header, [StringComparison]::Ordinal)) { throw 'invalid audit CSV header' }
+    while (-not $Parser.EndOfData) {
+      $Fields = $Parser.ReadFields()
+      if ($Fields.Count -ne 7 -or $Rows.Count -ge 4096 -or @($Fields | Where-Object Length -gt 4096).Count) {
+        throw 'invalid audit CSV row shape or bound'
+      }
+      $Key = ConvertTo-Json -InputObject $Fields[0..3] -Compress
+      # Reject repeated identities, including identical duplicates; never silently overwrite policy.
+      if ($Rows.ContainsKey($Key)) { throw 'duplicate audit CSV identity' }
+      $Rows.Add($Key, $Fields)
+    }
+    if ($Rows.Count -eq 0) { throw 'empty audit CSV policy' }
+    return ,$Rows
+  } finally {
+    $Parser.Dispose()
+  }
+}
+
+function Compare-AuditPolicyCsv([string]$BeforeCsv, [string]$AfterCsv) {
+  $Before = Read-AuditPolicyCsv $BeforeCsv
+  $After = Read-AuditPolicyCsv $AfterCsv
+  $Missing = @($Before.Keys | Where-Object { -not $After.ContainsKey($_) }).Count
+  $Extra = @($After.Keys | Where-Object { -not $Before.ContainsKey($_) }).Count
+  $Changed = 0
+  $ChangedFields = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+  $Names = @('Machine Name', 'Policy Target', 'Subcategory', 'Subcategory GUID', 'Inclusion Setting', 'Exclusion Setting', 'Setting Value')
+  foreach ($Key in $Before.Keys) {
+    if (-not $After.ContainsKey($Key)) { continue }
+    $Different = $false
+    for ($Index = 0; $Index -lt 7; $Index++) {
+      if (-not [string]::Equals($Before[$Key][$Index], $After[$Key][$Index], [StringComparison]::Ordinal)) {
+        $Different = $true
+        [void]$ChangedFields.Add($Names[$Index])
+      }
+    }
+    if ($Different) { $Changed++ }
+  }
+  # Only counts and fixed field names leave this function; never policy targets or row values.
+  return [pscustomobject]@{
+    equal = ($Missing -eq 0 -and $Extra -eq 0 -and $Changed -eq 0)
+    beforeRows = $Before.Count; afterRows = $After.Count
+    missingRows = $Missing; extraRows = $Extra; changedRows = $Changed
+    changedFields = @($ChangedFields | Sort-Object)
+  }
+}
+
+function Get-ConnectionAuditFlags([string]$Csv) {
+  $Rows = Read-AuditPolicyCsv $Csv
+  $Selected = [Collections.Generic.List[string[]]]::new()
+  foreach ($Row in $Rows.Values) {
+    if ([string]::Equals($Row[1], 'System', [StringComparison]::Ordinal) -and
+        [string]::Equals($Row[3], '{0CCE9226-69AE-11D9-BED3-505054503030}', [StringComparison]::OrdinalIgnoreCase)) {
+      $Selected.Add($Row)
+    }
+  }
+  if ($Selected.Count -ne 1) { throw 'system connection audit row is missing or ambiguous' }
+  $Row = $Selected[0]
+  if ($Row[6] -notmatch '\A[0-3]\z' -or $Row[5].Length -ne 0) { throw 'system connection audit flags are unsupported' }
+  $Flags = [int]$Row[6]
+  $Labels = @('No Auditing', 'Success', 'Failure', 'Success and Failure')
+  if (-not [string]::Equals($Row[4], $Labels[$Flags], [StringComparison]::Ordinal)) {
+    throw 'system connection audit flags are ambiguous'
+  }
+  return [pscustomobject]@{
+    success = $(if ($Flags -band 1) { 'enable' } else { 'disable' })
+    failure = $(if ($Flags -band 2) { 'enable' } else { 'disable' })
+  }
+}
+
+function Get-CandidateProcessSnapshot {
+  # Observed names identify candidates, not authorized roles or trusted provenance. These
+  # post-checkout snapshots do not bind a running process image to the file hashed on disk.
+  # Signature calls run outside isolation; the job timeout remains their outer time bound.
+  $Snapshot = [ordered]@{
+    capturedAt = [DateTime]::UtcNow.ToString('o'); purpose = 'candidate-identities-not-authorization'
+    limit = 16; truncated = $false; queryError = $null; candidates = @()
+  }
+  $NamePattern = '\A(?:hosted-compute-agent(?:\.exe)?|provjobd\.exe[0-9]+|WaAppAgent\.exe|WindowsAzureGuestAgent\.exe)\z'
+  try {
+    $Processes = @(Get-CimInstance -ClassName Win32_Process -Property Name,ProcessId,ParentProcessId,CreationDate,ExecutablePath -Filter "Name = 'hosted-compute-agent' OR Name = 'hosted-compute-agent.exe' OR Name LIKE 'provjobd.exe%' OR Name = 'WaAppAgent.exe' OR Name = 'WindowsAzureGuestAgent.exe'" -ErrorAction Stop |
+      Where-Object { [regex]::IsMatch([string]$_.Name, $NamePattern, 'IgnoreCase,CultureInvariant') } | Select-Object -First 17)
+  } catch {
+    $Snapshot.queryError = 'process-query-unavailable'
+    return [pscustomobject]$Snapshot
+  }
+  $Snapshot.truncated = $Processes.Count -gt 16
+  $Snapshot.candidates = @(foreach ($Process in ($Processes | Select-Object -First 16)) {
+    $Name = [string]$Process.Name
+    $Path = [string]$Process.ExecutablePath
+    $Candidate = [ordered]@{
+      candidateName = $Name.Substring(0, [Math]::Min(128, $Name.Length))
+      pid = [uint32]$Process.ProcessId; parentPid = [uint32]$Process.ParentProcessId
+      createdAt = $(if ($null -ne $Process.CreationDate) { ([DateTime]$Process.CreationDate).ToUniversalTime().ToString('o') } else { $null })
+      executablePath = $Path.Substring(0, [Math]::Min(1024, $Path.Length))
+      sha256 = $null; authenticodeStatus = $null; signerThumbprint = $null; error = $null
+    }
+    if ($Path.Length -gt 1024 -or $Path -notmatch '\A[A-Za-z]:\\' -or
+        $Path.Substring(2).Contains(':') -or ($Path -split '\\') -contains '..') {
+      $Candidate.error = 'unsupported-path'
+    } else {
+      try {
+        $Part = $Path
+        while (-not [string]::IsNullOrEmpty($Part)) {
+          $Item = Get-Item -LiteralPath $Part -Force -ErrorAction Stop
+          if (($Item.Attributes -band ([IO.FileAttributes]::ReparsePoint -bor [IO.FileAttributes]::Device)) -ne 0 -or
+              ($Part -eq $Path -and $Item.PSIsContainer) -or ($Part -ne $Path -and -not $Item.PSIsContainer)) {
+            $Candidate.error = 'unsafe-file'; break
+          }
+          if ($Part -eq $Path -and $Item.Length -gt 268435456) { $Candidate.error = 'file-too-large'; break }
+          $Part = [IO.Path]::GetDirectoryName($Part)
+        }
+        if ($null -eq $Candidate.error) {
+          $Hash = [string](Get-FileHash -Algorithm SHA256 -LiteralPath $Path -ErrorAction Stop).Hash
+          if ($Hash -notmatch '\A[0-9A-Fa-f]{64}\z') { throw 'invalid hash result' }
+          $Candidate.sha256 = $Hash
+          $Candidate.error = 'signature-unavailable'
+          $Signature = Get-AuthenticodeSignature -LiteralPath $Path -ErrorAction Stop
+          $Status = [string]$Signature.Status
+          $Candidate.authenticodeStatus = $Status.Substring(0, [Math]::Min(64, $Status.Length))
+          if ($null -ne $Signature.SignerCertificate) {
+            $Thumbprint = [string]$Signature.SignerCertificate.Thumbprint
+            if ($Thumbprint -notmatch '\A[0-9A-Fa-f]{40,128}\z') { throw 'invalid signer thumbprint' }
+            $Candidate.signerThumbprint = $Thumbprint
+          }
+          $Candidate.error = $null
+        }
+      } catch {
+        if ($null -eq $Candidate.error) { $Candidate.error = 'file-unavailable' }
+      }
+    }
+    [pscustomobject]$Candidate
+  })
+  return [pscustomobject]$Snapshot
+}
+
+function Get-JobAncestrySnapshot([pscustomobject]$Candidates, [pscustomobject]$Previous = $null) {
+  # A bounded, contemporaneous CIM observation only; it is not vendor attestation,
+  # historical ancestry proof, process-image binding, or permission to allow network traffic.
+  $Snapshot = [ordered]@{
+    capturedAt = [DateTime]::UtcNow.ToString('o'); purpose = 'observed-job-ancestry-only'
+    limit = 32; termination = 'root'; nodes = @()
+  }
+  $Nodes = [Collections.Generic.List[object]]::new()
+  $Visited = [Collections.Generic.HashSet[uint32]]::new()
+  [uint32]$NextProcessId = $PID
+  $ChildCreated = $null
+  while ($NextProcessId -ne 0 -and $Nodes.Count -lt 32) {
+    if (-not $Visited.Add($NextProcessId)) { $Snapshot.termination = 'cycle'; break }
+    $Failure = 'query-unavailable'
+    try {
+      $Found = @(Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $NextProcessId" -Property ProcessId,ParentProcessId,CreationDate,ExecutablePath -ErrorAction Stop | Select-Object -First 2)
+      if ($Found.Count -eq 0) { $Snapshot.termination = 'missing-process'; break }
+      if ($Found.Count -ne 1) { $Snapshot.termination = 'ambiguous-process'; break }
+      $Failure = 'invalid-process-metadata'
+      $Process = $Found[0]
+      if ([uint32]$Process.ProcessId -ne $NextProcessId) { $Snapshot.termination = 'pid-mismatch'; break }
+      if ($null -eq $Process.CreationDate) { $Snapshot.termination = 'missing-creation'; break }
+      $Created = ([DateTime]$Process.CreationDate).ToUniversalTime()
+      if ($null -ne $ChildCreated -and $Created -gt $ChildCreated) {
+        $Snapshot.termination = 'parent-created-after-child'; break
+      }
+      $Path = [string]$Process.ExecutablePath
+      $Node = [ordered]@{
+        pid = $NextProcessId; parentPid = [uint32]$Process.ParentProcessId; createdAt = $Created.ToString('o')
+        executablePath = $Path.Substring(0, [Math]::Min(1024, $Path.Length))
+        candidateIndex = $null; candidateMatch = 'unmatched'; previousIdentity = 'not-compared'
+      }
+      if ($null -ne $Previous) {
+        $PriorNodes = @($Previous.nodes | Select-Object -First 32 | Where-Object pid -eq $NextProcessId)
+        $Node.previousIdentity = 'not-observed-before'
+        if ($PriorNodes.Count -eq 1) {
+          $Node.previousIdentity = if ([string]::Equals($PriorNodes[0].createdAt, $Node.createdAt, [StringComparison]::Ordinal)) {
+            'same-pid-and-creation'
+          } else { 'pid-reused' }
+        }
+      }
+      $MatchesAt = [Collections.Generic.List[int]]::new()
+      $CandidateRows = @($Candidates.candidates | Select-Object -First 16)
+      for ($Index = 0; $Index -lt $CandidateRows.Count; $Index++) {
+        if ($CandidateRows[$Index].pid -eq $Node.pid -and
+            [string]::Equals($CandidateRows[$Index].createdAt, $Node.createdAt, [StringComparison]::Ordinal)) {
+          $MatchesAt.Add($Index)
+        }
+      }
+      if ($MatchesAt.Count -gt 1) { $Node.candidateMatch = 'duplicate-identity' }
+      elseif ($MatchesAt.Count -eq 1 -and $Node.previousIdentity -ne 'pid-reused') {
+        $Node.candidateIndex = $MatchesAt[0]; $Node.candidateMatch = 'pid-and-creation'
+      }
+      $Nodes.Add([pscustomobject]$Node)
+      $ChildCreated = $Created
+      $NextProcessId = $Node.parentPid
+    } catch {
+      $Snapshot.termination = $Failure; break
+    }
+  }
+  if ($Nodes.Count -eq 32 -and $NextProcessId -ne 0) { $Snapshot.termination = 'limit' }
+  $Snapshot.nodes = $Nodes.ToArray()
+  return [pscustomobject]$Snapshot
+}
+
+# This changes host policy: only the disposable GitHub-hosted Windows 2022 job may run it.
+if (-not $IsWindows -or $env:GITHUB_ACTIONS -ne 'true' -or
+    $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or $env:RUNNER_OS -ne 'Windows' -or
+    $env:ImageOS -ne 'win22' -or $env:CONTEXT_RELAY_RUNNER_IMAGE -ne 'windows-2022') {
+  Fail 'firewall diagnostics require an ephemeral windows-2022 GitHub Actions runner'
+}
+$OutputRoot = [IO.Path]::GetFullPath($OutputRoot)
+$TempRoot = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\') + '\'
+if (-not $OutputRoot.StartsWith($TempRoot, [StringComparison]::OrdinalIgnoreCase) -or
+    (Test-Path -LiteralPath $OutputRoot)) { Fail 'diagnostic output must be a new runner-temp directory' }
+New-Item -ItemType Directory -Path $OutputRoot | Out-Null
+$Auditpol = Join-Path ([Environment]::SystemDirectory) 'auditpol.exe'
+# Capture all policy rows, but restore only the system subcategory this diagnostic changes.
+# https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/auditpol-set
+$AuditBackup = Join-Path $env:RUNNER_TEMP "$([Guid]::NewGuid().ToString('N')).audit.csv"
+$AuditRestored = "$AuditBackup.restored"
+# https://learn.microsoft.com/en-us/windows/win32/fwp/auditing-and-logging
+$ConnectionAudit = '{0CCE9226-69AE-11D9-BED3-505054503030}'
+$Report = [ordered]@{
+  schemaVersion = 1; purpose = 'short-firewall-diagnostic-not-release-qualification'
+  observationSeconds = 120; baselineConnected = $false; isolatedShellDenied = $false
+  firewallRestored = $false; auditRestored = $false; postRestoreConnected = $false
+  failureStage = $null; eventLimit = 256; eventsTruncated = $false; blockedConnections = @()
+  auditVerification = [ordered]@{ restoreExitCode = $null; backupExitCode = $null; comparison = $null }
+  candidateProcessesBefore = $null; candidateProcessesAfter = $null
+  jobAncestryBefore = $null; jobAncestryAfter = $null
+}
+$Stage = 'baseline'
+$AuditSaved = $false
+$FirewallRestored = $false
+$Started = [DateTime]::UtcNow
+$Ended = $Started
+try {
+  $Address = [Net.Dns]::GetHostAddresses('github.com') |
+    Where-Object AddressFamily -eq ([Net.Sockets.AddressFamily]::InterNetwork) | Select-Object -First 1
+  if ($null -eq $Address -or -not (Test-OutboundTcp $Address)) { Fail 'baseline connection failed' }
+  $Report.baselineConnected = $true
+  $Report.candidateProcessesBefore = Get-CandidateProcessSnapshot
+  $Report.jobAncestryBefore = Get-JobAncestrySnapshot $Report.candidateProcessesBefore
+  $Stage = 'audit-setup'
+  & $Auditpol /backup "/file:$AuditBackup" 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0) { Fail 'audit backup failed' }
+  if ((Get-Item -LiteralPath $AuditBackup).Length -gt 1048576) { Fail 'audit CSV file exceeds bound' }
+  $OriginalAuditFlags = Get-ConnectionAuditFlags ([IO.File]::ReadAllText($AuditBackup, [Text.UTF8Encoding]::new($false, $true)))
+  # Unsupported initial representations fail before any audit policy mutation.
+  $AuditSaved = $true
+  & $Auditpol /set "/subcategory:$ConnectionAudit" /failure:enable 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0) { Fail 'audit enable failed' }
+  $Stage = 'isolated-window'
+  $Started = [DateTime]::UtcNow
+  Invoke-WindowsOfflineFirewall {
+    # Entry occurs only after the shared policy's hostile shell TCP probe was denied.
+    $Report.isolatedShellDenied = $true
+    Start-Sleep -Seconds 120
+  } -RestorationVerified ([ref]$FirewallRestored)
+} catch {
+  # Never export exception text (native tools can include unrelated host data).
+  $Report.failureStage = $Stage
+} finally {
+  $Ended = [DateTime]::UtcNow
+  $Report.firewallRestored = $FirewallRestored
+  if ($AuditSaved) {
+    & $Auditpol /set "/subcategory:$ConnectionAudit" "/success:$($OriginalAuditFlags.success)" "/failure:$($OriginalAuditFlags.failure)" 2>&1 | Out-Null
+    $Report.auditVerification.restoreExitCode = $LASTEXITCODE
+    if ($LASTEXITCODE -ne 0) {
+      $Report.failureStage = 'audit-restore-native-exit'
+    } else {
+      & $Auditpol /backup "/file:$AuditRestored" 2>&1 | Out-Null
+      $Report.auditVerification.backupExitCode = $LASTEXITCODE
+      if ($LASTEXITCODE -ne 0) {
+        $Report.failureStage = 'audit-restored-backup-native-exit'
+      } else {
+        try {
+          foreach ($Path in @($AuditBackup, $AuditRestored)) {
+            if ((Get-Item -LiteralPath $Path).Length -gt 1048576) { throw 'audit CSV file exceeds bound' }
+          }
+          $Utf8 = [Text.UTF8Encoding]::new($false, $true)
+          $Report.auditVerification.comparison = Compare-AuditPolicyCsv ([IO.File]::ReadAllText($AuditBackup, $Utf8)) ([IO.File]::ReadAllText($AuditRestored, $Utf8))
+          $Report.auditRestored = $Report.auditVerification.comparison.equal
+          if (-not $Report.auditRestored) { $Report.failureStage = 'audit-policy-mismatch' }
+        } catch {
+          $Report.failureStage = 'audit-policy-invalid-csv'
+        }
+      }
+    }
+    Remove-Item -LiteralPath $AuditBackup, $AuditRestored -Force -ErrorAction SilentlyContinue
+  }
+}
+if ($Report.firewallRestored) {
+  $Report.candidateProcessesAfter = Get-CandidateProcessSnapshot
+  $Report.jobAncestryAfter = Get-JobAncestrySnapshot $Report.candidateProcessesAfter $Report.jobAncestryBefore
+}
+if (-not $Report.firewallRestored -or -not $Report.auditRestored) {
+  # Retain bounded comparison metadata even on failure; connection events remain uncollected.
+  $Report | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $OutputRoot 'firewall-diagnostic.v1.json') -Encoding utf8
+  Fail 'diagnostic did not verify both restorations; network event export suppressed'
+}
+$Report.postRestoreConnected = Test-OutboundTcp $Address
+try {
+  $Events = @(Get-WinEvent -FilterHashtable @{
+    LogName = 'Security'; ProviderName = 'Microsoft-Windows-Security-Auditing'
+    Id = 5157; StartTime = $Started; EndTime = $Ended
+  } -MaxEvents 257 -ErrorAction Stop)
+  $Report.eventsTruncated = $Events.Count -gt 256
+  $Report.blockedConnections = @($Events | Select-Object -First 256 | ForEach-Object {
+    Convert-WfpBlockedEvent ([xml]$_.ToXml())
+  })
+} catch {
+  $Report.failureStage = 'event-collection'
+}
+if (-not $Report.postRestoreConnected) { $Report.failureStage = 'post-restoration-network' }
+if (@($Report.blockedConnections | Where-Object pid -eq ([string]$PID)).Count -eq 0) {
+  $Report.failureStage = 'missing-shell-denial-audit'
+}
+$Report | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $OutputRoot 'firewall-diagnostic.v1.json') -Encoding utf8
+if ($null -ne $Report.failureStage) { Fail "firewall diagnostic failed at $($Report.failureStage)" }
+Write-Output 'Short firewall diagnostic completed and host policies restored; sustained build qualification remains unproven.'

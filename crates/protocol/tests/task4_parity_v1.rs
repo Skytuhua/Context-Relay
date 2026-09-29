@@ -1,8 +1,8 @@
 mod support;
 
 use context_relay_protocol::{
-    JsonRpcRequestV1, MemoryRecord, ProjectIdentity, SetupPlan, SyncOperationV1, TaskRecord,
-    mcp_schema,
+    JsonRpcRequestV1, MemoryRecord, PROTOCOL_VERSION, ProjectIdentity, SetupPlan, SyncOperationV1,
+    TaskRecord, mcp_schema,
 };
 
 #[test]
@@ -59,6 +59,7 @@ fn shared_json_fixture_round_trips_through_rust() {
 
     let request: JsonRpcRequestV1 =
         serde_json::from_value(fixture["memoryCreateRequest"].clone()).unwrap();
+    assert_eq!(request.protocol, PROTOCOL_VERSION);
     assert_eq!(
         serde_json::to_value(request).unwrap(),
         fixture["memoryCreateRequest"]

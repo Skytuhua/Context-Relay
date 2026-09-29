@@ -1,0 +1,197 @@
+import { beforeEach, expect, it, vi } from 'vitest';
+
+import type {
+  RecoveryEnrollmentConfirmParams,
+  RecoveryEnrollmentHostBeginResult,
+  RecoveryEnrollmentHostConfirmResult,
+  RecoveryEnrollmentId,
+} from './bindings';
+
+const invoke = vi.hoisted(() => vi.fn());
+vi.mock('@tauri-apps/api/core', () => ({ invoke }));
+
+import { LocalClient } from './local-client';
+import { LocalWorkspaceGateway } from './workspace';
+
+beforeEach(() => {
+    invoke.mockReset();
+});
+
+it('opens native recovery input without passing phrase data through invoke', async () => {
+  invoke.mockResolvedValueOnce(null);
+  await expect(new LocalClient().recoveryRestoreBegin()).resolves.toBeNull();
+  expect(invoke).toHaveBeenCalledExactlyOnceWith('recovery_restore_begin');
+});
+
+it('routes restore actions and rejects malformed or secret-bearing public status', async () => {
+  const gateway = new LocalWorkspaceGateway();
+  const idle = { state: 'idle' };
+  invoke.mockResolvedValue({ kind: 'recovery_restore_status', data: { status: idle } });
+  await expect(gateway.recoveryRestoreOverview()).resolves.toEqual(idle);
+  await expect(gateway.recoveryRestoreCancel()).resolves.toEqual(idle);
+  const pending = { state: 'submitting', restoreId: '018f22e2-79b0-7cc8-98c4-dc0c0c075602' };
+  invoke.mockResolvedValue({ kind: 'recovery_restore_status', data: { status: pending } });
+  await expect(gateway.recoveryRestoreResume()).resolves.toEqual(pending);
+  await expect(gateway.recoveryRestoreCancel()).rejects.toThrow();
+  invoke.mockResolvedValue(pending);
+  await expect(gateway.recoveryRestoreBegin()).resolves.toEqual(pending);
+  expect(invoke.mock.calls.slice(0, 3).map((call) => call[1].request.method)).toEqual([
+    'recovery_restore_overview', 'recovery_restore_cancel', 'recovery_restore_resume',
+  ]);
+  for (const invalid of [
+    { state: 'idle', phrase: ['secret'] }, { state: 'submitting', restoreId: 'bad-id' },
+    { state: 'complete', restoreId: pending.restoreId, device: null }, { state: 'unknown' },
+  ]) {
+    invoke.mockResolvedValue(invalid);
+    await expect(gateway.recoveryRestoreBegin()).rejects.toThrow();
+    invoke.mockResolvedValue({ kind: 'recovery_restore_status', data: { status: invalid } });
+    await expect(gateway.recoveryRestoreOverview()).rejects.toThrow();
+  }
+});
+
+it('reads and retries search preparation through the typed protocol and rejects malformed progress', async () => {
+  const gateway = new LocalWorkspaceGateway();
+  const status = { phase: 'preparing', revision: '4' };
+  invoke.mockResolvedValue({ kind: 'search_index', data: { status } });
+  await expect(gateway.searchIndexStatus()).resolves.toEqual(status);
+  await expect(gateway.searchIndexRetry()).resolves.toEqual(status);
+  expect(invoke.mock.calls.map((call) => call[1].request.method)).toEqual(['search_index_status', 'search_index_retry']);
+  for (const invalid of [
+    { phase: 'ready', revision: 4 }, { phase: 'ready', revision: '18446744073709551616' },
+    { phase: 'unknown', revision: '4' }, { phase: 'ready' },
+    { phase: 'ready', revision: '4', recordCount: 3 },
+  ]) {
+    invoke.mockResolvedValue({ kind: 'search_index', data: { status: invalid } });
+    await expect(gateway.searchIndexStatus()).rejects.toThrow();
+  }
+});
+
+it('opens the native folder picker without sending workspace mutations, including cancellation', async () => {
+  invoke.mockResolvedValueOnce('C:\\Work\\專案 🚀').mockResolvedValueOnce(null);
+  const gateway = new LocalWorkspaceGateway();
+  await expect(gateway.chooseProjectFolder()).resolves.toBe('C:\\Work\\專案 🚀');
+  await expect(gateway.chooseProjectFolder()).resolves.toBeNull();
+  expect(invoke.mock.calls).toEqual([['choose_project_folder'], ['choose_project_folder']]);
+});
+
+it('forwards only the typed request through the local_request command', async () => {
+  const response = { kind: 'projects', data: { projects: [] } } as const;
+  invoke.mockResolvedValue(response);
+  const request = { method: 'projects_list', params: {} } as const;
+
+  await expect(new LocalClient().call(request)).resolves.toEqual(response);
+  expect(invoke).toHaveBeenCalledWith('local_request', { request });
+});
+
+it('uses dedicated native recovery commands and never generic local_request', async () => {
+  const beginResult = { kind: 'status', data: recoveryStatus('idle') } satisfies RecoveryEnrollmentHostBeginResult;
+  const confirmResult = { kind: 'canceled' } satisfies RecoveryEnrollmentHostConfirmResult;
+  const params = {
+    enrollmentId: '018f22e2-79b0-7cc8-98c4-dc0c0c076001',
+    confirmations: [
+      { position: 1, word: 'first' },
+      { position: 7, word: 'seventh' },
+      { position: 13, word: 'thirteenth' },
+      { position: 24, word: 'last' },
+    ],
+  } as RecoveryEnrollmentConfirmParams;
+  invoke.mockResolvedValueOnce(beginResult).mockResolvedValueOnce(confirmResult);
+
+  const client = new LocalClient();
+  await expect(client.recoveryEnrollmentBegin()).resolves.toEqual(beginResult);
+  await expect(client.recoveryEnrollmentConfirm(params)).resolves.toEqual(confirmResult);
+
+  expect(invoke).toHaveBeenNthCalledWith(1, 'recovery_enrollment_begin');
+  expect(invoke).toHaveBeenNthCalledWith(2, 'recovery_enrollment_confirm', { params });
+  expect(invoke).not.toHaveBeenCalledWith('local_request', expect.anything());
+});
+
+it('rejects phrase-bearing recovery methods on the generic renderer bridge', async () => {
+  const client = new LocalClient();
+  const params = {
+    enrollmentId:
+      '018f22e2-79b0-7cc8-98c4-dc0c0c076001' as RecoveryEnrollmentConfirmParams['enrollmentId'],
+    confirmations: [],
+  };
+
+  await expect(
+    client.call({ method: 'recovery_enrollment_begin', params: {} }),
+  ).rejects.toThrow('dedicated native recovery command');
+  await expect(
+    client.call({ method: 'recovery_enrollment_confirm', params }),
+  ).rejects.toThrow('dedicated native recovery command');
+  expect(invoke).not.toHaveBeenCalled();
+});
+
+it('rejects restore phrase submission through the generic renderer bridge', async () => {
+  await expect(
+    new LocalClient().call({
+      method: 'recovery_restore_begin',
+      params: { recoveryPhraseWords: Array<string>(24).fill('abandon') },
+    }),
+  ).rejects.toThrow('dedicated native recovery command');
+  expect(invoke).not.toHaveBeenCalled();
+});
+
+it('routes only overview, status, and cancel through authenticated local_request', async () => {
+  const enrollmentId =
+    '018f22e2-79b0-7cc8-98c4-dc0c0c076001' as RecoveryEnrollmentId;
+  const idle = recoveryStatus('idle');
+  const challenge = {
+    kind: 'challenge',
+    data: {
+      enrollmentId,
+      confirmationPositions: [1, 7, 13, 24],
+      createdAtMs: '1000',
+      expiresAtMs: '601000',
+    },
+  } as RecoveryEnrollmentHostBeginResult;
+  const params = { enrollmentId, confirmations: [] };
+  invoke
+    .mockResolvedValueOnce({ kind: 'recovery_enrollment_status', data: { status: idle } })
+    .mockResolvedValueOnce(challenge)
+    .mockResolvedValueOnce({ kind: 'recovery_enrollment_status', data: { status: idle } })
+    .mockResolvedValueOnce({ kind: 'canceled' })
+    .mockResolvedValueOnce({ kind: 'recovery_enrollment_status', data: { status: idle } });
+
+  const gateway = new LocalWorkspaceGateway();
+  await expect(gateway.recoveryEnrollmentOverview()).resolves.toEqual(idle);
+  await expect(gateway.recoveryEnrollmentBegin()).resolves.toEqual(challenge);
+  await expect(gateway.recoveryEnrollmentStatus(enrollmentId)).resolves.toEqual(idle);
+  await expect(gateway.recoveryEnrollmentConfirm(params)).resolves.toEqual({ kind: 'canceled' });
+  await expect(gateway.recoveryEnrollmentCancel(enrollmentId)).resolves.toBeUndefined();
+
+  expect(invoke.mock.calls).toEqual([
+    ['local_request', { request: { method: 'recovery_enrollment_overview', params: {} } }],
+    ['recovery_enrollment_begin'],
+    [
+      'local_request',
+      { request: { method: 'recovery_enrollment_status', params: { enrollmentId } } },
+    ],
+    ['recovery_enrollment_confirm', { params }],
+    [
+      'local_request',
+      { request: { method: 'recovery_enrollment_cancel', params: { enrollmentId } } },
+    ],
+  ]);
+});
+
+function recoveryStatus(state: 'idle') {
+  return {
+    enrollmentId: null,
+    state,
+    createdAtMs: null,
+    transitionedAtMs: null,
+  } as const;
+}
+
+it('keeps history unlock on the native host and rejects its phrase-bearing generic route', async () => {
+  const params = { restoreId: '018f22e2-79b0-7cc8-98c4-dc0c0c073914' as never, acceptedEndpointSha256: '11'.repeat(32) as never, checkpointSha256: '22'.repeat(32) as never };
+  invoke.mockResolvedValueOnce(null);
+  const client = new LocalClient();
+  await expect(client.recoveryHistoryUnlock(params)).resolves.toBeNull();
+  expect(invoke).toHaveBeenCalledExactlyOnceWith('recovery_history_unlock', { params });
+  invoke.mockClear();
+  await expect(client.call({ method: 'recovery_history_unlock', params: { ...params, recoveryPhraseWords: Array<string>(24).fill('abandon') } })).rejects.toThrow('dedicated native recovery command');
+  expect(invoke).not.toHaveBeenCalled();
+});

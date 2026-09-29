@@ -21,6 +21,8 @@ pub enum ValidationError {
 pub enum ProtocolError {
     #[error("protocol version unsupported")]
     ProtocolVersionUnsupported,
+    #[error("checkpoint version unsupported")]
+    CheckpointVersionUnsupported,
     #[error("invalid request")]
     InvalidRequest,
     #[error("frame too large")]

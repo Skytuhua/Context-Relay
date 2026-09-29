@@ -6,6 +6,8 @@
 
 # Cryptographically pinned build material must hash identically on every runner.
 /third_party/sidecars/semgrep/build-public-source-windows.ps1 text eol=lf
+/third_party/sidecars/semgrep/windows-offline-firewall.ps1 text eol=lf
+/third_party/sidecars/semgrep/diagnose-windows-firewall.ps1 text eol=lf
 
 *.bmp binary
 *.gif binary
@@ -31,3 +33,9 @@
 
 # Upstream Gitleaks policy is byte-pinned with its published CRLF bytes.
 /third_party/sidecars/policies/gitleaks.toml -text whitespace=-trailing-space
+
+# ts-rs 11 emits one trailing space before the line break in optional-field
+# declarations (PackageInspectionReport). check-bindings verifies the committed
+# file byte-for-byte against generator output, so the trailing space is
+# intentional; opt the path out of the whitespace gate like gitleaks.toml.
+/apps/desktop/src/bindings.ts -whitespace

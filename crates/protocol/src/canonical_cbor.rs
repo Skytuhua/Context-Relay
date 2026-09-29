@@ -1,11 +1,11 @@
 use minicbor::{Decoder, Encoder};
 
 use crate::{
-    AccountId, BlobRef, BoundedCiphertext, CheckpointV1, DeviceId, DeviceSequence,
-    Ed25519SignatureBytes, HybridLogicalClock, MAX_BATCH_OPERATIONS, MAX_CBOR_OPERATION_BYTES,
-    MAX_CIPHERTEXT_BYTES, MAX_TITLE_BYTES, MutationKind, OperationId, ProjectId, ProtocolError,
-    RecordId, RecordKind, SYNC_SCHEMA_VERSION, Sha256Digest, SyncOperationV1, WorkspaceId,
-    XChaChaNonce, uuid_v7_from_bytes,
+    AccountId, BlobRef, BoundedCiphertext, CHECKPOINT_SCHEMA_VERSION, CheckpointV1, DeviceId,
+    DeviceSequence, Ed25519SignatureBytes, HybridLogicalClock, MAX_BATCH_OPERATIONS,
+    MAX_CBOR_OPERATION_BYTES, MAX_CIPHERTEXT_BYTES, MAX_TITLE_BYTES, MutationKind, OperationId,
+    ProjectId, ProtocolError, RecordId, RecordKind, SYNC_SCHEMA_VERSION, Sha256Digest,
+    SyncOperationV1, WorkspaceId, XChaChaNonce, uuid_v7_from_bytes,
 };
 
 pub fn encode_sync_operation_signing_preimage_v1(
@@ -22,6 +22,58 @@ pub fn encode_sync_operation_v1(operation: &SyncOperationV1) -> Result<Vec<u8>, 
         .validate()
         .map_err(|_| ProtocolError::InvalidCbor("invalid operation"))?;
     encode_operation(operation, true)
+}
+
+pub fn encode_sync_operation_aad_v1(operation: &SyncOperationV1) -> Result<Vec<u8>, ProtocolError> {
+    let mut encoder = Encoder::new(Vec::new());
+    encoder.map(16).map_err(enc)?;
+    key(&mut encoder, 0)?;
+    encoder.u16(operation.schema_version).map_err(enc)?;
+    key(&mut encoder, 1)?;
+    bytes(&mut encoder, operation.operation_id.as_bytes())?;
+    key(&mut encoder, 2)?;
+    bytes(&mut encoder, operation.account_id.as_bytes())?;
+    key(&mut encoder, 3)?;
+    bytes(&mut encoder, operation.workspace_id.as_bytes())?;
+    key(&mut encoder, 4)?;
+    match operation.project_id {
+        Some(id) => bytes(&mut encoder, id.as_bytes())?,
+        None => {
+            encoder.null().map_err(enc)?;
+        }
+    }
+    key(&mut encoder, 5)?;
+    bytes(&mut encoder, operation.record_id.as_bytes())?;
+    key(&mut encoder, 6)?;
+    encoder
+        .u8(record_kind(operation.record_kind))
+        .map_err(enc)?;
+    key(&mut encoder, 7)?;
+    encoder
+        .u8(mutation_kind(operation.mutation_kind))
+        .map_err(enc)?;
+    key(&mut encoder, 8)?;
+    bytes(&mut encoder, operation.device_id.as_bytes())?;
+    key(&mut encoder, 9)?;
+    encoder.u64(operation.device_sequence).map_err(enc)?;
+    key(&mut encoder, 10)?;
+    encode_frontier(&mut encoder, &operation.causal_frontier)?;
+    key(&mut encoder, 11)?;
+    encoder.u32(operation.control_epoch).map_err(enc)?;
+    key(&mut encoder, 12)?;
+    encoder.u32(operation.key_epoch).map_err(enc)?;
+    key(&mut encoder, 13)?;
+    bytes(&mut encoder, &operation.previous_device_hash.0)?;
+    key(&mut encoder, 17)?;
+    encoder
+        .array(operation.blob_refs.len() as u64)
+        .map_err(enc)?;
+    for blob in &operation.blob_refs {
+        encode_blob(&mut encoder, blob)?;
+    }
+    key(&mut encoder, 18)?;
+    encode_hlc(&mut encoder, operation.created_hlc)?;
+    Ok(encoder.into_writer())
 }
 
 fn encode_operation(operation: &SyncOperationV1, signed: bool) -> Result<Vec<u8>, ProtocolError> {
@@ -207,23 +259,27 @@ fn encode_checkpoint(checkpoint: &CheckpointV1, signed: bool) -> Result<Vec<u8>,
         .validate()
         .map_err(|_| bad("invalid checkpoint"))?;
     let mut encoder = Encoder::new(Vec::new());
-    encoder.map(if signed { 8 } else { 7 }).map_err(enc)?;
+    encoder.map(if signed { 10 } else { 9 }).map_err(enc)?;
     key(&mut encoder, 0)?;
     encoder.u16(checkpoint.schema_version).map_err(enc)?;
     key(&mut encoder, 1)?;
-    bytes(&mut encoder, &checkpoint.previous_checkpoint_hash.0)?;
+    bytes(&mut encoder, checkpoint.account_id.as_bytes())?;
     key(&mut encoder, 2)?;
-    encode_frontier(&mut encoder, &checkpoint.causal_frontier)?;
+    bytes(&mut encoder, checkpoint.workspace_id.as_bytes())?;
     key(&mut encoder, 3)?;
-    bytes(&mut encoder, &checkpoint.state_hash.0)?;
+    bytes(&mut encoder, &checkpoint.previous_checkpoint_hash.0)?;
     key(&mut encoder, 4)?;
-    encoder.u32(checkpoint.key_epoch).map_err(enc)?;
+    encode_frontier(&mut encoder, &checkpoint.causal_frontier)?;
     key(&mut encoder, 5)?;
-    bytes(&mut encoder, checkpoint.creator_device.as_bytes())?;
+    bytes(&mut encoder, &checkpoint.state_hash.0)?;
     key(&mut encoder, 6)?;
+    encoder.u32(checkpoint.key_epoch).map_err(enc)?;
+    key(&mut encoder, 7)?;
+    bytes(&mut encoder, checkpoint.creator_device.as_bytes())?;
+    key(&mut encoder, 8)?;
     encode_hlc(&mut encoder, checkpoint.created_hlc)?;
     if signed {
-        key(&mut encoder, 7)?;
+        key(&mut encoder, 9)?;
         bytes(&mut encoder, &checkpoint.signature.0)?;
     }
     let output = encoder.into_writer();
@@ -238,32 +294,43 @@ pub fn decode_checkpoint_v1(input: &[u8]) -> Result<CheckpointV1, ProtocolError>
         return Err(bad("checkpoint too large"));
     }
     let mut decoder = Decoder::new(input);
-    require_map(&mut decoder, 8)?;
+    let map_size = decoder.map().map_err(dec)?;
     expect_key(&mut decoder, 0)?;
     let schema_version = decoder.u16().map_err(dec)?;
-    if schema_version != SYNC_SCHEMA_VERSION {
-        return Err(bad("unsupported schema"));
+    if schema_version != CHECKPOINT_SCHEMA_VERSION {
+        return Err(ProtocolError::CheckpointVersionUnsupported);
+    }
+    if map_size != Some(10) {
+        return Err(bad("map size"));
     }
     expect_key(&mut decoder, 1)?;
-    let previous_checkpoint_hash = Sha256Digest(read_fixed::<32>(&mut decoder)?);
+    let account_id = uuid_v7_from_bytes(decoder.bytes().map_err(dec)?, AccountId::new)
+        .map_err(|_| bad("account"))?;
     expect_key(&mut decoder, 2)?;
-    let causal_frontier = decode_frontier(&mut decoder)?;
+    let workspace_id = uuid_v7_from_bytes(decoder.bytes().map_err(dec)?, WorkspaceId::new)
+        .map_err(|_| bad("workspace"))?;
     expect_key(&mut decoder, 3)?;
-    let state_hash = Sha256Digest(read_fixed::<32>(&mut decoder)?);
+    let previous_checkpoint_hash = Sha256Digest(read_fixed::<32>(&mut decoder)?);
     expect_key(&mut decoder, 4)?;
-    let key_epoch = decoder.u32().map_err(dec)?;
+    let causal_frontier = decode_frontier(&mut decoder)?;
     expect_key(&mut decoder, 5)?;
+    let state_hash = Sha256Digest(read_fixed::<32>(&mut decoder)?);
+    expect_key(&mut decoder, 6)?;
+    let key_epoch = decoder.u32().map_err(dec)?;
+    expect_key(&mut decoder, 7)?;
     let creator_device = uuid_v7_from_bytes(decoder.bytes().map_err(dec)?, DeviceId::new)
         .map_err(|_| bad("creator device"))?;
-    expect_key(&mut decoder, 6)?;
+    expect_key(&mut decoder, 8)?;
     let created_hlc = decode_hlc(&mut decoder)?;
-    expect_key(&mut decoder, 7)?;
+    expect_key(&mut decoder, 9)?;
     let signature = Ed25519SignatureBytes(read_fixed::<64>(&mut decoder)?);
     if decoder.position() != input.len() {
         return Err(bad("trailing bytes"));
     }
     let checkpoint = CheckpointV1 {
         schema_version,
+        account_id,
+        workspace_id,
         previous_checkpoint_hash,
         causal_frontier,
         state_hash,

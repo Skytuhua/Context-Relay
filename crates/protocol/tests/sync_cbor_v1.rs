@@ -3,9 +3,9 @@ mod support;
 use std::str::FromStr;
 
 use context_relay_protocol::{
-    BoundedCiphertext, DeviceId, DeviceSequence, MAX_BATCH_OPERATIONS, MAX_CIPHERTEXT_BYTES,
-    ProtocolError, decode_checkpoint_v1, decode_sync_operation_v1,
-    encode_checkpoint_signing_preimage_v1, encode_checkpoint_v1,
+    BoundedCiphertext, CHECKPOINT_SCHEMA_VERSION, DeviceId, DeviceSequence, MAX_BATCH_OPERATIONS,
+    MAX_CIPHERTEXT_BYTES, ProtocolError, SYNC_SCHEMA_VERSION, decode_checkpoint_v1,
+    decode_sync_operation_v1, encode_checkpoint_signing_preimage_v1, encode_checkpoint_v1,
     encode_sync_operation_signing_preimage_v1, encode_sync_operation_v1,
 };
 use serde::Deserialize;
@@ -33,6 +33,20 @@ fn operation_and_checkpoint_match_golden_bytes() {
     assert_eq!(
         hex(&encode_checkpoint_signing_preimage_v1(&checkpoint).unwrap()),
         include_str!("fixtures/checkpoint-signing-preimage-v1.hex").trim()
+    );
+}
+
+#[test]
+fn checkpoint_wire_version_is_distinct_and_legacy_v1_is_explicitly_unsupported() {
+    assert_eq!(SYNC_SCHEMA_VERSION, 1);
+    assert_eq!(CHECKPOINT_SCHEMA_VERSION, 2);
+    assert_eq!(support::sync_operation().schema_version, 1);
+    assert_eq!(support::checkpoint().schema_version, 2);
+
+    let legacy = unhex(include_str!("../../core/tests/fixtures/checkpoint-schema17-v1.hex").trim());
+    assert_eq!(
+        decode_checkpoint_v1(&legacy),
+        Err(ProtocolError::CheckpointVersionUnsupported)
     );
 }
 

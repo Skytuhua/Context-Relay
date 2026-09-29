@@ -20,6 +20,8 @@ import {
   hydrateCiCandidateSidecar,
   hydrateSidecars,
   parseSidecarManifest,
+  parseInternalWindowsDescriptorV2,
+  validateInternalWindowsNativeBuildEvidence,
 } from './hydrate-sidecars.mjs';
 import { verifyBundleEvidence } from './semgrep-source-bundle.mjs';
 
@@ -471,6 +473,96 @@ export function createCandidateDocuments({
     candidateDocumentBytes,
     documentRelativePath: `third_party/sidecars/semgrep/ci-candidate-closure.${targetName}.v1.json`,
     target,
+  };
+}
+
+// Document construction binds supplied bytes; package verification must check the actual
+// source companion, compliance inventory and runtime before these bytes are staged/embedded.
+export function createInternalWindowsDocuments({
+  applicationSourceCommit,
+  qualification,
+  manifestBytes,
+  sourceLockBytes,
+  nativeBuildEvidenceBytes,
+  bundleEvidenceBytes,
+  complianceManifestBytes,
+}) {
+  for (const bytes of [manifestBytes, sourceLockBytes, nativeBuildEvidenceBytes, bundleEvidenceBytes, complianceManifestBytes]) {
+    if (!Buffer.isBuffer(bytes) || bytes.length === 0 || bytes.length > 16_777_216) fail('internal material bytes are invalid');
+  }
+  const manifest = parseSidecarManifest(new TextDecoder('utf-8', { fatal: true }).decode(manifestBytes));
+  const semgrep = manifest.tools.find(({ id }) => id === 'semgrep');
+  const target = semgrep?.targets.find(({ target: name }) => name === 'windows-x86_64');
+  if (!target?.enabled || semgrep.targets.filter(({ enabled }) => enabled).length !== 1
+      || target.reproducibleBuilds !== 2 || target.correspondingSourceComplete !== true
+      || semgrep.targets.find(({ target: name }) => name === 'macos-aarch64')?.disabledReason !== 'deferred_apple_native_qualification') {
+    fail('internal manifest must qualify only Windows');
+  }
+  const decode = (bytes) => JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+  const sourceLock = decode(sourceLockBytes);
+  const bundle = decode(bundleEvidenceBytes);
+  const native = decode(nativeBuildEvidenceBytes);
+  const nativeMaterial = semgrep.materials.find(({ role }) => role === 'native-build-evidence');
+  const bundleMaterial = semgrep.materials.find(({ role }) => role === 'source-bundle-evidence');
+  if (semgrep.source.materialPath !== 'third_party/sidecars/semgrep/source-lock.v1.json'
+      || semgrep.source.materialSha256 !== sha256(sourceLockBytes)
+      || nativeMaterial?.sha256 !== sha256(nativeBuildEvidenceBytes)
+      || bundleMaterial?.sha256 !== sha256(bundleEvidenceBytes)
+      || bundleMaterial.path !== 'third_party/sidecars/semgrep/bundle-evidence.internal-windows.v2.json'
+      || bundle.schemaVersion !== 2 || bundle.status !== 'complete_corresponding_source'
+      || bundle.sourceLockSha256 !== sha256(sourceLockBytes) || bundle.independentBuilds !== 2
+      || bundle.byteIdentical !== true || bundle.sourceDelivery?.kind !== 'bundled'
+      || bundle.sourceDelivery.path !== 'compliance/semgrep/semgrep-1.170.0-corresponding-source.tar') {
+    fail('internal finalizer material identity mismatch');
+  }
+  validateInternalWindowsNativeBuildEvidence(native, sourceLock, nativeMaterial, semgrep.materials, [target], qualification);
+  const prefix = 'sidecars/semgrep/verification/';
+  const identity = (path, bytes) => ({ path, size: bytes.length, sha256: sha256(bytes) });
+  const descriptorBytes = jsonBytes({
+    schemaVersion: 2,
+    purpose: 'internal-windows-package-qualification',
+    publishable: false,
+    enabled: true,
+    target: 'windows-x86_64',
+    sidecar: 'semgrep',
+    version: semgrep.version,
+    applicationSourceCommit,
+    qualification: {
+      commit: qualification.commit,
+      runId: qualification.runId,
+      runAttempt: qualification.runAttempt,
+      workflowRef: qualification.workflowRef,
+      workflowSha: qualification.workflowSha,
+    },
+    sidecarManifest: identity(`${prefix}third_party/sidecars/manifest.v1.json`, manifestBytes),
+    sourceLock: identity(`${prefix}third_party/sidecars/semgrep/source-lock.v1.json`, sourceLockBytes),
+    nativeBuildEvidence: identity(`${prefix}third_party/sidecars/semgrep/native-build-evidence.v1.json`, nativeBuildEvidenceBytes),
+    bundleEvidence: identity(`${prefix}third_party/sidecars/semgrep/bundle-evidence.internal-windows.v2.json`, bundleEvidenceBytes),
+    commandTemplate: { id: semgrep.commandTemplate.id, sha256: semgrep.commandTemplate.sha256 },
+    archive: {
+      format: target.download.format,
+      size: target.download.size,
+      sha256: target.download.sha256,
+      entries: target.closure.map(({ path, size }) => ({ path, type: 'file', size })),
+      extractPath: target.download.extractPath,
+    },
+    executable: { path: target.executable.path, size: target.executable.size, sha256: target.executable.sha256 },
+    closure: target.closure.map(({ path, size, sha256: digest, executable }) => ({ path, size, sha256: digest, executable })),
+    sourceCompanion: {
+      path: bundle.sourceDelivery.path,
+      size: bundle.bundle.size,
+      sha256: bundle.bundle.sha256,
+      payloadEntries: bundle.bundle.payloadEntries,
+      recordedLinks: bundle.bundle.recordedLinks,
+    },
+    complianceManifest: identity('compliance/manifest.v1.json', complianceManifestBytes),
+  });
+  parseInternalWindowsDescriptorV2(descriptorBytes);
+  return {
+    descriptorBytes,
+    descriptorDigest: sha256(Buffer.concat([
+      Buffer.from('context-relay/internal-windows-package-qualification/v2\0'), descriptorBytes,
+    ])),
   };
 }
 
