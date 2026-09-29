@@ -58,6 +58,18 @@ describe('Content-Security-Policy delivery', () => {
     expect(cspMeta?.[1]).not.toContain('unsafe-inline');
   });
 
+  it('omits frame-ancestors, which a meta tag cannot enforce', () => {
+    // The browser ignores this directive when it arrives via <meta>, so leaving it
+    // there implies clickjacking protection that the document never actually has.
+    // tauri.conf.json keeps it, where it is delivered as a real header and does work.
+    expect(cspMeta?.[1]).not.toContain('frame-ancestors');
+    const tauriConfig = readFileSync(
+      join(appDir, 'src-tauri', 'tauri.conf.json'),
+      'utf8',
+    );
+    expect(tauriConfig).toContain("frame-ancestors 'none'");
+  });
+
   it('registers the plugin in the dev-only position', () => {
     // 'apply: serve' is what keeps this out of `vite build`; without it the
     // relaxation would ship in the packaged app.
@@ -80,6 +92,5 @@ describe('Content-Security-Policy delivery', () => {
     expect(after).toContain("default-src 'self'");
     expect(after).toContain("object-src 'none'");
     expect(after).toContain("base-uri 'none'");
-    expect(after).toContain("frame-ancestors 'none'");
   });
 });
