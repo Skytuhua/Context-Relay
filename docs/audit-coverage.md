@@ -202,7 +202,23 @@ original plan, and is recorded so the limit of this pass is visible:
 - A compensation pass failing *mid-walk* is covered for the write-ahead log and the
   CLI WAL by #38. The sandbox cleanup path has the same structure and was reasoned
   about, not exercised.
-- Rendered acceptance at the sizes DESIGN.md names (1180x760, 900x600, 600px, 200%
-  text). Those need a running app; the browser tool here refuses localhost, so this
-  pass verified the tokens, dimensions and contrast arithmetic rather than the
-  rendered result.
+- Rendered acceptance was carried out against the production build, not the dev
+  server, at the four sizes DESIGN.md names. The sidebar measures exactly 200px at
+  1180x760, 900x600 and 200% text; the first control is 37px tall, rising to 58px
+  when text is doubled; no viewport scrolls horizontally; and no button, link or
+  input falls below 44px in any of the four. The 46rem breakpoint was observed
+  switching the sidebar to a horizontal top region, and at 200% text the sidebar
+  stacks vertically rather than overflowing, which is the intended reflow.
+
+  Both themes were rendered. Dark computes to `rgb(28, 28, 31)` on `rgb(243, 243,
+  244)` and light to `rgb(250, 250, 250)` on `rgb(32, 32, 36)`, matching the tokens
+  exactly, and each was inspected visually for legibility of the sidebar, the
+  selected row and the error banner. Note the default preference is `dark`, not
+  `system`, so the app does not follow the OS appearance until a user changes it.
+
+  One finding: `index.html` repeats the full CSP in a `<meta http-equiv>` tag, and
+  the browser logs an error for `frame-ancestors` because that directive is ignored
+  when delivered that way. Tauri injects a byte-identical policy as a real header
+  from `tauri.conf.json`, so the shipped app is protected and the meta tag is
+  redundant rather than dangerous. Worth knowing the browser ignores the directive
+  it looks like it is enforcing.
