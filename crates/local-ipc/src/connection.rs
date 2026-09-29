@@ -1,13 +1,12 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, VecDeque},
     fmt,
     future::Future,
-    process::{Command, Stdio},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU8, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant as StdInstant},
 };
 
 use context_relay_protocol::{
@@ -28,8 +27,10 @@ use tokio::{
 use crate::{
     AuthAcceptedV1, AuthTranscriptV1, ConnectedStream, HANDSHAKE_TIMEOUT, InstallationToken,
     IpcError, REQUEST_TIMEOUT, RuntimeConfig, ServerHelloV1, connect, create_proof,
-    create_server_proof, generate_instance_nonce, load_installation_token, read_frame, read_json,
-    role_allows, verify_proof, verify_server_proof, write_frame, write_json,
+    create_server_proof,
+    frame::{ZeroizingJsonFrame, encode_json_frame},
+    generate_instance_nonce, load_installation_token, read_frame, read_json, role_allows,
+    verify_proof, verify_server_proof, write_frame, write_json,
 };
 
 pub(crate) struct ClientConnection<S> {
@@ -58,10 +59,32 @@ const REQUEST_QUEUED: u8 = 0;
 const REQUEST_ACTIVE: u8 = 1;
 const REQUEST_CANCELED: u8 = 2;
 const REQUEST_COMPLETE: u8 = 3;
+// Twice the MCP dispatcher's 64-call ceiling, while bounding authenticated cancel floods.
+const EARLY_CANCEL_CAPACITY: usize = 128;
+// Covers the complete request deadline with a five-second registration margin.
+const EARLY_CANCEL_TTL: Duration = Duration::from_secs(35);
+const RECENT_COMPLETION_CAPACITY: usize = 128;
+const RECENT_COMPLETION_TTL: Duration = Duration::from_secs(35);
+const _: () = assert!(EARLY_CANCEL_CAPACITY >= 64);
+const _: () = assert!(EARLY_CANCEL_TTL.as_secs() >= REQUEST_TIMEOUT.as_secs());
+const _: () = assert!(RECENT_COMPLETION_CAPACITY >= 64);
+const _: () = assert!(RECENT_COMPLETION_TTL.as_secs() >= REQUEST_TIMEOUT.as_secs());
 
 #[derive(Clone, Default)]
 pub struct RequestRegistry {
-    inner: Arc<Mutex<HashMap<RecordId, Arc<RequestState>>>>,
+    inner: Arc<Mutex<RegistryState>>,
+}
+
+#[derive(Default)]
+struct RegistryState {
+    requests: HashMap<RecordId, Arc<RequestState>>,
+    early_cancels: VecDeque<ExpiringId>,
+    recent_completions: VecDeque<ExpiringId>,
+}
+
+struct ExpiringId {
+    id: RecordId,
+    expires_at: StdInstant,
 }
 
 struct RequestState {
@@ -76,14 +99,32 @@ pub struct RequestRegistration {
 
 impl RequestRegistry {
     fn register(&self, id: RecordId) -> Option<RequestRegistration> {
-        let mut requests = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-        if requests.contains_key(&id) {
+        self.register_at(id, StdInstant::now())
+    }
+
+    fn register_at(&self, id: RecordId, now: StdInstant) -> Option<RequestRegistration> {
+        let mut registry = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        registry.remove_expired(now);
+        if registry.requests.contains_key(&id) {
             return None;
         }
+        // Reuse claims the ID for this registration. A later cancel targets this current
+        // request; production bridge calls avoid the ambiguity by using fresh UUIDv7 IDs.
+        registry.remove_recent_completion(id);
+        let canceled = registry
+            .early_cancels
+            .iter()
+            .position(|cancel| cancel.id == id)
+            .and_then(|index| registry.early_cancels.remove(index))
+            .is_some();
         let state = Arc::new(RequestState {
-            phase: AtomicU8::new(REQUEST_QUEUED),
+            phase: AtomicU8::new(if canceled {
+                REQUEST_CANCELED
+            } else {
+                REQUEST_QUEUED
+            }),
         });
-        requests.insert(id, state.clone());
+        registry.requests.insert(id, state.clone());
         Some(RequestRegistration {
             id,
             state,
@@ -92,12 +133,13 @@ impl RequestRegistry {
     }
 
     fn cancel(&self, id: RecordId) {
-        let state = self
-            .inner
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .get(&id)
-            .cloned();
+        self.cancel_at(id, StdInstant::now());
+    }
+
+    fn cancel_at(&self, id: RecordId, now: StdInstant) {
+        let mut registry = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        registry.remove_expired(now);
+        let state = registry.requests.get(&id).cloned();
         if let Some(state) = state {
             let _ = state.phase.compare_exchange(
                 REQUEST_QUEUED,
@@ -105,7 +147,60 @@ impl RequestRegistry {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             );
+            return;
         }
+        if registry
+            .recent_completions
+            .iter()
+            .any(|completion| completion.id == id)
+        {
+            return;
+        }
+        if registry.early_cancels.iter().any(|cancel| cancel.id == id) {
+            return;
+        }
+        if registry.early_cancels.len() == EARLY_CANCEL_CAPACITY {
+            registry.early_cancels.pop_front();
+        }
+        registry.early_cancels.push_back(ExpiringId {
+            id,
+            expires_at: now + EARLY_CANCEL_TTL,
+        });
+    }
+}
+
+impl RegistryState {
+    fn remove_expired(&mut self, now: StdInstant) {
+        Self::remove_expired_from(&mut self.early_cancels, now);
+        Self::remove_expired_from(&mut self.recent_completions, now);
+    }
+
+    fn remove_expired_from(entries: &mut VecDeque<ExpiringId>, now: StdInstant) {
+        while entries.front().is_some_and(|entry| entry.expires_at <= now) {
+            entries.pop_front();
+        }
+    }
+
+    fn remove_recent_completion(&mut self, id: RecordId) {
+        if let Some(index) = self
+            .recent_completions
+            .iter()
+            .position(|completion| completion.id == id)
+        {
+            self.recent_completions.remove(index);
+        }
+    }
+
+    fn record_completion(&mut self, id: RecordId, now: StdInstant) {
+        self.remove_expired(now);
+        self.remove_recent_completion(id);
+        if self.recent_completions.len() == RECENT_COMPLETION_CAPACITY {
+            self.recent_completions.pop_front();
+        }
+        self.recent_completions.push_back(ExpiringId {
+            id,
+            expires_at: now + RECENT_COMPLETION_TTL,
+        });
     }
 }
 
@@ -140,16 +235,18 @@ impl fmt::Debug for RequestRegistration {
 impl Drop for RequestRegistration {
     fn drop(&mut self) {
         self.state.phase.store(REQUEST_COMPLETE, Ordering::Release);
-        let mut requests = self
+        let mut registry = self
             .registry
             .inner
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if requests
+        if registry
+            .requests
             .get(&self.id)
             .is_some_and(|state| Arc::ptr_eq(state, &self.state))
         {
-            requests.remove(&self.id);
+            registry.requests.remove(&self.id);
+            registry.record_completion(self.id, StdInstant::now());
         }
     }
 }
@@ -173,11 +270,29 @@ impl Client {
         )
         .await?;
         let token = load_installation_token()?;
+        Self::from_stream(stream, role, &token).await
+    }
+
+    #[cfg(feature = "test-support")]
+    pub async fn connect_for_test(
+        runtime: &RuntimeConfig,
+        role: ClientRole,
+        token: &InstallationToken,
+    ) -> Result<Self, IpcError> {
+        let stream = connect(runtime).await?;
+        Self::from_stream(stream, role, token).await
+    }
+
+    pub(crate) async fn from_stream(
+        stream: ConnectedStream,
+        role: ClientRole,
+        token: &InstallationToken,
+    ) -> Result<Self, IpcError> {
         let client_nonce = generate_instance_nonce()?;
         let request_id = RecordId::new(uuid::Uuid::now_v7())
             .expect("UUID v7 constructor returns a valid RecordId");
         Ok(Self {
-            inner: client_handshake(stream, role, &token, client_nonce, request_id).await?,
+            inner: client_handshake(stream, role, token, client_nonce, request_id).await?,
         })
     }
 
@@ -227,19 +342,188 @@ fn launch_daemon_sibling() -> Result<(), IpcError> {
         "context-relay-contextd{}",
         std::env::consts::EXE_SUFFIX
     ));
+    spawn_daemon(&daemon).map_err(|_| IpcError::Io)
+}
+
+#[cfg(not(windows))]
+fn spawn_daemon(daemon: &std::path::Path) -> std::io::Result<()> {
+    use std::process::{Command, Stdio};
+
     let mut command = Command::new(daemon);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+    command.spawn().map(|_| ())
+}
 
-        command.creation_flags(CREATE_NO_WINDOW);
+#[cfg(windows)]
+fn spawn_daemon(daemon: &std::path::Path) -> std::io::Result<()> {
+    let mut command_line = daemon_command_line(daemon)?;
+    spawn_detached_process(daemon, &mut command_line).map(drop)
+}
+
+#[cfg(windows)]
+fn daemon_command_line(daemon: &std::path::Path) -> std::io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let executable: Vec<_> = daemon.as_os_str().encode_wide().collect();
+    if executable.is_empty() || executable.iter().any(|unit| matches!(unit, 0 | 34)) {
+        return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
     }
-    command.spawn().map(|_| ()).map_err(|_| IpcError::Io)
+    // Only argv[0] is supplied in production. Quoting preserves executable paths
+    // containing spaces; a Windows executable filename cannot contain a quote.
+    Ok([&[34][..], &executable, &[34, 0]].concat())
+}
+
+#[cfg(windows)]
+fn spawn_detached_process(
+    executable: &std::path::Path,
+    command_line: &mut [u16],
+) -> std::io::Result<std::os::windows::io::OwnedHandle> {
+    use std::{
+        os::windows::{
+            ffi::OsStrExt,
+            io::{FromRawHandle, OwnedHandle},
+        },
+        ptr::null,
+    };
+    use windows_sys::Win32::System::Threading::{
+        CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, PROCESS_INFORMATION,
+        STARTUPINFOW,
+    };
+
+    let application: Vec<_> = executable.as_os_str().encode_wide().chain([0]).collect();
+    let startup = STARTUPINFOW {
+        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+        ..Default::default()
+    };
+    let mut information = PROCESS_INFORMATION::default();
+    // The daemon must not retain any inheritable launcher handles, including
+    // redirected MCP pipes. Stdio::null alone still inherits those handles on Windows.
+    // Both buffers are terminated UTF-16; CreateProcessW may mutate command_line.
+    let created = unsafe {
+        CreateProcessW(
+            application.as_ptr(),
+            command_line.as_mut_ptr(),
+            null(),
+            null(),
+            0,
+            CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+            null(),
+            null(),
+            &startup,
+            &mut information,
+        )
+    };
+    if created == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // Each successful CreateProcessW call returns two owned handles. Closing
+    // them does not terminate the child or tie its lifetime to the launcher.
+    let process = unsafe { OwnedHandle::from_raw_handle(information.hProcess) };
+    let _thread = unsafe { OwnedHandle::from_raw_handle(information.hThread) };
+    Ok(process)
+}
+
+#[cfg(all(test, windows))]
+mod windows_launch_tests {
+    use std::{
+        fs,
+        io::Read,
+        os::windows::process::CommandExt,
+        process::{Command, Stdio},
+        sync::mpsc,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+
+    use super::{daemon_command_line, spawn_detached_process};
+
+    #[test]
+    fn daemon_launch_does_not_keep_its_exited_parents_stderr_pipe_open() {
+        let root =
+            std::env::temp_dir().join(format!("test-daemon-launch-{}", uuid::Uuid::now_v7()));
+        fs::create_dir(&root).unwrap();
+        let mut bridge = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "connection::windows_launch_tests::bridge_launch_fixture",
+                "--ignored",
+            ])
+            .env("CONTEXT_RELAY_LAUNCH_TEST_ROOT", &root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .unwrap();
+        let mut stderr = bridge.stderr.take().unwrap();
+        assert!(bridge.wait().unwrap().success());
+        wait_for_marker(&root.join("ready"));
+        let (send, receive) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            send.send(stderr.read_to_end(&mut bytes)).unwrap();
+        });
+        let eof_while_daemon_alive = receive.recv_timeout(Duration::from_millis(200));
+        assert!(
+            !root.join("exited").exists(),
+            "fixture must remain alive during the pipe check"
+        );
+        fs::write(root.join("exit"), b"").unwrap();
+        wait_for_marker(&root.join("exited"));
+        reader.join().unwrap();
+        fs::remove_dir_all(&root).unwrap();
+        assert!(
+            matches!(eof_while_daemon_alive, Ok(Ok(_))),
+            "daemon inherited stderr and held the exited bridge's pipe open: {eof_while_daemon_alive:?}"
+        );
+    }
+
+    fn wait_for_marker(path: &std::path::Path) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !path.exists() {
+            assert!(Instant::now() < deadline, "fixture marker timed out");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn bridge_launch_fixture() {
+        assert!(std::env::var_os("CONTEXT_RELAY_LAUNCH_TEST_ROOT").is_some());
+        let executable = std::env::current_exe().unwrap();
+        let mut command_line = daemon_command_line(&executable).unwrap();
+        command_line.pop();
+        command_line.extend(
+            " --exact connection::windows_launch_tests::lingering_child_fixture --ignored"
+                .encode_utf16(),
+        );
+        command_line.push(0);
+        spawn_detached_process(&executable, &mut command_line).unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn lingering_child_fixture() {
+        let root =
+            std::path::PathBuf::from(std::env::var_os("CONTEXT_RELAY_LAUNCH_TEST_ROOT").unwrap());
+        assert!(
+            root.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("test-daemon-launch-")
+        );
+        fs::write(root.join("ready"), b"").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !root.join("exit").exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        fs::write(root.join("exited"), b"").unwrap();
+    }
 }
 
 pub struct AuthenticatedConnection {
@@ -288,7 +572,7 @@ where
 {
     pub(crate) async fn next_request(&mut self) -> Result<AuthenticatedRequest, IpcError> {
         loop {
-            let raw = read_frame(&mut self._stream).await?;
+            let raw = ZeroizingJsonFrame::from_frame(read_frame(&mut self._stream).await?);
             let probe: RequestProbe = match serde_json::from_slice(&raw) {
                 Ok(probe) => probe,
                 Err(error) => {
@@ -446,7 +730,7 @@ where
                 false,
             ));
         }
-        let payload = serde_json::to_vec(&JsonRpcRequestV1 {
+        let payload = encode_json_frame(&JsonRpcRequestV1 {
             jsonrpc: JsonRpcVersion::V2,
             id,
             protocol: self.protocol,
@@ -459,7 +743,7 @@ where
         };
         let exchange = timeout(REQUEST_TIMEOUT, async {
             write_frame(&mut stream, &payload).await?;
-            let raw = read_frame(&mut stream).await?;
+            let raw = ZeroizingJsonFrame::from_frame(read_frame(&mut stream).await?);
             serde_json::from_slice::<RpcResponse>(&raw).map_err(|_| IpcError::InvalidFrame)
         })
         .await;
@@ -686,7 +970,7 @@ where
 {
     timeout(HANDSHAKE_TIMEOUT, async {
         write_json(&mut stream, &server_hello).await?;
-        let raw = read_frame(&mut stream).await?;
+        let raw = ZeroizingJsonFrame::from_frame(read_frame(&mut stream).await?);
         let probe: RequestProbe = match serde_json::from_slice(&raw) {
             Ok(probe) => probe,
             Err(error) => {
@@ -771,6 +1055,118 @@ where
     })
     .await
     .map_err(|_| IpcError::HandshakeTimeout)?
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use std::time::{Duration, Instant};
+
+    use context_relay_protocol::RecordId;
+    use uuid::Uuid;
+
+    use super::{
+        EARLY_CANCEL_CAPACITY, EARLY_CANCEL_TTL, RECENT_COMPLETION_CAPACITY, RECENT_COMPLETION_TTL,
+        RequestRegistry,
+    };
+
+    fn id() -> RecordId {
+        RecordId::new(Uuid::now_v7()).unwrap()
+    }
+
+    fn complete(registry: &RequestRegistry, target: RecordId) {
+        let registration = registry.register(target).unwrap();
+        assert!(registration.begin());
+        drop(registration);
+    }
+
+    #[test]
+    fn early_cancel_tombstones_are_fifo_bounded() {
+        let registry = RequestRegistry::default();
+        let now = Instant::now();
+        let oldest = id();
+        registry.cancel_at(oldest, now);
+        let mut retained = Vec::new();
+        for _ in 0..EARLY_CANCEL_CAPACITY {
+            let target = id();
+            registry.cancel_at(target, now);
+            retained.push(target);
+        }
+
+        assert!(registry.register_at(oldest, now).unwrap().begin());
+        for target in retained {
+            assert!(!registry.register_at(target, now).unwrap().begin());
+        }
+    }
+
+    #[test]
+    fn early_cancel_tombstones_expire_after_covering_the_request_timeout() {
+        let registry = RequestRegistry::default();
+        let target = id();
+        let canceled_at = Instant::now();
+        registry.cancel_at(target, canceled_at);
+
+        let registration = registry
+            .register_at(
+                target,
+                canceled_at + EARLY_CANCEL_TTL + Duration::from_nanos(1),
+            )
+            .unwrap();
+
+        assert!(registration.begin());
+    }
+
+    #[test]
+    fn sequential_reuse_without_cancel_starts_queued() {
+        let registry = RequestRegistry::default();
+        let target = id();
+        complete(&registry, target);
+
+        assert!(registry.register(target).unwrap().begin());
+    }
+
+    #[test]
+    fn cancel_after_reuse_targets_the_current_registration() {
+        let registry = RequestRegistry::default();
+        let target = id();
+        complete(&registry, target);
+        let reused = registry.register(target).unwrap();
+
+        registry.cancel(target);
+
+        assert!(!reused.begin());
+    }
+
+    #[test]
+    fn recent_completion_markers_are_fifo_bounded() {
+        let registry = RequestRegistry::default();
+        let oldest = id();
+        complete(&registry, oldest);
+        let mut retained = Vec::new();
+        for _ in 0..RECENT_COMPLETION_CAPACITY {
+            let target = id();
+            complete(&registry, target);
+            retained.push(target);
+        }
+
+        registry.cancel(oldest);
+        assert!(!registry.register(oldest).unwrap().begin());
+
+        let newest = retained.pop().unwrap();
+        registry.cancel(newest);
+        assert!(registry.register(newest).unwrap().begin());
+    }
+
+    #[test]
+    fn expired_completion_marker_no_longer_swallows_a_cancel() {
+        let registry = RequestRegistry::default();
+        let target = id();
+        complete(&registry, target);
+        let after_expiry = Instant::now() + RECENT_COMPLETION_TTL + Duration::from_nanos(1);
+
+        registry.cancel_at(target, after_expiry);
+
+        assert!(!registry.register_at(target, after_expiry).unwrap().begin());
+    }
 }
 
 #[cfg(test)]

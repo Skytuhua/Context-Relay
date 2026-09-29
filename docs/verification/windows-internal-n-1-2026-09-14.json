@@ -1,0 +1,275 @@
+{
+  "ObservedUtc": "2026-09-14T01:05:19.7864591Z",
+  "SourceCommit": "14683270b98f391d9e9bce71792f9ace8620ea04",
+  "Scope": "Internal N-1 artifact identity only; clean installation and upgrade remain pending",
+  "InstallerPath": "E:\\Context Relay Releases\\1468327\\Context Relay_0.1.0_x64-setup.exe",
+  "InstallerBytes": 75852732,
+  "InstallerSha256": "3a0dacf88661628de535a4d46ecf17d968227fea3dc3856673b7c53f93bc8b45",
+  "ManifestSha256": "3d89cef18cc00334ac9858fa9b961f2e686ed0a06a05a6dc1cdb8d14f6a56250",
+  "InstallerAuthenticode": "NotSigned",
+  "DesktopFileVersion": "0.1.0",
+  "DesktopProductVersion": "0.1.0",
+  "Files": [
+    {
+      "Location": "E:\\Context Relay Releases\\1468327\\extracted",
+      "Path": "context-relay-desktop.exe",
+      "Bytes": 14019072,
+      "Sha256": "79d7d1849ab4944bd4a1b6eff3d042626c9d196f2d3efb35fd12e984b44eee66",
+      "Matches": true
+    },
+    {
+      "Location": "E:\\Context Relay Releases\\1468327\\extracted",
+      "Path": "context-relay-contextd.exe",
+      "Bytes": 22982144,
+      "Sha256": "a15f750cb31913692fc823ff4645875c7a43137e399fa33421a793e499fc1413",
+      "Matches": true
+    },
+    {
+      "Location": "E:\\Context Relay Releases\\1468327\\extracted",
+      "Path": "context-relay-context-mcp.exe",
+      "Bytes": 5704192,
+      "Sha256": "79a743ea8fdecadcb1f85088643a4e1056d5c4daa98b7aa2987bf28d09b66808",
+      "Matches": true
+    },
+    {
+      "Location": "E:\\Context Relay Releases\\1468327\\extracted",
+      "Path": "context-relay-native-helper.exe",
+      "Bytes": 1082880,
+      "Sha256": "dca22fe3b7ca980452ab10ed979864a68e3091408717664e81dc405dd97ff409",
+      "Matches": true
+    },
+    {
+      "Location": "E:\\Context Relay Releases\\1468327\\extracted",
+      "Path": "context-relay-sidecar-installer.exe",
+      "Bytes": 440320,
+      "Sha256": "33ad57089d0f4d44e867263cbc9c1423d414a293b20b5d614fa8a8b4ac26f503",
+      "Matches": true
+    },
+    {
+      "Location": "E:\\Context Relay Releases\\1468327\\extracted",
+      "Path": "search/model/model_optimized.onnx",
+      "Bytes": 66465124,
+      "Sha256": "51f1bd0addd6e859e42c2c8021a5e5461385bb676a649f4b269aa445449f2431",
+      "Matches": true
+    },
+    {
+      "Location": "E:\\Context Relay Releases\\1468327\\extracted",
+      "Path": "search/model/config.json",
+      "Bytes": 706,
+      "Sha256": "13582bcf2effc85b7bf3d3f5532e686bc1c9ce86bb009d10f0ec33cbe92299dd",
+      "Matches": true
+    },
+    {
+      "Location": "E:\\Context Relay Releases\\1468327\\extracted",
+      "Path": "search/model/special_tokens_map.json",
+      "Bytes": 695,
+      "Sha256": "5d5b662e421ea9fac075174bb0688ee0d9431699900b90662acd44b2a350503a",
+      "Matches": true
+    },
+    {
+      "Location": "E:\\Context Relay Releases\\1468327\\extracted",
+      "Path": "search/model/tokenizer.json",
+      "Bytes": 711396,
+      "Sha256": "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66",
+      "Matches": true
+    },
+    {
+      "Location": "E:\\Context Relay Releases\\1468327\\extracted",
+      "Path": "search/model/tokenizer_config.json",
+      "Bytes": 1242,
+      "Sha256": "0b29c7bfc889e53b36d9dd3e686dd4300f6525110eaa98c76a5dafceb2029f53",
+      "Matches": true
+    },
+    {
+      "Location": "E:\\Context Relay Releases\\1468327\\extracted",
+      "Path": "search/runtime/vcruntime140.dll",
+      "Bytes": 124544,
+      "Sha256": "d5e4d9a3e835fa679450145d6a7d94e36573a509317111904d9b3712c30d9066",
+      "Matches": true
+    },
+    {
+      "Location": "E:\\Context Relay Releases\\1468327\\extracted",
+      "Path": "search/runtime/vcruntime140_1.dll",
+      "Bytes": 49792,
+      "Sha256": "1f2d41c4aa5db0bc33ebf7b66d72943a817d7ce6cbe880502a9403823633093f",
+      "Matches": true
+    },
+    {
+      "Location": "E:\\Context Relay Releases\\1468327\\extracted",
+      "Path": "search/runtime/msvcp140.dll",
+      "Bytes": 557728,
+      "Sha256": "0f885b509a685d2bbfa652fed26b5fb31d88fbdab0a978c641d1c7b8aa460aa9",
+      "Matches": true
+    },
+    {
+      "Location": "E:\\Context Relay Releases\\1468327\\extracted",
+      "Path": "search/runtime/msvcp140_1.dll",
+      "Bytes": 35952,
+      "Sha256": "bfad5aef4c63a669e3c140655cdfdf395b6c979b400a447bd5dcb65ed8826c3d",
+      "Matches": true
+    },
+    {
+      "Location": "E:\\Context Relay Releases\\1468327\\extracted",
+      "Path": "search/runtime/onnxruntime_providers_shared.dll",
+      "Bytes": 22048,
+      "Sha256": "c10763a3764f5c292072533560c341565be64f38fd2807ed5035cd177d3bbb26",
+      "Matches": true
+    },
+    {
+      "Location": "E:\\Context Relay Releases\\1468327\\extracted",
+      "Path": "search/runtime/onnxruntime.dll",
+      "Bytes": 14148680,
+      "Sha256": "114947d633e6844ce3c4b51ef6678f776628571d08a5763859c61642c8dcca9c",
+      "Matches": true
+    },
+    {
+      "Location": "E:\\Context Relay Releases\\1468327\\extracted",
+      "Path": "search/runtime/LICENSE",
+      "Bytes": 1094,
+      "Sha256": "c250d6278f0b47a6439fb7592b08b58a55eb9f535aa49a1db63211c3f982b674",
+      "Matches": true
+    },
+    {
+      "Location": "E:\\Context Relay Releases\\1468327\\extracted",
+      "Path": "search/runtime/ThirdPartyNotices.txt",
+      "Bytes": 331175,
+      "Sha256": "fb0af774b4d7cffc5b9d046f2aaeade2f37df2f80abf8033c95dfffcc77a8866",
+      "Matches": true
+    },
+    {
+      "Location": "C:\\Users\\User\\AppData\\Local\\Context Relay",
+      "Path": "context-relay-desktop.exe",
+      "Bytes": 14019072,
+      "Sha256": "79d7d1849ab4944bd4a1b6eff3d042626c9d196f2d3efb35fd12e984b44eee66",
+      "Matches": true
+    },
+    {
+      "Location": "C:\\Users\\User\\AppData\\Local\\Context Relay",
+      "Path": "context-relay-contextd.exe",
+      "Bytes": 22982144,
+      "Sha256": "a15f750cb31913692fc823ff4645875c7a43137e399fa33421a793e499fc1413",
+      "Matches": true
+    },
+    {
+      "Location": "C:\\Users\\User\\AppData\\Local\\Context Relay",
+      "Path": "context-relay-context-mcp.exe",
+      "Bytes": 5704192,
+      "Sha256": "79a743ea8fdecadcb1f85088643a4e1056d5c4daa98b7aa2987bf28d09b66808",
+      "Matches": true
+    },
+    {
+      "Location": "C:\\Users\\User\\AppData\\Local\\Context Relay",
+      "Path": "context-relay-native-helper.exe",
+      "Bytes": 1082880,
+      "Sha256": "dca22fe3b7ca980452ab10ed979864a68e3091408717664e81dc405dd97ff409",
+      "Matches": true
+    },
+    {
+      "Location": "C:\\Users\\User\\AppData\\Local\\Context Relay",
+      "Path": "context-relay-sidecar-installer.exe",
+      "Bytes": 440320,
+      "Sha256": "33ad57089d0f4d44e867263cbc9c1423d414a293b20b5d614fa8a8b4ac26f503",
+      "Matches": true
+    },
+    {
+      "Location": "C:\\Users\\User\\AppData\\Local\\Context Relay",
+      "Path": "search/model/model_optimized.onnx",
+      "Bytes": 66465124,
+      "Sha256": "51f1bd0addd6e859e42c2c8021a5e5461385bb676a649f4b269aa445449f2431",
+      "Matches": true
+    },
+    {
+      "Location": "C:\\Users\\User\\AppData\\Local\\Context Relay",
+      "Path": "search/model/config.json",
+      "Bytes": 706,
+      "Sha256": "13582bcf2effc85b7bf3d3f5532e686bc1c9ce86bb009d10f0ec33cbe92299dd",
+      "Matches": true
+    },
+    {
+      "Location": "C:\\Users\\User\\AppData\\Local\\Context Relay",
+      "Path": "search/model/special_tokens_map.json",
+      "Bytes": 695,
+      "Sha256": "5d5b662e421ea9fac075174bb0688ee0d9431699900b90662acd44b2a350503a",
+      "Matches": true
+    },
+    {
+      "Location": "C:\\Users\\User\\AppData\\Local\\Context Relay",
+      "Path": "search/model/tokenizer.json",
+      "Bytes": 711396,
+      "Sha256": "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66",
+      "Matches": true
+    },
+    {
+      "Location": "C:\\Users\\User\\AppData\\Local\\Context Relay",
+      "Path": "search/model/tokenizer_config.json",
+      "Bytes": 1242,
+      "Sha256": "0b29c7bfc889e53b36d9dd3e686dd4300f6525110eaa98c76a5dafceb2029f53",
+      "Matches": true
+    },
+    {
+      "Location": "C:\\Users\\User\\AppData\\Local\\Context Relay",
+      "Path": "search/runtime/vcruntime140.dll",
+      "Bytes": 124544,
+      "Sha256": "d5e4d9a3e835fa679450145d6a7d94e36573a509317111904d9b3712c30d9066",
+      "Matches": true
+    },
+    {
+      "Location": "C:\\Users\\User\\AppData\\Local\\Context Relay",
+      "Path": "search/runtime/vcruntime140_1.dll",
+      "Bytes": 49792,
+      "Sha256": "1f2d41c4aa5db0bc33ebf7b66d72943a817d7ce6cbe880502a9403823633093f",
+      "Matches": true
+    },
+    {
+      "Location": "C:\\Users\\User\\AppData\\Local\\Context Relay",
+      "Path": "search/runtime/msvcp140.dll",
+      "Bytes": 557728,
+      "Sha256": "0f885b509a685d2bbfa652fed26b5fb31d88fbdab0a978c641d1c7b8aa460aa9",
+      "Matches": true
+    },
+    {
+      "Location": "C:\\Users\\User\\AppData\\Local\\Context Relay",
+      "Path": "search/runtime/msvcp140_1.dll",
+      "Bytes": 35952,
+      "Sha256": "bfad5aef4c63a669e3c140655cdfdf395b6c979b400a447bd5dcb65ed8826c3d",
+      "Matches": true
+    },
+    {
+      "Location": "C:\\Users\\User\\AppData\\Local\\Context Relay",
+      "Path": "search/runtime/onnxruntime_providers_shared.dll",
+      "Bytes": 22048,
+      "Sha256": "c10763a3764f5c292072533560c341565be64f38fd2807ed5035cd177d3bbb26",
+      "Matches": true
+    },
+    {
+      "Location": "C:\\Users\\User\\AppData\\Local\\Context Relay",
+      "Path": "search/runtime/onnxruntime.dll",
+      "Bytes": 14148680,
+      "Sha256": "114947d633e6844ce3c4b51ef6678f776628571d08a5763859c61642c8dcca9c",
+      "Matches": true
+    },
+    {
+      "Location": "C:\\Users\\User\\AppData\\Local\\Context Relay",
+      "Path": "search/runtime/LICENSE",
+      "Bytes": 1094,
+      "Sha256": "c250d6278f0b47a6439fb7592b08b58a55eb9f535aa49a1db63211c3f982b674",
+      "Matches": true
+    },
+    {
+      "Location": "C:\\Users\\User\\AppData\\Local\\Context Relay",
+      "Path": "search/runtime/ThirdPartyNotices.txt",
+      "Bytes": 331175,
+      "Sha256": "fb0af774b4d7cffc5b9d046f2aaeade2f37df2f80abf8033c95dfffcc77a8866",
+      "Matches": true
+    }
+  ],
+  "Ancestry": {
+    "ObservedUtc": "2026-09-14T01:29:34.0905755Z",
+    "Repository": "E:\\Context Relay Releases\\workspaces\\pr16-release",
+    "Predecessor": "14683270b98f391d9e9bce71792f9ace8620ea04",
+    "Descendant": "86f5f37343978351f1d0cb1e13e28ce9c91a8ffd",
+    "Command": "git merge-base --is-ancestor 14683270b98f391d9e9bce71792f9ace8620ea04 86f5f37343978351f1d0cb1e13e28ce9c91a8ffd",
+    "ExitCode": 0,
+    "IsAncestor": true
+  }
+}

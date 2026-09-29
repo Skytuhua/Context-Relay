@@ -2,12 +2,23 @@ name: Semgrep release qualification
 
 on:
   workflow_dispatch:
+    inputs:
+      windows_only:
+        description: Qualify Windows only; defer Apple jobs and cross-platform publication
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 jobs:
   qualification:
+    # Reusable workflows cannot elevate the caller permission ceiling.
+    # The callee still limits publication to a protected main push.
+    permissions:
+      actions: read
+      contents: write
     uses: ./.github/workflows/ci.yml
     with:
       semgrep_release_qualification: true
+      semgrep_windows_only: ${{ inputs.windows_only }}

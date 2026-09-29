@@ -30,3 +30,20 @@ The protocol crate directly uses the following third-party source packages:
 | uuid | 1.24.0 | Apache-2.0 OR MIT | https://github.com/uuid-rs/uuid |
 
 The repository lockfile records the exact resolved source-package versions.
+
+Windows search resources are staged separately from the Rust executables. The
+installer includes only the pinned files listed in the manifests under
+`crates/core/models/`:
+
+| Resource | Version / source | License / notice |
+| --- | --- | --- |
+| BGE small English embedding model (Qdrant ONNX quantization) | `Qdrant/bge-small-en-v1.5-onnx-Q`, revision `52398278842ec682c6f32300af41344b1c0b0bb2` | Apache-2.0; see the Apache license included with the application |
+| ONNX Runtime Windows x64 | Microsoft ONNX Runtime 1.24.2 | MIT; bundled `search/runtime/LICENSE` and `search/runtime/ThirdPartyNotices.txt` |
+| Microsoft Visual C++ runtime DLLs | 14.44.35211.0, x64 release redistributables from Visual Studio 2022 | Microsoft Software License Terms; copyright Microsoft Corporation. Distributed as application-local supporting libraries, not as standalone developer tools. |
+
+The Visual C++ files are `vcruntime140.dll`, `vcruntime140_1.dll`, `msvcp140.dll`,
+and `msvcp140_1.dll`. Build-time staging verifies their pinned hashes; the selected
+source copies have valid Microsoft signatures. Redistribution is subject to the
+[Visual Studio license terms](https://visualstudio.microsoft.com/license-terms/)
+and [Microsoft's redistributable-file guidance](https://learn.microsoft.com/en-us/cpp/windows/redistributing-visual-cpp-files).
+Application-local copies are serviced through Context Relay releases.

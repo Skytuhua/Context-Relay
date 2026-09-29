@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+test-support = []
+
 [dependencies]
 base64.workspace = true
 context-relay-protocol = { version = "0.1.0", path = "../protocol" }
@@ -27,6 +30,7 @@ windows-sys = { workspace = true, features = [
   "Win32_Foundation",
   "Win32_Security",
   "Win32_Security_Authorization",
+  "Win32_System_Pipes",
   "Win32_System_Threading",
 ] }
 

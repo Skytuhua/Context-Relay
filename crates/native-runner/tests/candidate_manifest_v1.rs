@@ -182,7 +182,16 @@ impl CandidateFixture {
             .finalize();
         let hydrated_root = root.join(format!("{digest:x}")).join("semgrep");
         fs::create_dir_all(&hydrated_root).unwrap();
-        fs::write(hydrated_root.join("osemgrep.exe"), executable).unwrap();
+        let executable_path = hydrated_root.join("osemgrep.exe");
+        fs::write(&executable_path, executable).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let mut permissions = fs::metadata(&executable_path).unwrap().permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(&executable_path, permissions).unwrap();
+        }
         Self {
             root,
             hydrated_root,

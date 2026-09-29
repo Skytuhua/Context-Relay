@@ -237,10 +237,13 @@ mod platform {
 
     pub async fn connect(config: &RuntimeConfig) -> Result<ConnectedStream, IpcError> {
         let endpoint = endpoint_name(config)?;
-        ClientOptions::new()
-            .open(endpoint)
-            .map(ConnectedStream::new)
-            .map_err(map_connect_error)
+        crate::pipe_connect::open_pipe_with(
+            || ClientOptions::new().open(&endpoint),
+            ERROR_PIPE_BUSY as i32,
+        )
+        .await
+        .map(ConnectedStream::new)
+        .map_err(map_connect_error)
     }
 
     pub(super) fn endpoint_name(config: &RuntimeConfig) -> Result<String, IpcError> {

@@ -1,0 +1,435 @@
+{
+  "observedUtc": "2026-09-14T05:41:40.770024+00:00",
+  "sourceCommit": "924348a36900e89df6bc8b41fa6162127c24b8b3",
+  "inheritedReviewBaseline": "f59c394527f8e76d37e4e00cdb2aea584a135f50",
+  "workingByteManifestSha256": "7d3c60f81a0046a745d3cabc1e688bd71c7db4dfd98eab84f0f423fd299ab18a",
+  "scope": "Reviewed Task2 and inherited Task5 source checkpoint. Git-normalized committed bytes are separate from preserved tested/reviewed working bytes. Earlier tests retain their recorded source-stage limits; single final SQL whitespace byte independently reviewed. No hosted, installed, randomized full-suite or release qualification implied.",
+  "paths": [
+    {
+      "path": "apps/desktop/src/bindings.ts",
+      "reviewedWorkingBytesSha256": "72133734030a5ebb023237a0d40de63a64fd5bda7748cd55d728c51913a0dc2e",
+      "committedGitBlob": "6405b8c754248836b1212c9c2e0f1dcd62dbb88d",
+      "committedBytesSha256": "72133734030a5ebb023237a0d40de63a64fd5bda7748cd55d728c51913a0dc2e"
+    },
+    {
+      "path": "apps/desktop/src/protocol-validation.ts",
+      "reviewedWorkingBytesSha256": "63a7ad52dc5320ec37ddc04620f368ebadab6a2989599ea8b802311fde54bdc0",
+      "committedGitBlob": "967b5316dbcb3588558779758213171329d3818d",
+      "committedBytesSha256": "8076bfbf049222d8a7b4f119227f905196f9521fac6d93dd4ab775eb3dc64fa6"
+    },
+    {
+      "path": "apps/desktop/src/recovery-restore.test.tsx",
+      "reviewedWorkingBytesSha256": "00d97ac87c628cd0666df29335d3dadb57472c5fad2f506572560570f4348190",
+      "committedGitBlob": "87feb332ceed7b347a32002e183920b2ba19b990",
+      "committedBytesSha256": "00d97ac87c628cd0666df29335d3dadb57472c5fad2f506572560570f4348190"
+    },
+    {
+      "path": "apps/desktop/src/recovery-restore.tsx",
+      "reviewedWorkingBytesSha256": "22b0e8bdba1cc405c3daf3cbdd720dfae18e09365869d50bea835b14a425fa2b",
+      "committedGitBlob": "7d91c03a71c31cd9157433ff07cffbc2690752dc",
+      "committedBytesSha256": "22b0e8bdba1cc405c3daf3cbdd720dfae18e09365869d50bea835b14a425fa2b"
+    },
+    {
+      "path": "crates/contextd/src/hosted_sync.rs",
+      "reviewedWorkingBytesSha256": "80ef718c17146e4b95703ed86aeb1c466d4d5056a8e13eecd54097b56037c497",
+      "committedGitBlob": "8c0699956e9187da3958493d19ab28e46df1b935",
+      "committedBytesSha256": "80ef718c17146e4b95703ed86aeb1c466d4d5056a8e13eecd54097b56037c497"
+    },
+    {
+      "path": "crates/contextd/src/lib.rs",
+      "reviewedWorkingBytesSha256": "5f1cb5fda0b4e0bae0b1d6269b03be1577d29ba1928510d76c57b513c922c1e9",
+      "committedGitBlob": "3a4c949b1e74ae2153aacf305190eced9c6d8d0f",
+      "committedBytesSha256": "5f1cb5fda0b4e0bae0b1d6269b03be1577d29ba1928510d76c57b513c922c1e9"
+    },
+    {
+      "path": "crates/contextd/src/pairing_test_provider.rs",
+      "reviewedWorkingBytesSha256": "b181023c96b567318a050651d5942745cfa7ac019700bcbd400f8ff81ef07758",
+      "committedGitBlob": "576ec6cb20cec950002c2186011f2a3add8f49ba",
+      "committedBytesSha256": "b181023c96b567318a050651d5942745cfa7ac019700bcbd400f8ff81ef07758"
+    },
+    {
+      "path": "crates/contextd/src/pairing.rs",
+      "reviewedWorkingBytesSha256": "d7fd9bf9c95f47d9ef8e1b3f8c1ba6489b2c25da8b7f39c4a0f1c7da56b1b79b",
+      "committedGitBlob": "bd03cb9d546825e3228229216737fd0925781c07",
+      "committedBytesSha256": "d7fd9bf9c95f47d9ef8e1b3f8c1ba6489b2c25da8b7f39c4a0f1c7da56b1b79b"
+    },
+    {
+      "path": "crates/contextd/src/recovery_enrollment.rs",
+      "reviewedWorkingBytesSha256": "90b7b1b9ecd0cbe896f849c499d23c1ad8a7e2e2ebb36e6a2c5f501b795a1535",
+      "committedGitBlob": "dde8a008f3fcf0aaf51fc17ac38107fef9ec9560",
+      "committedBytesSha256": "90b7b1b9ecd0cbe896f849c499d23c1ad8a7e2e2ebb36e6a2c5f501b795a1535"
+    },
+    {
+      "path": "crates/core/migrations/0042_pairing_v2.sql",
+      "reviewedWorkingBytesSha256": "44af084209de3c92c751053b6cb3814447bfa154fbc9fc72ec4cc99bcba709e7",
+      "committedGitBlob": "ec439bc19d3512a1ed38e4476ad9814116994326",
+      "committedBytesSha256": "44af084209de3c92c751053b6cb3814447bfa154fbc9fc72ec4cc99bcba709e7"
+    },
+    {
+      "path": "crates/core/migrations/0043_recovery_membership.sql",
+      "reviewedWorkingBytesSha256": "850f89a506676c8f01a1571d47eedca056eebf5d41631dde68a279c49e49e000",
+      "committedGitBlob": "17a27ad50a70ad17601d60b9ee672d02203f231e",
+      "committedBytesSha256": "850f89a506676c8f01a1571d47eedca056eebf5d41631dde68a279c49e49e000"
+    },
+    {
+      "path": "crates/core/migrations/0044_recovery_v2_preparation.sql",
+      "reviewedWorkingBytesSha256": "f9d7373002383fbe8ec86eed04f38637c3b159e73520adf2194809b7dd7e0d3d",
+      "committedGitBlob": "373a82d207dc672f9624c36864f393113b50661c",
+      "committedBytesSha256": "f9d7373002383fbe8ec86eed04f38637c3b159e73520adf2194809b7dd7e0d3d"
+    },
+    {
+      "path": "crates/core/migrations/0045_recovery_history.sql",
+      "reviewedWorkingBytesSha256": "3c6764f6c46f3911aede4afab23f76dc8c2045053995dbdb0e72077db02016b9",
+      "committedGitBlob": "905dc9621373aed9ec32c7ff319b52cbfd1b8745",
+      "committedBytesSha256": "3c6764f6c46f3911aede4afab23f76dc8c2045053995dbdb0e72077db02016b9"
+    },
+    {
+      "path": "crates/core/migrations/0046_recovery_conflict.sql",
+      "reviewedWorkingBytesSha256": "553a68ce0fe010b31d5efecd34f1c8651f9a2bcc132621c3bf2f9db93109afca",
+      "committedGitBlob": "77401f72f5418d333c2850d1e1114ab554f88e98",
+      "committedBytesSha256": "8eadb16c5799e55d86043e544d569207e2637fc6ce0a0668ee7f10822b4d4dc4"
+    },
+    {
+      "path": "crates/core/src/devices/crypto/control_v2.rs",
+      "reviewedWorkingBytesSha256": "3d72ea86af80a322faa8181885f1d24914622131b8827e203e26aaa1d63ee006",
+      "committedGitBlob": "c99c4df6de11322b235d56a0b7d2afa52e60d1fc",
+      "committedBytesSha256": "3d72ea86af80a322faa8181885f1d24914622131b8827e203e26aaa1d63ee006"
+    },
+    {
+      "path": "crates/core/src/devices/membership_crypto.rs",
+      "reviewedWorkingBytesSha256": "7faebc6975b9827419ddbdb8663fc11dc02ef4f3597519176f065e25379fc3a2",
+      "committedGitBlob": "6801e3077e4fe024fb251f62ae92dc61710fa810",
+      "committedBytesSha256": "7faebc6975b9827419ddbdb8663fc11dc02ef4f3597519176f065e25379fc3a2"
+    },
+    {
+      "path": "crates/core/src/devices/membership_transport.rs",
+      "reviewedWorkingBytesSha256": "62897f7ec8a848b1abd567415144bdab24e8b5473309ee9fb876aa06fe357520",
+      "committedGitBlob": "7853cfa9538c6821395f9f499d13d6f12ae99218",
+      "committedBytesSha256": "62897f7ec8a848b1abd567415144bdab24e8b5473309ee9fb876aa06fe357520"
+    },
+    {
+      "path": "crates/core/src/devices/memory_recovery_transport.rs",
+      "reviewedWorkingBytesSha256": "39e998ec0416077fec5f96b1ab9bee80cbf6fbf24736be3bdefaae831066943d",
+      "committedGitBlob": "a9e6928f92e375b1a30e194452e2b53615ec126a",
+      "committedBytesSha256": "39e998ec0416077fec5f96b1ab9bee80cbf6fbf24736be3bdefaae831066943d"
+    },
+    {
+      "path": "crates/core/src/devices/memory_transport.rs",
+      "reviewedWorkingBytesSha256": "58788f49727430dc8ad1382fce995f7a14f057e2a3ace4e00bf7c4aab5c6200a",
+      "committedGitBlob": "b3131d935aaa341c9ba17f4775388a31112d38f1",
+      "committedBytesSha256": "58788f49727430dc8ad1382fce995f7a14f057e2a3ace4e00bf7c4aab5c6200a"
+    },
+    {
+      "path": "crates/core/src/devices/mod.rs",
+      "reviewedWorkingBytesSha256": "b4acc4dffdb0c26440ca6477f97fc87291f494e001d46055b45787b4947b4cee",
+      "committedGitBlob": "5f58b339d9c318dd34114cd63f1d7b46a6ba20d7",
+      "committedBytesSha256": "b4acc4dffdb0c26440ca6477f97fc87291f494e001d46055b45787b4947b4cee"
+    },
+    {
+      "path": "crates/core/src/devices/pairing.rs",
+      "reviewedWorkingBytesSha256": "923b475cfbcd4579c855ab47acd6b654fdcd694eda1145ed5b3faf23fb771c37",
+      "committedGitBlob": "45cc4bd3d071593cf5392b7381d33063253de61e",
+      "committedBytesSha256": "923b475cfbcd4579c855ab47acd6b654fdcd694eda1145ed5b3faf23fb771c37"
+    },
+    {
+      "path": "crates/core/src/devices/pairing/v2.rs",
+      "reviewedWorkingBytesSha256": "a0dc15bfd65b03bf0fed443ff7b6f6f0f068c8ee2f85817e8429ed3b411dbab7",
+      "committedGitBlob": "62b1c38b6021d625ad7e0ad23fdb7d1b7a48b268",
+      "committedBytesSha256": "a0dc15bfd65b03bf0fed443ff7b6f6f0f068c8ee2f85817e8429ed3b411dbab7"
+    },
+    {
+      "path": "crates/core/src/devices/recovery_restore_crypto.rs",
+      "reviewedWorkingBytesSha256": "12f82d0f6a0da0937b149eb5c19aa284a1062c0242fffa4e81a11a849e03215a",
+      "committedGitBlob": "0b6b6af8784fb5df44fbef90d0acece62c4f0c13",
+      "committedBytesSha256": "12f82d0f6a0da0937b149eb5c19aa284a1062c0242fffa4e81a11a849e03215a"
+    },
+    {
+      "path": "crates/core/src/devices/recovery_restore_crypto/v2.rs",
+      "reviewedWorkingBytesSha256": "7807e8f4d7c66851a5ae2f6023d976131a882628e866cf88f3716775459087a3",
+      "committedGitBlob": "2bbf923363a2461a09aabba370cae0aaea2054fb",
+      "committedBytesSha256": "7807e8f4d7c66851a5ae2f6023d976131a882628e866cf88f3716775459087a3"
+    },
+    {
+      "path": "crates/core/src/devices/recovery_restore_transport.rs",
+      "reviewedWorkingBytesSha256": "94f4be38a1841ca1176516c1c07e8cb00c4793e8a90cae60705abf1e9f0799bb",
+      "committedGitBlob": "64cd694b22b692c748e7d099a986c042f4aada70",
+      "committedBytesSha256": "94f4be38a1841ca1176516c1c07e8cb00c4793e8a90cae60705abf1e9f0799bb"
+    },
+    {
+      "path": "crates/core/src/devices/recovery_restore.rs",
+      "reviewedWorkingBytesSha256": "974aa8f6b7b0cab4cab9ecedd3633bf963f8db76a352b4c4e55e0771f0f004fa",
+      "committedGitBlob": "f040270d41e2745a11c4bc0f13ef2fd46056ad5c",
+      "committedBytesSha256": "974aa8f6b7b0cab4cab9ecedd3633bf963f8db76a352b4c4e55e0771f0f004fa"
+    },
+    {
+      "path": "crates/core/src/devices/recovery_restore/v2.rs",
+      "reviewedWorkingBytesSha256": "84f1170a2fffb05f377d2c2ae9cd0dbb5843bd451666e23268b30da9f8fead1b",
+      "committedGitBlob": "c2665eee7fb2f7fe10e6a4756330066589171ab6",
+      "committedBytesSha256": "84f1170a2fffb05f377d2c2ae9cd0dbb5843bd451666e23268b30da9f8fead1b"
+    },
+    {
+      "path": "crates/core/src/devices/recovery_transport.rs",
+      "reviewedWorkingBytesSha256": "7ccfa5fa3a72379b8cf54d37387e1876523d6e89ffdf448842f0131608a51a7d",
+      "committedGitBlob": "84a64d4c2b00b9b425388473d13aa86b4b42de20",
+      "committedBytesSha256": "e814ba115150aad7d7789ff5c1fad679d0b8d194b083238ec51dad53761ad4cf"
+    },
+    {
+      "path": "crates/core/src/devices/recovery.rs",
+      "reviewedWorkingBytesSha256": "ea24314bd03f78ad2f9c4f5ab69e921979124806506add1833a0862ebabac5e5",
+      "committedGitBlob": "41531ceee64e5a6b775ea6ae9b6483499b176dfc",
+      "committedBytesSha256": "ea24314bd03f78ad2f9c4f5ab69e921979124806506add1833a0862ebabac5e5"
+    },
+    {
+      "path": "crates/core/src/devices/supabase_enrollment.rs",
+      "reviewedWorkingBytesSha256": "11329a27b8225005e697524d7ed6a557dbf7061b0cf48b9ce45e4bd2fd73781c",
+      "committedGitBlob": "a62cc0ff9edc5ceec46313fdcdd82d13c4a0a64e",
+      "committedBytesSha256": "11329a27b8225005e697524d7ed6a557dbf7061b0cf48b9ce45e4bd2fd73781c"
+    },
+    {
+      "path": "crates/core/src/devices/supabase_pairing.rs",
+      "reviewedWorkingBytesSha256": "98c3e6934b445de2af70bfab2b2744b9a62e6ffaf23f6a97db0e9bc8bf397c7c",
+      "committedGitBlob": "b2ba8bec2ca359e8952001b8f26178193d363719",
+      "committedBytesSha256": "98c3e6934b445de2af70bfab2b2744b9a62e6ffaf23f6a97db0e9bc8bf397c7c"
+    },
+    {
+      "path": "crates/core/src/devices/transport.rs",
+      "reviewedWorkingBytesSha256": "84bfee7fa9141716ca3db08b4b39fd7dacba4b6716cd001bd6ce305cb0b71518",
+      "committedGitBlob": "2c596b5e5dbd8eb1d87b50d7167dad33340e396d",
+      "committedBytesSha256": "84bfee7fa9141716ca3db08b4b39fd7dacba4b6716cd001bd6ce305cb0b71518"
+    },
+    {
+      "path": "crates/core/src/vault.rs",
+      "reviewedWorkingBytesSha256": "aa50f1ad4d8c6fe84980ecb18ec295aab9fe0854294b25c5b0660848714e2f18",
+      "committedGitBlob": "679ea6d4ee36284eae720353c48126d3ddcfd4c3",
+      "committedBytesSha256": "aa50f1ad4d8c6fe84980ecb18ec295aab9fe0854294b25c5b0660848714e2f18"
+    },
+    {
+      "path": "crates/core/src/vault/devices.rs",
+      "reviewedWorkingBytesSha256": "84f906d33183097498fb3be3c89158c13bda3af8c48dc4fa9f1c35091f9356a0",
+      "committedGitBlob": "1072f4d776350ce9c734fbd4d6629fd79c9b04c0",
+      "committedBytesSha256": "84f906d33183097498fb3be3c89158c13bda3af8c48dc4fa9f1c35091f9356a0"
+    },
+    {
+      "path": "crates/core/src/vault/hosted_pairing.rs",
+      "reviewedWorkingBytesSha256": "65114615a2c7402bec9c7353cf8dc769e7bc0613e3819c80d4cf62958d46df8a",
+      "committedGitBlob": "dd9b15caea51fe63f0e47b2cf30fbf1ace568283",
+      "committedBytesSha256": "65114615a2c7402bec9c7353cf8dc769e7bc0613e3819c80d4cf62958d46df8a"
+    },
+    {
+      "path": "crates/core/src/vault/membership.rs",
+      "reviewedWorkingBytesSha256": "ac2d2fc7d917f15f5d4e147979e6e950c9d4eaa90e0d9c23af8d88ebbfbf23aa",
+      "committedGitBlob": "84b84fd22633b7c554955cdbbdf1b047118b1099",
+      "committedBytesSha256": "ac2d2fc7d917f15f5d4e147979e6e950c9d4eaa90e0d9c23af8d88ebbfbf23aa"
+    },
+    {
+      "path": "crates/core/src/vault/membership/device_views.rs",
+      "reviewedWorkingBytesSha256": "1491e1af26226923143a1602e4a95215d635296b0dbff8681fdda1879d0e678a",
+      "committedGitBlob": "6c5be43ee3e31db002c8eab6c91cb0acb24c6901",
+      "committedBytesSha256": "1491e1af26226923143a1602e4a95215d635296b0dbff8681fdda1879d0e678a"
+    },
+    {
+      "path": "crates/core/src/vault/membership/material.rs",
+      "reviewedWorkingBytesSha256": "cea6764454363d68a704ebffd1301416704ada1fbf285dff1201a8904613c4ed",
+      "committedGitBlob": "d1833fc30cc3a6b43adda0edbd5a368522b3b5b5",
+      "committedBytesSha256": "cea6764454363d68a704ebffd1301416704ada1fbf285dff1201a8904613c4ed"
+    },
+    {
+      "path": "crates/core/src/vault/membership/reconstruction.rs",
+      "reviewedWorkingBytesSha256": "cc4569e03aa8c3fa6358d4e22ebf7f864d0c08ac249a227c0f59fbc96eb27e9d",
+      "committedGitBlob": "39e8546f20c64b58c21b7c77669feaf2d997a5eb",
+      "committedBytesSha256": "cc4569e03aa8c3fa6358d4e22ebf7f864d0c08ac249a227c0f59fbc96eb27e9d"
+    },
+    {
+      "path": "crates/core/src/vault/membership/reconstruction/recovery.rs",
+      "reviewedWorkingBytesSha256": "cc2d634578506c8bc4c473a6bc1d84b78891d277ef541a6700d305fb060c3356",
+      "committedGitBlob": "741272b2287defe6dc169f642570b56e5315ce4c",
+      "committedBytesSha256": "cc2d634578506c8bc4c473a6bc1d84b78891d277ef541a6700d305fb060c3356"
+    },
+    {
+      "path": "crates/core/src/vault/membership/recovery.rs",
+      "reviewedWorkingBytesSha256": "adf2098c6d5e3dbf855f7f64b67be9caf28c47d3426fb5f99dcbe74c159b51b2",
+      "committedGitBlob": "7bcfb7b7236cb49b06c32a51e4608eba11223f9c",
+      "committedBytesSha256": "adf2098c6d5e3dbf855f7f64b67be9caf28c47d3426fb5f99dcbe74c159b51b2"
+    },
+    {
+      "path": "crates/core/src/vault/pairing_v2.rs",
+      "reviewedWorkingBytesSha256": "29e196824f3cbfeb8f522df75e4fb97d1cdc0788d7d0532dcea45b94f9308010",
+      "committedGitBlob": "58c8bafc72bcdfed23710a222e234dfd4f41ff04",
+      "committedBytesSha256": "29e196824f3cbfeb8f522df75e4fb97d1cdc0788d7d0532dcea45b94f9308010"
+    },
+    {
+      "path": "crates/core/src/vault/recovery_restore.rs",
+      "reviewedWorkingBytesSha256": "a76870961bd090b59453001432947a2511e43f21ad87f72d78ef7125bbf4da68",
+      "committedGitBlob": "67046798e33c3a2874d97f7f581f7165dfa9bdcd",
+      "committedBytesSha256": "a76870961bd090b59453001432947a2511e43f21ad87f72d78ef7125bbf4da68"
+    },
+    {
+      "path": "crates/core/src/vault/recovery_v2.rs",
+      "reviewedWorkingBytesSha256": "b8020ce19c3f6c25b82533ba707389f5eebbd38b5eeba1f273ac272d72983a5b",
+      "committedGitBlob": "de076284e08d6ad0d0bcba0e10edc771c302d51e",
+      "committedBytesSha256": "b8020ce19c3f6c25b82533ba707389f5eebbd38b5eeba1f273ac272d72983a5b"
+    },
+    {
+      "path": "crates/core/tests/device_pairing_e2e_v2.rs",
+      "reviewedWorkingBytesSha256": "90e7f8f58589e956e344596317c8b3812ffac7f4ec00c8ac755a9a6cbb6a8ff1",
+      "committedGitBlob": "f7cb25c0d74f9481351375d20d35a53c1209205a",
+      "committedBytesSha256": "90e7f8f58589e956e344596317c8b3812ffac7f4ec00c8ac755a9a6cbb6a8ff1"
+    },
+    {
+      "path": "crates/core/tests/fixtures/hosted-pairing-approval-v2.json",
+      "reviewedWorkingBytesSha256": "1a9a8c5d61ba31a62940dd4694658fc34f3328270224da37ca4725c19ff5a072",
+      "committedGitBlob": "900b25b30f747ffa828a1100f7a5b23e86442b8f",
+      "committedBytesSha256": "1a9a8c5d61ba31a62940dd4694658fc34f3328270224da37ca4725c19ff5a072"
+    },
+    {
+      "path": "crates/core/tests/fixtures/hosted-recovery-claim-v2.json",
+      "reviewedWorkingBytesSha256": "e2839e58e6765cb49ee8c9209b4ec40d763c8416866fd268adf215fc8ce5d59b",
+      "committedGitBlob": "e438c1e7ed12b4791253934b6fe30664d96955e5",
+      "committedBytesSha256": "e2839e58e6765cb49ee8c9209b4ec40d763c8416866fd268adf215fc8ce5d59b"
+    },
+    {
+      "path": "crates/core/tests/hosted_auth_transport_v1.rs",
+      "reviewedWorkingBytesSha256": "9124d6c78275f5151026432b25b9cf4c400bd90cc495313072c68814644018db",
+      "committedGitBlob": "ad61ba4c1a1309bdff090b5bcf94191f7fc6c217",
+      "committedBytesSha256": "9124d6c78275f5151026432b25b9cf4c400bd90cc495313072c68814644018db"
+    },
+    {
+      "path": "crates/core/tests/membership_vault_v1.rs",
+      "reviewedWorkingBytesSha256": "c98f2fd439b6e0176b3146ec7a44b8901dbd4580786d53cf42a83e4d2935c6e1",
+      "committedGitBlob": "80f8078b1b2c4a574dc4279561d4ae380e5f7d0f",
+      "committedBytesSha256": "c98f2fd439b6e0176b3146ec7a44b8901dbd4580786d53cf42a83e4d2935c6e1"
+    },
+    {
+      "path": "crates/core/tests/recovery_restore_crypto_v2.rs",
+      "reviewedWorkingBytesSha256": "9f56e2f04961e6d8046bb05074c80ee98de50573b167c71861c4e90811fd6726",
+      "committedGitBlob": "69f874cb64b1181afd51a900aedf5a34ccfaf67a",
+      "committedBytesSha256": "9f56e2f04961e6d8046bb05074c80ee98de50573b167c71861c4e90811fd6726"
+    },
+    {
+      "path": "crates/core/tests/recovery_restore_e2e_v1.rs",
+      "reviewedWorkingBytesSha256": "0b1b16700a32538b52e3d7948ab73ee563a6664f35378bacfaa922792394de13",
+      "committedGitBlob": "d9f7bd89b753fefcf5460d7ed0aac4e054f91ca3",
+      "committedBytesSha256": "0b1b16700a32538b52e3d7948ab73ee563a6664f35378bacfaa922792394de13"
+    },
+    {
+      "path": "crates/core/tests/recovery_restore_e2e_v2.rs",
+      "reviewedWorkingBytesSha256": "5de04cb2315188c8fa85aa903e276600ebc5b319819ee77865ea89240d9bcd2b",
+      "committedGitBlob": "33903c97d574eef410b6eb7571f24f2c292eceb2",
+      "committedBytesSha256": "6b327c5c371330eae354a611ee3f773965adc958236fb4495b93a607d8e513df"
+    },
+    {
+      "path": "crates/core/tests/support/mod.rs",
+      "reviewedWorkingBytesSha256": "93fe1ef024bb2756e604f795d960cb5643036606ac238ace9f7894eb1c8c7c81",
+      "committedGitBlob": "2293d04d7dec86adab58e0a5b5ca198c2d7052d4",
+      "committedBytesSha256": "5a4f3a1cf98519a9dceb9157cb796a58b0f5991b6e0b50574e274308bf59e3c2"
+    },
+    {
+      "path": "crates/protocol/src/ipc.rs",
+      "reviewedWorkingBytesSha256": "81fd4c1c60666638af41422073c73c55933a4e6748e8c6ee70a4b1fd94653ecf",
+      "committedGitBlob": "60c05d63b27b6e46605f4f65ad0ee6337c0a3b57",
+      "committedBytesSha256": "86c0ba3152cb6837c9a0cbef8bc295efed64ce61fbd98d0c5df6997d702fe7c7"
+    },
+    {
+      "path": "scripts/tests/hosted-enrollment-restore-v2.test.mjs",
+      "reviewedWorkingBytesSha256": "65238518fed513883f2af86f753e79b384e1bf65974502fffe71aede4667a274",
+      "committedGitBlob": "5ca60069d4a08286fa9f3d05861497cead5a9dbf",
+      "committedBytesSha256": "de2b0b2b187a1dcfdcac623dfae0faea3d4f03d7544ee814dd2e63967d2b8510"
+    },
+    {
+      "path": "scripts/verify-membership-postgres.mjs",
+      "reviewedWorkingBytesSha256": "77cb844ad00212bedf6c77a4e7022539eefa7600c61f4184c0ea6a5e6a1adbd9",
+      "committedGitBlob": "9656c9e7a37a1ad4daaf99539d21aad4d8533541",
+      "committedBytesSha256": "fa7c8f6d1ebdb4f2a471783d4041898fc280b5e1231fe7e1dac5552df7f23a13"
+    },
+    {
+      "path": "supabase/functions/enrollment/adapter.mjs",
+      "reviewedWorkingBytesSha256": "92ba94ecacf77349435d1cc9b51e6767f5ffdfc99bc2e31e7e362ce467070acf",
+      "committedGitBlob": "f4637b61f7e03f9dbdb68cb59d499ee75931985a",
+      "committedBytesSha256": "4de9c91c1835d3179d024eb0f6e40075fefb4aafaadb73fe7e185e0a9b762e28"
+    },
+    {
+      "path": "supabase/functions/enrollment/core.mjs",
+      "reviewedWorkingBytesSha256": "2c05daabf208017cfd6dcf468f55582d6d01ede3839c835b1492ebc2c5c4c47d",
+      "committedGitBlob": "b76ac3b37902bee3ba9ac7bd9906a9d13baa55c8",
+      "committedBytesSha256": "2e839221ccf462e2e9e1168dd1b89bee8891094311f78822d7227b0770b6a62c"
+    },
+    {
+      "path": "supabase/functions/enrollment/proof.mjs",
+      "reviewedWorkingBytesSha256": "6ceeac1e17fc119448cfd881188e3bf4f442a0e95444caf79abe6fac1dbe91ea",
+      "committedGitBlob": "0b2dee7246fc3d7cc7594949d4b0a64794687d87",
+      "committedBytesSha256": "34dbd839c6bba078b8c589db09577cfa393ad4410d88c80d34881744fbcd3870"
+    },
+    {
+      "path": "supabase/functions/enrollment/record.mjs",
+      "reviewedWorkingBytesSha256": "63bdb8f85201466b19862e082ad963adf679a58baf857c17c1e5a9120d4fde16",
+      "committedGitBlob": "7995a9f617ae8424f79611b1ff8c5d5dd99b5c86",
+      "committedBytesSha256": "1dfe69ef3e0474a8aae4e23a97326c3b1ab25ea797b4d2fc46a1c7429ab3978d"
+    },
+    {
+      "path": "supabase/functions/enrollment/restore.mjs",
+      "reviewedWorkingBytesSha256": "6c2046dd31db1c35b4bd588b1691b0c07f5bc61f29cb851b8da7811939338a4d",
+      "committedGitBlob": "e3697e2a797bda25776ce301e6c24be7774bbd38",
+      "committedBytesSha256": "cc7dfb5c99b1bdb3dcec52001415851a3cfb248d84382d7241e684e206b34e11"
+    },
+    {
+      "path": "supabase/functions/pairing/adapter.mjs",
+      "reviewedWorkingBytesSha256": "d5f67a649f5601be95fdcf7fe4be8a153f4136f116d534bb2ee1ab9d44d34e51",
+      "committedGitBlob": "3b85c0440f9d2197c928230bd670bf1bc87759d9",
+      "committedBytesSha256": "d5f67a649f5601be95fdcf7fe4be8a153f4136f116d534bb2ee1ab9d44d34e51"
+    },
+    {
+      "path": "supabase/functions/pairing/adapter.test.mjs",
+      "reviewedWorkingBytesSha256": "6cd24846b61e6d0b32d86f01a9fcfef98b32944c34896e27cde1b29a6c15267a",
+      "committedGitBlob": "fed978d8bf6b9110a95e0900e5e577828b50532c",
+      "committedBytesSha256": "6cd24846b61e6d0b32d86f01a9fcfef98b32944c34896e27cde1b29a6c15267a"
+    },
+    {
+      "path": "supabase/functions/pairing/approval-v2.test.mjs",
+      "reviewedWorkingBytesSha256": "1cdf9b2d77e855060a1ab906de7e2624a72e3fee0d15573017c349d846339804",
+      "committedGitBlob": "14e4a036d89bdbe56dde81a8c613d3796828869d",
+      "committedBytesSha256": "1cdf9b2d77e855060a1ab906de7e2624a72e3fee0d15573017c349d846339804"
+    },
+    {
+      "path": "supabase/functions/pairing/approval.mjs",
+      "reviewedWorkingBytesSha256": "f285c3a6de845661ed1376248d332126032d277cd240036e675e99c014d5c4e4",
+      "committedGitBlob": "728c185a7f4f15b77deb3fdef5ec9a186c5f6fd9",
+      "committedBytesSha256": "f285c3a6de845661ed1376248d332126032d277cd240036e675e99c014d5c4e4"
+    },
+    {
+      "path": "supabase/functions/pairing/core.mjs",
+      "reviewedWorkingBytesSha256": "96c7158c9c0c0970b196485be5a932cee5ec710ea1acd3e9ea17ea73335ce877",
+      "committedGitBlob": "ccbaef9a31f642cda0f5b6cca6b6c99658a702af",
+      "committedBytesSha256": "96c7158c9c0c0970b196485be5a932cee5ec710ea1acd3e9ea17ea73335ce877"
+    },
+    {
+      "path": "supabase/functions/pairing/membership.test.mjs",
+      "reviewedWorkingBytesSha256": "a860b757e9c424707f34381e84a1238792d8f83c8ec091da72ad6cfda685cf8d",
+      "committedGitBlob": "e4038e759897f858baf2abde536dca96cd474b4a",
+      "committedBytesSha256": "a860b757e9c424707f34381e84a1238792d8f83c8ec091da72ad6cfda685cf8d"
+    },
+    {
+      "path": "supabase/functions/pairing/proof.mjs",
+      "reviewedWorkingBytesSha256": "9e4d725b3f82c1c1c30a0da8de46ce49e1d0dde21e08441cebd1429b4e49186f",
+      "committedGitBlob": "7610d9fb448844aea885747bdf2864019fb3abc7",
+      "committedBytesSha256": "9e4d725b3f82c1c1c30a0da8de46ce49e1d0dde21e08441cebd1429b4e49186f"
+    },
+    {
+      "path": "supabase/migrations/20260913210523_membership_public_history_v2.sql",
+      "reviewedWorkingBytesSha256": "ab9731b3730b1447f5d93f5876a6c298060e941cd614cdebe0f02d9f24633a86",
+      "committedGitBlob": "f7330dcf84c8f267fb8b535aebd6515059366b9c",
+      "committedBytesSha256": "c5e08169ab8de9cee82fa3e4778b24aaff58f5eb170ae935ba79558f1283a8a7"
+    },
+    {
+      "path": "crates/core/src/vault/sync.rs",
+      "reviewedWorkingBytesSha256": "4519ff758f19d4a8f052fd7e0c7e182743c01a45dc438dc1591bc0b2e88d7fa9",
+      "committedGitBlob": "f11104a0fcb1f41f1d51f1bb14ce8f429077d987",
+      "committedBytesSha256": "57954888629655d2efb3cfe2b006f090320e75b13fc44eaab1de9f9d65a5908e"
+    },
+    {
+      "path": "crates/core/tests/recovery_enrollment_vault_v1.rs",
+      "reviewedWorkingBytesSha256": "b1291a47991a4f2282eb43423050377b83b4058f398b6cb30b6a20d933afd25b",
+      "committedGitBlob": "6d77aec8a149c5887746d95bfb0418db01fdf2cf",
+      "committedBytesSha256": "b1291a47991a4f2282eb43423050377b83b4058f398b6cb30b6a20d933afd25b"
+    }
+  ]
+}
