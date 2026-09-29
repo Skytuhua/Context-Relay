@@ -36,6 +36,16 @@ const INVITE_LIFETIME_MS: u64 = 600_000;
 const MAX_FAILED_ATTEMPTS: u8 = 5;
 const MAX_SESSION_ID_BYTES: usize = 128;
 const MAX_ENTROPY_RETRIES: usize = 32;
+/// Cap on concurrently tracked join sessions.
+///
+/// A join session id arrives from an unauthenticated caller and is inserted
+/// with `entry().or_default()`, so without a cap any local process could grow
+/// the map without bound simply by asking for new ids.
+const MAX_JOIN_SESSIONS: usize = 64;
+/// How long an expired invite is kept so a caller can still be told it expired
+/// rather than that it is missing. An hour is far longer than a client needs to
+/// ask about a code it just watched lapse.
+const EXPIRED_RETAIN_GRACE_MS: u64 = 3_600_000;
 const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 type HmacSha256 = Hmac<Sha256>;
@@ -220,6 +230,16 @@ impl InMemoryPairingProvider {
         Ok(())
     }
 
+    /// Number of invites and join sessions currently retained.
+    ///
+    /// Exposed so retention is observable rather than inferred: both maps grow
+    /// on paths reachable without authentication, and a regression that stopped
+    /// sweeping them would otherwise be invisible until memory grew.
+    pub fn retained_state_counts(&self) -> Result<(usize, usize), PairingTransportError> {
+        let state = lock(&self.shared)?;
+        Ok((state.invites.len(), state.sessions.len()))
+    }
+
     pub fn existing_device_client(
         &self,
         scope: SyncScope,
@@ -240,6 +260,9 @@ impl InMemoryPairingProvider {
             return Err(PairingTransportError::Unauthorized);
         }
         let mut state = lock(&self.shared)?;
+        if !state.sessions.contains_key(session_id) && state.sessions.len() >= MAX_JOIN_SESSIONS {
+            return Err(PairingTransportError::Transient);
+        }
         state.sessions.entry(session_id.to_owned()).or_default();
         drop(state);
         Ok(InMemoryPairingJoinClient {
@@ -338,7 +361,7 @@ impl PairingJoinTransport for InMemoryPairingJoinClient {
         now_ms: u64,
     ) -> Result<PairingId, PairingTransportError> {
         let mut state = lock(&self.shared)?;
-        prune_reported_expired(&mut state);
+        sweep_invites(&mut state, now_ms);
         if state
             .sessions
             .get(self.session_id.as_ref())
@@ -395,7 +418,7 @@ impl PairingJoinTransport for InMemoryPairingJoinClient {
         }
 
         let mut state = lock(&self.shared)?;
-        prune_reported_expired(&mut state);
+        sweep_invites(&mut state, now_ms);
         let invite = state
             .invites
             .get_mut(&pairing_id)
@@ -442,7 +465,7 @@ impl PairingJoinTransport for InMemoryPairingJoinClient {
         now_ms: u64,
     ) -> Result<PairingResult, PairingTransportError> {
         let mut state = lock(&self.shared)?;
-        prune_reported_expired(&mut state);
+        sweep_invites(&mut state, now_ms);
         let invite = state
             .invites
             .get_mut(&pairing_id)
@@ -509,6 +532,9 @@ impl PairingApprovalTransport for InMemoryPairingApprovalClient {
             .checked_add(INVITE_LIFETIME_MS)
             .ok_or(PairingTransportError::Transient)?;
         let mut state = lock(&self.shared)?;
+        // Creating an invite is the one path that grows the map without ever
+        // looking anything up, so it must sweep before inserting.
+        sweep_invites(&mut state, now_ms);
         for _ in 0..MAX_ENTROPY_RETRIES {
             let entropy = state.entropy.next()?;
             let pairing_id = pairing_id_from_entropy(now_ms, entropy)?;
@@ -552,7 +578,7 @@ impl PairingApprovalTransport for InMemoryPairingApprovalClient {
         now_ms: u64,
     ) -> Result<PairingInviteStatus, PairingTransportError> {
         let mut state = lock(&self.shared)?;
-        prune_reported_expired(&mut state);
+        sweep_invites(&mut state, now_ms);
         let invite = state
             .invites
             .get_mut(&pairing_id)
@@ -583,7 +609,7 @@ impl PairingApprovalTransport for InMemoryPairingApprovalClient {
         now_ms: u64,
     ) -> Result<Option<StoredPairingRequest>, PairingTransportError> {
         let mut state = lock(&self.shared)?;
-        prune_reported_expired(&mut state);
+        sweep_invites(&mut state, now_ms);
         let invite = state
             .invites
             .get_mut(&pairing_id)
@@ -606,7 +632,7 @@ impl PairingApprovalTransport for InMemoryPairingApprovalClient {
         now_ms: u64,
     ) -> Result<PairingDecisionReceipt, PairingTransportError> {
         let mut state = lock(&self.shared)?;
-        prune_reported_expired(&mut state);
+        sweep_invites(&mut state, now_ms);
         let ProviderState {
             invites,
             memberships,
@@ -768,7 +794,7 @@ impl PairingApprovalTransport for InMemoryPairingApprovalClient {
 
     fn cancel(&self, pairing_id: PairingId, now_ms: u64) -> Result<(), PairingTransportError> {
         let mut state = lock(&self.shared)?;
-        prune_reported_expired(&mut state);
+        sweep_invites(&mut state, now_ms);
         let invite = state
             .invites
             .get_mut(&pairing_id)
@@ -946,6 +972,43 @@ fn prune_reported_expired(state: &mut ProviderState) {
     state.invites.retain(|_, invite| {
         !matches!(invite.terminal, TerminalState::Expired) || !invite.expiry_reported
     });
+}
+
+/// Expire and drop every invite whose lifetime has elapsed.
+///
+/// `prune_reported_expired` only removes an invite once a caller has observed
+/// it expire, and that observation happens on a targeted read. An invite nobody
+/// ever queries therefore stayed `Active` forever, so a caller who kept
+/// creating invites grew the map without bound: 120 invites created over 120
+/// hours all remained resident.
+///
+/// Retention here depends only on the timestamp, not on whether the invite was
+/// ever read. A lapsed invite is dropped immediately; nothing is waiting on a
+/// read that may never arrive.
+/// Expire lapsed invites and drop the ones nobody is waiting to hear about.
+///
+/// The original sweep only removed an invite once a caller had observed it
+/// expire, and that observation happens on a targeted read. An invite nobody
+/// ever queried therefore stayed resident forever: 120 invites created over 120
+/// hours all remained, and a caller who kept creating invites grew the map
+/// without bound.
+///
+/// An invite is retained until its expiry has been *reported*, so a caller that
+/// does ask about a lapsed invite still learns that it expired rather than that
+/// it is missing. The gap this closes is the invite that lapses and is never
+/// read, which no one is waiting on.
+fn sweep_invites(state: &mut ProviderState, now_ms: u64) {
+    for invite in state.invites.values_mut() {
+        expire_if_due(invite, now_ms);
+    }
+    // Expired, never reported, and now well past any plausible read: drop it.
+    // The grace band keeps the "Expired" answer available to a caller that
+    // reacts to expiry, instead of turning a lapsed invite into "not found".
+    state.invites.retain(|_, invite| {
+        !matches!(invite.terminal, TerminalState::Expired)
+            || now_ms < invite.expires_at_ms.saturating_add(EXPIRED_RETAIN_GRACE_MS)
+    });
+    prune_reported_expired(state);
 }
 
 fn require_join_session(
