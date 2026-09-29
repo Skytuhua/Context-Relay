@@ -149,6 +149,14 @@ empty id and validates the value; every other caller is test support. The `Deskt
 role is enforced by `role_allows` at the IPC layer for all of these, not by the
 narrower list inside `route_request`.
 
+**Harness launch** (`src-tauri/src/harness_launch.rs`) — the executable is spawned
+with `Command::new` and an explicit `args` array, never a shell, so a harness path
+cannot become a shell command. The plan is re-validated on the Tauri side rather than
+trusted from the daemon: the executable and root must both be absolute, the
+executable must be a file, the root a directory, and a Hermes profile is only
+accepted for harnesses that take one. The Tauri command surface is small and
+deliberate — eleven commands, with recovery behind its own four.
+
 **Desktop privilege separation** (`src-tauri/src/main.rs`,
 `apps/desktop/src/local-client.ts`) — recovery runs under a distinct
 `DesktopRecoveryHost` role rather than `Desktop`. Phrase entry and confirmation are
@@ -156,7 +164,9 @@ narrower list inside `route_request`.
 renderer cannot drive an approval it has no host prompt for. The recovery phrase is
 entered in a native prompt and never crosses the JavaScript boundary, and the generic
 `call()` throws if a recovery method is routed through it, making the dedicated
-native command the only path. No `dangerouslySetInnerHTML`, `innerHTML` or `eval`
+native command the only path. The prompt's failure modes are `&'static str`, so no
+runtime value can reach an error message, and the word-count rejection does not echo
+what was typed. No `dangerouslySetInnerHTML`, `innerHTML` or `eval`
 appears anywhere in the front end.
 
 ## Not yet reviewed
