@@ -109,6 +109,94 @@ fn temp_vault_paths_are_unique_under_concurrent_construction() {
     assert_eq!(unique_paths.len(), BUILDERS);
 }
 
+/// The CLI compensation path marks every not-yet-restored record `Conflict`,
+/// one record at a time, each transition committing on its own. A crash partway
+/// through therefore leaves some records already `Conflict` and others not, so
+/// the walk has to tolerate re-entering a record it already finished. This is
+/// the CLI counterpart to the write-ahead log resumption covered for
+/// `native_journal_v1`, and the same argument applies.
+#[test]
+fn a_partially_applied_cli_compensation_resumes_from_its_own_midpoint() {
+    let (_path, _keys, mut vault) = open_transaction();
+    let expected = br#"{"command":"/old","args":[]}"#;
+    let intended = br#"{"command":"/new","args":["--harness","codex"]}"#;
+    let expected_fingerprint = fingerprint(expected);
+    let intended_fingerprint = fingerprint(intended);
+    // Two distinct sequences, so a crash between them leaves one finished and
+    // one untouched.
+    for sequence in 0..2_u32 {
+        vault
+            .prepare_native_cli_wal(
+                TRANSACTION_ID,
+                &NativeCliWalWrite {
+                    sequence,
+                    // A transaction may not name the same target twice: the
+                    // vault rejects a repeated stable id, or a repeated
+                    // harness/server-name pair, and the server name is pinned to
+                    // the context-relay server. The two records therefore differ
+                    // in stable id and in harness.
+                    stable_id: if sequence == 0 { ID_2 } else { ID_3 },
+                    harness: if sequence == 0 {
+                        HarnessId::Codex
+                    } else {
+                        HarnessId::ClaudeCode
+                    },
+                    server_name: "context-relay",
+                    expected_declaration: Some(expected),
+                    expected_fingerprint: Some(&expected_fingerprint),
+                    intended_declaration: Some(intended),
+                    intended_fingerprint: Some(&intended_fingerprint),
+                    forward_operations: br#"[{"op":"add","exact":true}]"#,
+                    rollback_operations: br#"[{"op":"restore","exact":true}]"#,
+                },
+            )
+            .unwrap();
+        vault
+            .transition_native_cli_wal(TRANSACTION_ID, sequence, NativeCliWalState::Applied)
+            .unwrap();
+    }
+
+    // First pass: mark sequence 0, then stop the way a crash would.
+    vault
+        .transition_native_cli_wal(TRANSACTION_ID, 0, NativeCliWalState::Conflict)
+        .unwrap();
+    let interrupted = vault.native_cli_wal(TRANSACTION_ID).unwrap();
+    assert_eq!(interrupted[0].state, NativeCliWalState::Conflict);
+    assert_eq!(interrupted[1].state, NativeCliWalState::Applied);
+
+    // Second pass: the same state-driven walk `finish_compensated` performs.
+    // A record already `Conflict` takes the no-op arm rather than being
+    // rejected, and one still `Applied` is carried the rest of the way.
+    for record in vault.native_cli_wal(TRANSACTION_ID).unwrap() {
+        let sequence = record.sequence;
+        match record.state {
+            NativeCliWalState::Prepared
+            | NativeCliWalState::Applied
+            | NativeCliWalState::RestorePrepared => {
+                vault
+                    .transition_native_cli_wal(
+                        TRANSACTION_ID,
+                        sequence,
+                        NativeCliWalState::Conflict,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("sequence {sequence} must accept a resume into Conflict: {error:?}")
+                    });
+            }
+            NativeCliWalState::Restored | NativeCliWalState::Conflict => {}
+        }
+    }
+
+    for record in vault.native_cli_wal(TRANSACTION_ID).unwrap() {
+        assert_eq!(
+            record.state,
+            NativeCliWalState::Conflict,
+            "sequence {} must finish Conflict after a resumed compensation",
+            record.sequence
+        );
+    }
+}
+
 #[test]
 fn cli_wal_round_trips_canonical_bytes_and_allows_only_monotonic_transitions() {
     let (_path, _keys, mut vault) = open_transaction();
