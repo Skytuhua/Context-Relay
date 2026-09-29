@@ -53,6 +53,16 @@ Both connection-open paths call it.
 sets are keyed by source id, the join set is drained each loop iteration, and a
 `JoinSet` drain prevents duplicate submissions. Debounce is a bounded state machine.
 
+**Command authorization** (`local-ipc/src/connection.rs`, `contextd/src/lib.rs`) —
+every inbound frame is checked by `role_allows` in the connection read loop, before
+the daemon sees it, and an unauthorized request gets `ScopeDenied` without being
+dispatched. Verified that the narrower checks inside `route_request` are
+defense-in-depth rather than the primary gate: a probe showed `route_request` does
+not deny `ProjectUpsert`, `TasksList` or `AccessSet` for `McpBridge`/`Installer`
+roles, but the IPC layer refuses them first. `role_allows` itself is exhaustive per
+variant — `MemoryCreate`, `AccessSet`, `AccountDeletionBegin` and `Shutdown` are all
+`Desktop`-only, `Health` is shared, and `Hello` is denied to everyone.
+
 **Filesystem boundary** (`core/src/`) — `..` and `.` path components are rejected
 explicitly in four separate boundary modules, wire paths are validated against the
 declared platform and reject NUL bytes, containment checks compare
@@ -61,8 +71,9 @@ declared platform and reject NUL bytes, containment checks compare
 
 ## Not yet reviewed
 
-- `contextd` request dispatch (`contextd/src/lib.rs`, ~10.9k lines) — command
-  authorization and per-handler parameter validation were not walked end to end.
+- Per-handler parameter validation inside `contextd`'s workspace queue. Command
+  *authorization* is verified (see above); the individual handlers were not each
+  walked for input validation.
 - `contextd` shutdown and ledger transaction integrity, including crash-during-write
   behaviour.
 - `hosted_auth` / `hosted_sync` state machines and retry backoff.
