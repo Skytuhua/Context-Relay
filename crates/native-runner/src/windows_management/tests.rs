@@ -11,6 +11,25 @@ impl Drop for Owner {
     }
 }
 
+/// Waits for a handle to signal, rather than polling it with a zero timeout.
+///
+/// The job object terminates descendants asynchronously, so a process can still
+/// be alive for a short window after cleanup returns. `WaitForSingleObject`
+/// with a zero timeout observes whatever state the process happens to be in at
+/// that instant, which made these tests fail intermittently under load.
+fn wait_for_signal(process: &std::os::windows::io::OwnedHandle, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let wait = remaining.as_millis().min(u128::from(u32::MAX)) as u32;
+        match unsafe { WaitForSingleObject(raw(process), wait) } {
+            WAIT_OBJECT_0 => return true,
+            windows_sys::Win32::Foundation::WAIT_TIMEOUT if remaining > Duration::ZERO => {}
+            _ => return false,
+        }
+    }
+}
+
 fn fixture(mode: &str) -> ProcessSpec {
     ProcessSpec {
         executable: std::env::current_exe().unwrap(),
@@ -107,7 +126,9 @@ fn management_child_fixture() {
 
 #[test]
 fn management_captures_both_streams_and_returns_runtime_owner() {
-    let _serial = SERIAL.lock().unwrap();
+    // Recover from poisoning: a panic in one test must not turn every later test
+    // into a PoisonError that hides the original failure.
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
     let released = Arc::new(AtomicBool::new(false));
     let (output, owner) = run_process(
         fixture("echo"),
@@ -127,7 +148,9 @@ fn management_captures_both_streams_and_returns_runtime_owner() {
 
 #[test]
 fn management_bounds_flood_timeout_and_cancellation() {
-    let _serial = SERIAL.lock().unwrap();
+    // Recover from poisoning: a panic in one test must not turn every later test
+    // into a PoisonError that hides the original failure.
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
     for (mode, expected) in [
         ("flood", ManagementError::OutputLimit),
         ("wait", ManagementError::Timeout),
@@ -170,7 +193,9 @@ fn management_bounds_flood_timeout_and_cancellation() {
 
 #[test]
 fn management_stops_descendants_with_open_or_closed_pipes() {
-    let _serial = SERIAL.lock().unwrap();
+    // Recover from poisoning: a panic in one test must not turn every later test
+    // into a PoisonError that hides the original failure.
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
     for mode in ["parent-pipes", "parent-closed-pipes"] {
         let (output, ()) = run_process(
             fixture(mode),
@@ -195,9 +220,9 @@ fn management_stops_descendants_with_open_or_closed_pipes() {
             )
         };
         if let Ok(process) = owned(process) {
-            assert_eq!(
-                unsafe { WaitForSingleObject(raw(&process), 0) },
-                WAIT_OBJECT_0
+            assert!(
+                wait_for_signal(&process, Duration::from_secs(10)),
+                "descendant was still alive after cleanup"
             );
         }
     }
@@ -205,7 +230,9 @@ fn management_stops_descendants_with_open_or_closed_pipes() {
 
 #[test]
 fn management_launch_failures_and_uncertain_cleanup_preserve_ownership() {
-    let _serial = SERIAL.lock().unwrap();
+    // Recover from poisoning: a panic in one test must not turn every later test
+    // into a PoisonError that hides the original failure.
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
     for faults in [
         Faults {
             assignment: true,
@@ -253,7 +280,9 @@ fn management_launch_failures_and_uncertain_cleanup_preserve_ownership() {
 #[test]
 fn settings_readback_returns_owner_only_after_descendants_stop() {
     use std::os::windows::process::CommandExt as _;
-    let _serial = SERIAL.lock().unwrap();
+    // Recover from poisoning: a panic in one test must not turn every later test
+    // into a PoisonError that hides the original failure.
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
     let temp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(temp.path()).unwrap();
     fs::create_dir(root.join("python")).unwrap();
@@ -312,9 +341,9 @@ fn main() {
         )
     };
     if let Ok(process) = owned(process) {
-        assert_eq!(
-            unsafe { WaitForSingleObject(raw(&process), 0) },
-            WAIT_OBJECT_0
+        assert!(
+            wait_for_signal(&process, Duration::from_secs(10)),
+            "descendant was still alive after cleanup"
         );
     }
     drop(owner);
@@ -323,7 +352,9 @@ fn main() {
 
 #[test]
 fn management_retains_real_file_locks_until_cleanup_can_be_proved() {
-    let _serial = SERIAL.lock().unwrap();
+    // Recover from poisoning: a panic in one test must not turn every later test
+    // into a PoisonError that hides the original failure.
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
     let mut random = [0u8; 16];
     OsRng.try_fill_bytes(&mut random).unwrap();
     let suffix = random
@@ -386,7 +417,9 @@ fn management_retains_real_file_locks_until_cleanup_can_be_proved() {
 
 #[test]
 fn management_reports_output_limit_reached_during_final_drain() {
-    let _serial = SERIAL.lock().unwrap();
+    // Recover from poisoning: a panic in one test must not turn every later test
+    // into a PoisonError that hides the original failure.
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
     // The child can exit after writing more than one output read but before
     // collect sees the process exit. Cleanup must preserve any output error.
     let mut bound = limits();
@@ -406,7 +439,9 @@ fn management_reports_output_limit_reached_during_final_drain() {
 
 #[test]
 fn management_unwind_keeps_the_owner_until_a_later_reap() {
-    let _serial = SERIAL.lock().unwrap();
+    // Recover from poisoning: a panic in one test must not turn every later test
+    // into a PoisonError that hides the original failure.
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
     let released = Arc::new(AtomicBool::new(false));
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_process(
@@ -438,7 +473,9 @@ fn management_unwind_keeps_the_owner_until_a_later_reap() {
 
 #[test]
 fn management_keeps_reading_after_a_zero_byte_pipe_write() {
-    let _serial = SERIAL.lock().unwrap();
+    // Recover from poisoning: a panic in one test must not turn every later test
+    // into a PoisonError that hides the original failure.
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
     let (output, ()) = run_process(
         fixture("empty-write"),
         (),
@@ -478,7 +515,9 @@ fn management_zero_byte_completion_keeps_pipe_open_and_cap_active() {
 #[test]
 #[ignore = "requires an explicit CPython 3.11 home; runs only a disposable copy"]
 fn settings_readback_accepts_windows_path_aliases_and_rejects_external_paths() {
-    let _serial = SERIAL.lock().unwrap();
+    // Recover from poisoning: a panic in one test must not turn every later test
+    // into a PoisonError that hides the original failure.
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
     let source = PathBuf::from(std::env::var_os("CONTEXT_RELAY_TEST_PYTHON_HOME").unwrap());
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("runtime");
