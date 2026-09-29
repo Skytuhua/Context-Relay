@@ -100,6 +100,11 @@ export function DevicesScreen({
     return () => clearInterval(timer);
   }, [invite]);
 
+  // A spent code cannot be approved. Without this the countdown settles on
+  // "0 seconds remaining" and every control stays live, so the user is told to
+  // hand over a code that can no longer work.
+  const inviteExpired = !!invite && Number(invite.expiresAt) <= nowMs;
+
   const applyStatus = useCallback(
     async (result: PairingStatusResult, currentRole: PairingRole | null) => {
       const invalidForRole = () => {
@@ -376,7 +381,7 @@ export function DevicesScreen({
       setApproval(null);
       setRejected(false);
       setAwaitingConfirmation(false);
-      setMessage('Pairing canceled.');
+      setMessage(inviteExpired ? 'That code expired and this pairing was closed. Start again to generate a new one.' : 'Pairing canceled.');
     } catch (cause) {
       setError(safePairingError(cause, 'Pairing could not be canceled.'));
     } finally {
@@ -584,16 +589,20 @@ export function DevicesScreen({
           <div className="pairing-step">
             <h3>One-time pairing code</h3>
             <code className="pairing-code">{invite.code}</code>
-            <p>
-              Expires {formatTimestamp(invite.expiresAt)} · {formatRemaining(invite.expiresAt, nowMs)} remaining
-            </p>
+            {inviteExpired ? (
+              <p role="status">This code expired. Generate a new one to pair another device.</p>
+            ) : (
+              <p>
+                Expires {formatTimestamp(invite.expiresAt)} · {formatRemaining(invite.expiresAt, nowMs)} remaining
+              </p>
+            )}
             <button
               className="secondary-action"
               disabled={working}
               onClick={() => void cancelPairing()}
               type="button"
             >
-              Cancel pairing
+              {inviteExpired ? 'Generate a new code' : 'Cancel pairing'}
             </button>
           </div>
         )}
