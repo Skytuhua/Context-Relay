@@ -117,6 +117,30 @@ regular file that is neither a symlink nor a reparse point, it must carry the
 executable bit, and the value that gets stored and launched is the `canonicalize`d
 path rather than the supplied one.
 
+**Sync retry and backoff** (`core/src/sync/`) — `BackoffPolicy::next_delay` is
+overflow-safe: the exponent shift is guarded by `attempt >= u64::BITS`, the multiply
+is `saturating_mul`, and the `bound + 1` case that would wrap on `u64::MAX` is
+special-cased rather than computed. In-memory transport loops cap at
+`MAX_ATTEMPTS = 3`. The persisted outbox is bounded differently and deliberately: a
+non-retryable error, or a row that cannot fit a request, is deferred by
+`PERMANENT_RETRY_MS = i64::MAX`, and the due query filters on
+`next_attempt_ms <= ?1`, so a parked row never becomes due again. `attempt_count`
+still increments on a parked row, but nothing reads it after that.
+
+**Hosted auth** (`contextd/src/hosted_auth.rs`) — the session maintenance task is
+generation-scoped and every state write goes through `publish`, which re-checks
+`closed` and the generation under the lock, so a late task cannot overwrite a newer
+attempt. Cancellation is a token rather than a flag on shared state, and a late
+cancel after the session is connected is covered by
+`late_cancel_preserves_connected_session_and_shutdown_preserves_credentials`. The
+refresh loop after the wait loop was unbounded — no deadline, no cancellation check,
+exiting only when the error stopped being retryable — and is fixed in #37.
+
 ## Not yet reviewed
 
-- `hosted_auth` / `hosted_sync` state machines and retry backoff.
+Nothing in the audit scope is still unreviewed. The areas below were walked but not
+read line by line, and are the most likely place for something to have been missed.
+
+- `contextd` request dispatch, handler by handler, for the handlers outside the
+  workspace queue (pairing, revocation, sync, native transaction).
+- The React front end beyond the screens touched by #22-#28 and #30.
