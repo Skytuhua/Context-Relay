@@ -143,7 +143,7 @@ jobs:
           fi
       - if: ${{ runner.os == 'macOS' }}
         run: cargo test --manifest-path crates/native-runner/tests/macos-launcher-harness/Cargo.toml --test guardian_native -- --nocapture
-      - run: cargo test --workspace --all-targets --features "${{ env.ORDINARY_RUST_FEATURES }}""
+      - run: cargo test --workspace --all-targets --features "${{ env.ORDINARY_RUST_FEATURES }}"
 
   daemon-boundary:
     permissions:
