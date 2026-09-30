@@ -979,8 +979,17 @@ function RecoveryEnrollmentPanel({
     clearChallenge();
     setStatus(idleRecoveryStatus());
     setMessage(null);
-    setError('Recovery setup expired. Start again with a new phrase.');
-    void gateway.recoveryEnrollmentCancel(expired.enrollmentId).catch(() => undefined);
+    // Set the expiry message straight away so it never depends on the cancel
+    // round trip, then extend it if the local service does not confirm the release.
+    setError(RECOVERY_EXPIRED_GUIDANCE);
+    void gateway.recoveryEnrollmentCancel(expired.enrollmentId).catch(() =>
+      // The local challenge is already gone, so a cancel that fails leaves the
+      // local service holding an enrollment this screen can no longer show or
+      // stop. Saying so beats implying setup is fully wound down.
+      setError(
+        `${RECOVERY_EXPIRED_GUIDANCE} Context Relay could not confirm the local service released it, so close and reopen Context Relay before starting again.`,
+      ),
+    );
   }, [challenge, clearChallenge, gateway, nowMs]);
 
   useEffect(() => {
@@ -1278,6 +1287,8 @@ function isClientError(cause: unknown, code: ClientError['code']): cause is Clie
     (cause as { code?: unknown }).code === code
   );
 }
+
+const RECOVERY_EXPIRED_GUIDANCE = 'Recovery setup expired. Start again with a new phrase.';
 
 function safePairingError(cause: unknown, fallback: string) {
   if (isClientError(cause, 'harness_unsupported')) return HOSTED_PAIRING_UNAVAILABLE;
