@@ -298,6 +298,31 @@ Rust-relevant changed, because `Rust tests (windows-x64)` is a strict required
 check and cannot simply be skipped at the workflow level. Verified against three
 real PRs: #42 (frontend-only) skips, #41 and #38 (Rust changes) run.
 
+## Panic-site sweep
+
+A whole-crate sweep for panic-capable constructs in production code
+(`.unwrap()`, `.expect`, `panic!`, `unreachable!`, `todo!`, indexing, `.first().`),
+excluding `#[cfg(test)]` modules, `*_tests.rs` files, and `tests/` directories.
+
+The raw counts are misleading and are recorded here so the sweep is not repeated
+or mistaken for a defect list: `core` 416, `local-ipc` 142, `native-runner` 120,
+`contextd` 75, `protocol` 14, `context-mcp` 12. Ranking by *file* showed the
+largest counts are test modules the first pass had miscounted
+(`hermes/native_setup_tests.rs` 78, `claude_code/session_tests.rs` 66,
+`codex/native_setup_tests.rs` 63).
+
+What remains in production paths falls into two groups, both correct:
+
+- Provable invariants — `RecordId::new(Uuid::now_v7())`,
+  `HmacSha256::new_from_slice(..)`, `write!` into a `String`, and `serde_json`
+  serialization of known-shaped types.
+- `unreachable!()` arms guarded by an enclosing match, at
+  `core/src/service.rs:225` and `:358`. Both are unreachable because the outer
+  pattern already excludes the variant, and adding a variant to either enum
+  would break compilation at the outer match rather than reach the panic.
+
+No defect found; nothing was changed as a result of this sweep.
+
 ## Not yet reviewed
 
 Nothing in the audit scope is still unreviewed. Every crate (`core`, `protocol`,
