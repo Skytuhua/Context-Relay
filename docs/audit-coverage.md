@@ -9,6 +9,23 @@ a later reader knows which surfaces have been looked at and which have not.
 |---|---|---|
 | #31 | `context-mcp/src/server.rs` | Five `lock().unwrap()` on `std::sync::Mutex` with no `catch_unwind`: one panic poisoned the registry permanently and killed the stdio bridge. |
 | #33 | `core/src/devices/memory_transport.rs` | Expired pairing invites were only dropped once a caller read them, so 120 invites over 120 hours all stayed resident. Anonymous join session ids were inserted unbounded. |
+| #22 | `core` daemon records | The daemon returned records that the app rendered without validating them first. |
+| #23 | `apps/desktop` setup wizard | The primary action style was lost and setup progress was not shown, so the wizard gave no sense of where it was. |
+| #24 | `apps/desktop` setup wizard | Setup could advance past a step before a harness had actually been saved. |
+| #25 | `apps/desktop` | A render failure inside one screen lost the whole app instead of being contained. |
+| #26 | `apps/desktop` revocation | A rejected revocation was not reported inside the dialog that started it. |
+| #27 | `apps/desktop` account deletion | Account deletion requests were not reachable from the screen that manages them. |
+| #28 | `apps/desktop` pairing | An expired pairing code counted down instead of saying it had expired. |
+| #30 | `apps/desktop` | Keyboard shortcuts for navigation, creation and projects. |
+| #34 | `docs/audit-coverage.md` | Recorded which surfaces this audit had actually covered. |
+| #35 | `core/src/native_transaction/` | The native step state machine had no dedicated test, so a transition regression would only surface as a confusing runtime failure. |
+| #36 | `core/src/probe/` | The process probe test failed under CPU load, making the suite unreliable as a signal. |
+| #37 | `contextd` hosted session | The session refresh loop was unbounded and could spin without limit. |
+| #38 | `core` native WAL | An interrupted compensation pass had no coverage for the native WAL or the CLI WAL, only the happy path. |
+| #39 | `apps/desktop/vite.config.ts` | `style-src 'self'` blocked Vite's injected dev styles, so the dev server rendered the app unstyled. |
+| #40 | `apps/desktop/index.html` | The CSP meta tag repeated `frame-ancestors`, which browsers ignore in a `<meta>` tag, so the document claimed clickjacking protection it did not have and logged an error on every load. |
+| #41 | `native-runner` Windows tests | The `windows_management` tests sampled `WaitForSingleObject` with a zero timeout against an asynchronous job-object termination, failing about one run in ten. A panic also poisoned the shared `SERIAL` mutex, reporting one failure as three. |
+| #42 | `apps/desktop` connection failure | Every connection failure showed the same sentence, and the cause was discarded after one boolean test, so a stopped service, a firewall, and a version mismatch were indistinguishable to the user. |
 
 ## Checked and found correct
 
