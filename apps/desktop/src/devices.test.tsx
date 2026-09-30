@@ -593,6 +593,39 @@ describe('DevicesScreen', () => {
     expect(document.documentElement.outerHTML).not.toContain('recoveryPhraseWords');
   });
 
+  it('tells the user when a failed expiry cancel leaves the local service out of step', async () => {
+    // The local challenge is cleared before the cancel is sent, so a cancel that
+    // fails leaves the daemon holding an enrollment the user can no longer see.
+    // Saying nothing about it would leave them believing setup is fully wound down.
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    const gateway = new FakeDeviceGateway();
+    gateway.recoveryCancelError = new Error('cancel failed');
+    render(<DevicesScreen gateway={gateway} />);
+    await act(async () => undefined);
+    fireEvent.click(screen.getByRole('button', { name: 'Set up recovery' }));
+    await act(async () => undefined);
+    const form = screen.getByRole('form', { name: 'Confirm recovery phrase' });
+    fillRecoveryWords(form);
+
+    vi.setSystemTime(601_000);
+    await act(async () => {
+      vi.advanceTimersByTime(1_000);
+    });
+    // waitFor does not drive fake timers, so flush the rejected cancel directly.
+    expect(gateway.recoveryCancelCalls).toEqual([enrollmentId]);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    const alert = screen.getByRole('alert');
+    expect(alert).toHaveTextContent('Recovery setup expired. Start again with a new phrase.');
+    expect(alert).toHaveTextContent('local service');
+    // The recovery words must still be gone even though cleanup failed.
+    for (const canary of recoveryCanaries) {
+      expect(document.documentElement.outerHTML).not.toContain(canary);
+    }
+  });
+
   it('expires a memory-only challenge at the exact deadline and clears its words', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(1_000);
