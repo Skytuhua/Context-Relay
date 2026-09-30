@@ -278,6 +278,21 @@ rejected outright, `first_pipe_instance` catches a second daemon as
 alphanumerics and hyphens. No lock unwraps exist outside test code in either
 crate.
 
+## Cost of the Windows test job
+
+`Rust tests (windows-x64)` is now the slowest thing in this repository's CI. It
+runs `cargo test --workspace --all-targets` and has taken just under two hours on
+recent runs: 21:55 to 23:50 on #41, and over two hours on #43. Everything else in
+the workflow finishes in minutes, so this single job sets the wall-clock cost of
+every PR, including ones that touch only TypeScript — #42 and #43 change no Rust
+at all and still wait on it.
+
+Worth addressing at some point, in rough order of value: cache the cargo build
+directory between runs, split the workspace suite so frontend-only PRs do not wait
+on it, and cut it with `cargo-nextest`, which isolates each test and reports
+failures directly instead of waiting for a suite to finish. None of this is a
+correctness problem, so it is recorded rather than fixed here.
+
 ## Not yet reviewed
 
 Nothing in the audit scope is still unreviewed. Every crate (`core`, `protocol`,
