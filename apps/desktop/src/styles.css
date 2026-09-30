@@ -133,6 +133,8 @@ summary { min-height: 28px; padding-block: 3px; }
 .field input[type='checkbox'], .field input[type='radio'] { width: 18px; }
 .field-error, .form-error { color: var(--color-danger); font-weight: 600; }
 .field-error { margin: 0; }
+.form-error .recovery-steps { margin: 8px 0 12px; padding-left: 20px; font-weight: 400; }
+.form-error .recovery-steps li { margin: 2px 0; }
 .form-error { margin: 0 0 16px; border: 1px solid var(--color-danger); border-radius: var(--radius-panel); padding: 12px; background: var(--color-danger-surface); overflow-wrap: anywhere; }
 .primary-action, .secondary-action { min-height: 36px; width: fit-content; }
 .primary-action { border-color: var(--color-primary); background: var(--color-primary); color: var(--color-on-primary); }

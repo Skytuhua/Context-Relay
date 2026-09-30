@@ -24,7 +24,7 @@ import { SearchProgress } from './search-progress';
 import { HostedSignIn } from './hosted-sign-in';
 import { useSearchProgress } from './use-search-progress';
 import { useScopedEditor } from './use-scoped-editor';
-import { isServiceVersionMismatch, SERVICE_UPDATE_GUIDANCE } from './service-error';
+import { connectionFailureGuidance, type ConnectionFailureGuidance } from './service-error';
 import { LocalWorkspaceGateway, RecoveryStorageFullError, type WorkspaceGateway } from './workspace';
 
 type ScreenId =
@@ -111,7 +111,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
   const [status, setStatus] = useState<StatusOutput | null>(null);
   const [connectionState, setConnectionState] = useState<'connecting' | 'ready' | 'failed'>('connecting');
   const [connectionAttempt, setConnectionAttempt] = useState(0);
-  const [serviceVersionMismatch, setServiceVersionMismatch] = useState(false);
+  const [connectionFailure, setConnectionFailure] = useState<ConnectionFailureGuidance | null>(null);
   const [projects, setProjects] = useState<ProjectIdentity[]>([]);
   const [activeProject, setActiveProject] = useState<ProjectIdentity | null>(null);
   const [memories, setMemories] = useState<MemoryRecord[]>([]);
@@ -162,11 +162,14 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
   useEffect(() => {
     let active = true;
     setConnectionState('connecting');
-    setServiceVersionMismatch(false);
+    setConnectionFailure(null);
     // Bound the initial reads even if the native bridge never settles. Retrying
     // these reads must not replay any workspace mutation or accept stale results.
     const timeout = window.setTimeout(() => {
       active = false;
+      setConnectionFailure(
+        connectionFailureGuidance({ detail: 'the local service did not respond in time' }),
+      );
       setConnectionState('failed');
     }, STARTUP_TIMEOUT_MS);
     void Promise.all([gateway.status(), gateway.projects()])
@@ -181,7 +184,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
       .catch((failure: unknown) => {
         if (!active) return;
         window.clearTimeout(timeout);
-        setServiceVersionMismatch(isServiceVersionMismatch(failure));
+        setConnectionFailure(connectionFailureGuidance(failure));
         setConnectionState('failed');
       });
     return () => {
@@ -746,7 +749,14 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
           {(activeScreen === 'memory' || activeScreen === 'review') && <div className="context-tabs" role="group" aria-label="Context views"><button type="button" aria-pressed={activeScreen === 'memory'} onClick={() => void selectScreen('memory')}>Saved</button><button type="button" aria-pressed={activeScreen === 'review'} onClick={() => void selectScreen('review')}>Suggestions</button></div>}
           {connectionState === 'failed' && (
             <div className="form-error" role="alert">
-              <p>{serviceVersionMismatch ? SERVICE_UPDATE_GUIDANCE : 'Could not connect to the local workspace. Retry the connection to continue.'}</p>
+              <p>{connectionFailure?.message ?? 'Could not connect to the local workspace.'}</p>
+              {connectionFailure && connectionFailure.steps.length > 0 && (
+                <ol className="recovery-steps">
+                  {connectionFailure.steps.map((step) => (
+                    <li key={step}>{step}</li>
+                  ))}
+                </ol>
+              )}
               <button onClick={() => setConnectionAttempt((attempt) => attempt + 1)} type="button">Retry connection</button>
             </div>
           )}
