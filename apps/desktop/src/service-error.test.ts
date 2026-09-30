@@ -23,6 +23,17 @@ describe('connectionFailureGuidance', () => {
     expect(connectionFailureGuidance('service not running').reason).toBe('service-not-running');
   });
 
+  it('classifies the error the Tauri layer actually returns when the service is down', () => {
+    // safe_ipc_error in main.rs maps every non-version IPC failure, including
+    // EndpointNotFound, to code Internal with this exact message. It is the most
+    // common connection failure there is, so it must not fall through to unknown.
+    const actual = { code: 'internal', message: 'The local service is unavailable' };
+    expect(connectionFailureGuidance(actual).reason).toBe('service-not-running');
+    expect(connectionFailureGuidance(new Error('The local service is unavailable')).reason).toBe(
+      'service-not-running',
+    );
+  });
+
   it('classifies the protocol ErrorCode set without relying on message wording', () => {
     // These arrive as structured codes from the daemon, not English sentences.
     expect(connectionFailureGuidance({ code: 'daemon_not_running' }).reason).toBe('service-not-running');

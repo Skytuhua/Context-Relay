@@ -27,7 +27,14 @@ export function isServiceVersionMismatch(error: unknown): boolean {
 // failures the bridge itself produces.
 const NOT_RUNNING_CODES = new Set(['daemon_not_running', 'service_not_running', 'not_running', 'no_such_process']);
 const UNREACHABLE_CODES = new Set(['timeout', 'busy', 'connection_refused', 'pipe_broken', 'unreachable']);
-const NOT_RUNNING = /daemon|service[_ ](?:is[_ ])?not[_ ](?:running|started)|not running|no such (?:file|process)/i;
+// `safe_ipc_error` in src-tauri maps every non-version IPC failure, EndpointNotFound
+// included, to code `internal` with this one message. It is by far the most common
+// connection failure, so it is matched literally rather than left to guesswork.
+const SERVICE_UNAVAILABLE = 'The local service is unavailable';
+const NOT_RUNNING = new RegExp(
+  `daemon|service[_ ](?:is[_ ])?not[_ ](?:running|started)|not running|no such (?:file|process)|${SERVICE_UNAVAILABLE}`,
+  'i',
+);
 const UNREACHABLE = /connect|pipe|socket|timeout|timed out|unreachable|broken pipe|network/i;
 
 /**
