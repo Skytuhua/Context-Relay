@@ -219,6 +219,26 @@ closed if the comparison errors. `report_validation` checks scanner output with
 exact-key and closed-enum matching rather than allowlists of expected values, and
 all three of its public validators have dedicated tests.
 
+## Protocol crate
+
+`crates/protocol` was reviewed without finding a defect. Its 6,632 lines carry
+36 integration-test files plus unit tests, and `cargo clippy --all-targets
+-D warnings` plus the full `cargo test -p context-relay-protocol` both pass
+locally.
+
+`canonical_cbor.rs` was read in full. Encoding is deterministic by construction
+(explicit integer keys in fixed order, one CBOR type per field) and decoding is
+strictly canonical: exact map length, `expect_key` in order, exact schema version,
+UUID-v7 field checks, and a hard `MAX_CBOR_OPERATION_BYTES` bound on both encode
+and decode. The signing preimage omits the signature field (19 keys) and the AAD
+omits nonce, ciphertext, and ciphertext hash (16 keys), each map length matching
+its field list, so the three encodings cannot be confused.
+
+The pairing types are strict: `PairingCode` is exactly 11 bytes with a Crockford
+alphabet excluding I, L, O and U, `PairingSafetyNumber` is five hex groups, and
+both redact themselves in `Debug` so they cannot leak into logs. No lock
+unwraps, TODOs, or non-test `unwrap()`s exist in the crate.
+
 ## Not yet reviewed
 
 Nothing in the audit scope is still unreviewed. What remains is narrower than the
