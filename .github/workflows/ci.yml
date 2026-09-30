@@ -113,6 +113,34 @@ jobs:
           root="$(cd "$mount" && pwd -P)"
           printf 'CONTEXT_RELAY_CASE_SENSITIVE_APFS_ROOT=%s\n' "$root" >> "$GITHUB_ENV"
       - run: rustup show
+      - name: Skip the suite when nothing Rust changed
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `Rust tests (windows-x64)` is a strict required check, so this job
+          # must always report success or failure — it cannot simply be skipped
+          # at the workflow level. Instead, detect Rust-relevant changes against
+          # the base commit and exit successfully when there are none. A
+          # frontend-only PR then costs minutes instead of ~3 hours.
+          base='${{ github.event.pull_request.base.sha }}'
+          if [ -n "$base" ]; then
+            # The checkout is shallow; deepen just enough to reach the base
+            # before deciding, so the skip never fires on a missing history.
+            git fetch --quiet --deepen=100 origin "$base" || true
+          fi
+          if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            echo 'No usable base commit; running the full suite.'
+            exit 0
+          fi
+          changed=$(git diff --name-only "$base" "$GITHUB_SHA" -- \
+            'crates/**' 'apps/desktop/src-tauri/**' 'Cargo.lock' 'Cargo.toml' \
+            '.cargo/**' 'rust-toolchain*' '.github/workflows/ci.yml' | wc -l)
+          echo "Rust-relevant changes: $changed"
+          if [ "$changed" -eq 0 ]; then
+            echo 'EVENT:NOTHING_RUST_CHANGED' >> "$GITHUB_STEP_SUMMARY"
+            echo 'No Rust-relevant files changed; skipping cargo test.'
+            exit 0
+          fi
       - if: ${{ runner.os == 'macOS' }}
         run: cargo test --manifest-path crates/native-runner/tests/macos-launcher-harness/Cargo.toml --test guardian_native -- --nocapture
       - run: cargo test --workspace --all-targets --features "${{ env.ORDINARY_RUST_FEATURES }}"
