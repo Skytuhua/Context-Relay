@@ -26,6 +26,7 @@ a later reader knows which surfaces have been looked at and which have not.
 | #40 | `apps/desktop/index.html` | The CSP meta tag repeated `frame-ancestors`, which browsers ignore in a `<meta>` tag, so the document claimed clickjacking protection it did not have and logged an error on every load. |
 | #41 | `native-runner` Windows tests | The `windows_management` tests sampled `WaitForSingleObject` with a zero timeout against an asynchronous job-object termination, failing about one run in ten. A panic also poisoned the shared `SERIAL` mutex, reporting one failure as three. |
 | #43 | `apps/desktop/src/devices.tsx` | A failed recovery-expiry cancel was swallowed, so the user was told setup was expired while the local service still held an enrollment the screen could no longer show or stop. Visibility, not safety: `RecoveryEnrollment::cancel` runs `expire_pending` first, so an expired enrollment is cleared regardless. |
+| #44 | `apps/desktop/src/harnesses.tsx` | A setup review that failed because the local service was down showed generic harness guidance, sending the user to check configuration instead of the missing service. Now routed through the same classifier as #42. |
 | #42 | `apps/desktop` connection failure | Every connection failure showed the same sentence, and the cause was discarded after one boolean test, so a stopped service, a firewall, and a version mismatch were indistinguishable to the user. |
 
 ## Checked and found correct
