@@ -292,7 +292,11 @@ Worth addressing at some point, in rough order of value: cache the cargo build
 directory between runs, split the workspace suite so frontend-only PRs do not wait
 on it, and cut it with `cargo-nextest`, which isolates each test and reports
 failures directly instead of waiting for a suite to finish. None of this is a
-correctness problem, so it is recorded rather than fixed here.
+correctness problem. #45 now fixes it with an in-job guard: the job diffs the
+merge range against the Rust surface and exits successfully when nothing
+Rust-relevant changed, because `Rust tests (windows-x64)` is a strict required
+check and cannot simply be skipped at the workflow level. Verified against three
+real PRs: #42 (frontend-only) skips, #41 and #38 (Rust changes) run.
 
 ## Not yet reviewed
 
