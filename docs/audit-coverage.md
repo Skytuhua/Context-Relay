@@ -282,7 +282,7 @@ crate.
 
 `Rust tests (windows-x64)` is now the slowest thing in this repository's CI. It
 runs `cargo test --workspace --all-targets` and has taken just under two hours on
-recent runs: 21:55 to 23:50 on #41, and over two hours on #43. Everything else in
+recent runs: 1h55m on #41 and 2h45m on #43, both passing. Everything else in
 the workflow finishes in minutes, so this single job sets the wall-clock cost of
 every PR, including ones that touch only TypeScript — #42 and #43 change no Rust
 at all and still wait on it.
