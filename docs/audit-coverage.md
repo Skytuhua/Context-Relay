@@ -262,7 +262,11 @@ crate.
 
 ## Not yet reviewed
 
-Nothing in the audit scope is still unreviewed. What remains is narrower than the
+Nothing in the audit scope is still unreviewed. Every crate (`core`, `protocol`,
+`contextd`, `context-mcp`, `local-ipc`, `native-runner`), the desktop app, the
+Supabase functions and their scripts, the CI workflows, and the docs have each
+been read, exercised, or both, and `cargo clippy --workspace -D warnings` plus
+`cargo fmt --check` are clean on `main`. What remains is narrower than the
 original plan, and is recorded so the limit of this pass is visible:
 
 - A compensation pass failing *mid-walk* is covered for the write-ahead log and the
