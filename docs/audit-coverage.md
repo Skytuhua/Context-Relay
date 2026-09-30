@@ -239,6 +239,27 @@ alphabet excluding I, L, O and U, `PairingSafetyNumber` is five hex groups, and
 both redact themselves in `Debug` so they cannot leak into logs. No lock
 unwraps, TODOs, or non-test `unwrap()`s exist in the crate.
 
+## Daemon and local-IPC crates
+
+`crates/contextd` (22,791 lines) and `crates/local-ipc` (4,671 lines) were
+reviewed without finding a defect.
+
+`contextd` needed `--features test-support` to build locally — its test imports
+of `SupabaseHttpClient` are gated behind that feature, matching how CI invokes
+it. With the feature enabled, all 165 tests across 12 targets pass, including a
+368-second main-suite run. The recovery-enrollment history flow was read in
+detail: every authorized action re-checks the login session both before and after
+the action, and a denial inside the action is converted to `AuthRequired` rather
+than leaking the vault error, so an expired session cannot be sandwiched between
+check and effect.
+
+`local-ipc`'s named-pipe transport is hardened the way Windows documentation
+recommends: the pipe DACL is built for the current user's SID, remote clients are
+rejected outright, `first_pipe_instance` catches a second daemon as
+`AlreadyRunning`, and the runtime suffix is restricted to bounded ASCII
+alphanumerics and hyphens. No lock unwraps exist outside test code in either
+crate.
+
 ## Not yet reviewed
 
 Nothing in the audit scope is still unreviewed. What remains is narrower than the
