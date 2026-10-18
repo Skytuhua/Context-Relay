@@ -48,10 +48,9 @@ enum Lifecycle {
 ///
 /// A `std::sync::Mutex` stays poisoned forever once any thread panics while
 /// holding it, so every later `lock().unwrap()` on the same mutex panics too.
-/// On the stdio bridge there is no supervisor to restart the process, so one
-/// data-dependent panic would take the user's harness session down with it.
-/// The registry only ever holds plain request metadata, so discarding the
-/// in-flight set is preferable to losing the bridge.
+/// Recover the existing request and rate-limit state rather than discarding it;
+/// in-flight entries must remain available for cancellation and cleanup. This
+/// does not clear the poison flag, so later callers recover the guard too.
 fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
@@ -776,34 +775,28 @@ fn tool_error_result(error: &BridgeError) -> Value {
 
 #[cfg(test)]
 mod poison_tests {
-    use std::{
-        collections::HashMap,
-        sync::{Mutex, MutexGuard},
-    };
-
-    /// Mirrors `lock_unpoisoned` so the test exercises the real contract rather
-    /// than a reimplementation: a poisoned registry must still be readable.
-    fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-        mutex
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
+    use super::lock_unpoisoned;
+    use std::{collections::HashMap, sync::Mutex};
 
     #[test]
     fn a_poisoned_registry_is_still_readable() {
         let registry = Mutex::new(HashMap::<u64, ()>::new());
 
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _held = registry.lock().unwrap();
+            let mut held = registry.lock().unwrap();
+            held.insert(42, ());
             panic!("simulated data-dependent panic while the registry was locked");
         }));
         assert!(panicked.is_err(), "the original panic must propagate");
 
         // The guard is released during unwinding, so the mutex is free but
-        // poisoned. The next inbound request reads it on line 216.
+        // poisoned. The production helper must retain the existing entries.
         assert!(registry.lock().is_err(), "the mutex should be poisoned");
-        let guard = lock_unpoisoned(&registry);
-        assert!(guard.is_empty());
+        let mut guard = lock_unpoisoned(&registry);
+        assert!(guard.contains_key(&42));
+        guard.insert(43, ());
+        drop(guard);
+        assert_eq!(lock_unpoisoned(&registry).len(), 2);
     }
 
     #[test]
