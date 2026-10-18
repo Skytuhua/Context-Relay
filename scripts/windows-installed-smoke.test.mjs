@@ -25,7 +25,7 @@ test('installed smoke consumes this build artifact and retains only bounded evid
 // Parse the whole driver, but evaluate ONLY these named helper definitions.
 // Add-Type compiles the C# types; no job is constructed, native entry point is
 // called, installer is executed, or application/profile is touched by this test.
-test('Windows driver parses, its helper types compile, and artifact paths fail closed', {
+test('Windows driver parses, its helper types compile, and artifact and registration paths fail closed', {
   skip: process.platform !== 'win32' ? 'requires Windows PowerShell 5.1 and UI Automation reference assemblies' : false,
   timeout: 180_000,
 }, () => {
@@ -35,7 +35,7 @@ Set-StrictMode -Version Latest
 $tokens = $null; $parseErrors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($env:CONTEXT_RELAY_SMOKE_DRIVER, [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors.Count -ne 0) { throw (($parseErrors | ForEach-Object { $_.Message }) -join '; ') }
-foreach ($name in @('Assert-RegularPath', 'Get-ContainedPath', 'Assert-FileRecord', 'Initialize-SmokeHelpers')) {
+foreach ($name in @('Assert-RegularPath', 'Get-ContainedPath', 'Assert-RegisteredInstallLocation', 'Assert-FileRecord', 'Initialize-SmokeHelpers')) {
     $definitions = @($ast.FindAll({ param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
     }, $false))
@@ -53,6 +53,23 @@ $junction = Join-Path $fixtureRoot 'link'
 try {
     $null = [IO.Directory]::CreateDirectory($fixtureRoot)
     Assert-RegularPath $fixtureRoot
+    $registeredRoot = Join-Path $fixtureRoot 'Context Relay'
+    $null = [IO.Directory]::CreateDirectory($registeredRoot)
+    $quotedLocation = '"' + $registeredRoot + '"'
+    # Reproduce the hosted failure using the exact quoted NSIS representation.
+    Assert-Rejected { [IO.Path]::GetFullPath($quotedLocation) }
+    Assert-RegisteredInstallLocation $quotedLocation $registeredRoot
+    Assert-RegisteredInstallLocation $registeredRoot $registeredRoot
+    foreach ($invalid in @($null, 42, '', ' ', '""', ('"' + $registeredRoot), ($registeredRoot + '"'),
+        ('""' + $registeredRoot + '""'), ($quotedLocation + ' /S'), ($registeredRoot + ' /S'),
+        ('"' + $registeredRoot + ' /S"'), (' ' + $quotedLocation), ($quotedLocation + ' '),
+        ('cmd.exe /c ' + $quotedLocation), ('"' + $registeredRoot + '"extra"'),
+        ('%LOCALAPPDATA%\Context Relay'), 'C:relative', '\rooted', '\\host\share\Context Relay',
+        ($registeredRoot + [char]0), ($registeredRoot + [char]10), ($registeredRoot + [char]0x85))) {
+        Assert-Rejected { Assert-RegisteredInstallLocation $invalid $registeredRoot }
+    }
+    # An existing directory must still be refused when it is not the expected root.
+    Assert-Rejected { Assert-RegisteredInstallLocation $fixtureRoot $registeredRoot }
     $actual = Get-ContainedPath $fixtureRoot 'search/runtime/onnxruntime.dll'
     if ($actual -cne [IO.Path]::GetFullPath((Join-Path $fixtureRoot 'search\runtime\onnxruntime.dll'))) { throw 'Valid payload path changed.' }
     foreach ($invalid in @('..\escape', '/outside', 'C:\outside', '\\host\share\file',
@@ -74,6 +91,7 @@ try {
     $null = [IO.Directory]::CreateDirectory($destination)
     $null = New-Item -ItemType Junction -Path $junction -Target $destination
     Assert-Rejected { Assert-RegularPath $junction }
+    Assert-Rejected { Assert-RegisteredInstallLocation ('"' + $junction + '"') $junction }
     [IO.File]::WriteAllText((Join-Path $destination 'nested.txt'), 'fixture')
     Assert-Rejected { Assert-RegularPath (Join-Path $junction 'nested.txt') }
 } finally {
