@@ -1,5 +1,8 @@
 use super::*;
-use std::{fs, sync::Arc};
+use std::{
+    fs,
+    sync::{Arc, mpsc},
+};
 
 static SERIAL: Mutex<()> = Mutex::new(());
 const CHILD_MODE: &str = "CONTEXT_RELAY_MANAGEMENT_CHILD_MODE";
@@ -11,23 +14,39 @@ impl Drop for Owner {
     }
 }
 
-/// Waits for a handle to signal, rather than polling it with a zero timeout.
-///
-/// The job object terminates descendants asynchronously, so a process can still
-/// be alive for a short window after cleanup returns. `WaitForSingleObject`
-/// with a zero timeout observes whatever state the process happens to be in at
-/// that instant, which made these tests fail intermittently under load.
-fn wait_for_signal(process: &std::os::windows::io::OwnedHandle, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let wait = remaining.as_millis().min(u128::from(u32::MAX)) as u32;
-        match unsafe { WaitForSingleObject(raw(process), wait) } {
-            WAIT_OBJECT_0 => return true,
-            windows_sys::Win32::Foundation::WAIT_TIMEOUT if remaining > Duration::ZERO => {}
-            _ => return false,
+// Pin the descendant's process object while its parent still owns the child
+// handle. Looking up the PID only after cleanup can observe a reused PID.
+fn observe_descendant(
+    directory: PathBuf,
+) -> (mpsc::Receiver<(u32, OwnedHandle)>, thread::JoinHandle<()>) {
+    let (sender, receiver) = mpsc::channel();
+    let observer = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !directory.join("descendant-ready").exists() {
+            assert!(Instant::now() < deadline, "descendant did not become ready");
+            thread::sleep(Duration::from_millis(5));
         }
-    }
+        let pid = fs::read_to_string(directory.join("descendant-pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let process = owned(unsafe {
+            windows_sys::Win32::System::Threading::OpenProcess(
+                windows_sys::Win32::System::Threading::PROCESS_SYNCHRONIZE,
+                0,
+                pid,
+            )
+        })
+        .unwrap();
+        assert_eq!(
+            unsafe { WaitForSingleObject(raw(&process), 0) },
+            windows_sys::Win32::Foundation::WAIT_TIMEOUT,
+            "the fixture descendant must be alive before its parent exits"
+        );
+        sender.send((pid, process)).unwrap();
+        fs::write(directory.join("descendant-observed"), b"ready").unwrap();
+    });
+    (receiver, observer)
 }
 
 fn fixture(mode: &str) -> ProcessSpec {
@@ -117,6 +136,13 @@ fn management_child_fixture() {
                     .stderr(std::process::Stdio::null());
             }
             let child = child.spawn().unwrap();
+            fs::write("descendant-pid", child.id().to_string()).unwrap();
+            fs::write("descendant-ready", b"ready").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !Path::new("descendant-observed").exists() {
+                assert!(Instant::now() < deadline, "descendant was not observed");
+                thread::sleep(Duration::from_millis(5));
+            }
             println!("descendant={}", child.id());
             std::process::exit(0);
         }
@@ -197,14 +223,21 @@ fn management_stops_descendants_with_open_or_closed_pipes() {
     // into a PoisonError that hides the original failure.
     let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
     for mode in ["parent-pipes", "parent-closed-pipes"] {
-        let (output, ()) = run_process(
-            fixture(mode),
+        let temp = tempfile::tempdir().unwrap();
+        let mut spec = fixture(mode);
+        spec.directory = temp.path().to_owned();
+        let (observed, observer) = observe_descendant(spec.directory.clone());
+        let result = run_process(
+            spec,
             (),
             &AtomicBool::new(false),
             limits(),
             Faults::default(),
-        )
-        .unwrap();
+        );
+        let (expected_pid, process) = observed.try_recv().expect("retained descendant handle");
+        let at_return = unsafe { WaitForSingleObject(raw(&process), 0) };
+        observer.join().unwrap();
+        let (output, ()) = result.unwrap();
         let text = String::from_utf8_lossy(&output.stdout);
         let pid: u32 = text
             .lines()
@@ -212,19 +245,11 @@ fn management_stops_descendants_with_open_or_closed_pipes() {
             .expect("child PID")
             .parse()
             .unwrap();
-        let process = unsafe {
-            windows_sys::Win32::System::Threading::OpenProcess(
-                windows_sys::Win32::System::Threading::PROCESS_SYNCHRONIZE,
-                0,
-                pid,
-            )
-        };
-        if let Ok(process) = owned(process) {
-            assert!(
-                wait_for_signal(&process, Duration::from_secs(10)),
-                "descendant was still alive after cleanup"
-            );
-        }
+        assert_eq!(pid, expected_pid);
+        assert_eq!(
+            at_return, WAIT_OBJECT_0,
+            "descendant was still alive when cleanup returned"
+        );
     }
 }
 
@@ -290,7 +315,7 @@ fn settings_readback_returns_owner_only_after_descendants_stop() {
     fs::write(
         &source,
         r#"
-use std::{env, process::{Command, Stdio}, thread, time::Duration};
+use std::{env, fs, path::Path, process::{Command, Stdio}, thread, time::{Duration, Instant}};
 fn main() {
     let args = env::args().collect::<Vec<_>>();
     if args.get(1).is_some_and(|v| v == "--child") {
@@ -300,6 +325,13 @@ fn main() {
     assert!(args[5].contains("load_config_readonly"));
     let child = Command::new(env::current_exe().unwrap()).arg("--child")
         .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    fs::write("descendant-pid", child.id().to_string()).unwrap();
+    fs::write("descendant-ready", b"ready").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !Path::new("descendant-observed").exists() {
+        assert!(Instant::now() < deadline, "descendant was not observed");
+        thread::sleep(Duration::from_millis(5));
+    }
     println!("{}", child.id());
 }
 "#,
@@ -319,33 +351,29 @@ fn main() {
         String::from_utf8_lossy(&compilation.stderr)
     );
     let released = Arc::new(AtomicBool::new(false));
-    let (output, owner) = read_hermes_settings_for_qualification(
+    let (observed, observer) = observe_descendant(root.clone());
+    let result = read_hermes_settings_for_qualification(
         &root,
         &root,
         Owner(released.clone()),
         &AtomicBool::new(false),
-    )
-    .unwrap();
+    );
+    let (expected_pid, process) = observed.try_recv().expect("retained descendant handle");
+    let at_return = unsafe { WaitForSingleObject(raw(&process), 0) };
+    observer.join().unwrap();
+    let (output, owner) = result.unwrap();
     assert_eq!(output.exit_code, 0);
     assert!(!released.load(Ordering::SeqCst));
-    let pid = String::from_utf8(output.stdout)
+    let pid: u32 = String::from_utf8(output.stdout)
         .unwrap()
         .trim()
         .parse()
         .unwrap();
-    let process = unsafe {
-        windows_sys::Win32::System::Threading::OpenProcess(
-            windows_sys::Win32::System::Threading::PROCESS_SYNCHRONIZE,
-            0,
-            pid,
-        )
-    };
-    if let Ok(process) = owned(process) {
-        assert!(
-            wait_for_signal(&process, Duration::from_secs(10)),
-            "descendant was still alive after cleanup"
-        );
-    }
+    assert_eq!(pid, expected_pid);
+    assert_eq!(
+        at_return, WAIT_OBJECT_0,
+        "descendant was still alive when cleanup returned"
+    );
     drop(owner);
     assert!(released.load(Ordering::SeqCst));
 }
