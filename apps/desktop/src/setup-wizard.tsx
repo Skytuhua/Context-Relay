@@ -114,7 +114,7 @@ export function SetupWizard({ gateway, projects, progress, onChange, onProjectSa
         <p>Choose a project to continue. Your previous selection may no longer be available.</p><button type="button" onClick={() => step(progress.harnesses.length ? 'project' : 'harnesses')}>Choose a project</button>
       </section> : progress.step === 'connect' ? <section>
         <p>Connect each harness to <strong>{project.name}</strong>. Review the changes before saving. Approvals in the harness may still be required afterward.</p>
-        <div className="context-tabs" aria-label="Selected harnesses">{progress.harnesses.map(id => <button type="button" disabled={operationBusy} key={id} aria-pressed={harness === id} onClick={() => setActiveHarness(id)}><span>{HARNESS_NAMES[id]}</span><small>{setupStates[id] ?? 'Review setup'}</small></button>)}</div>
+        <div className="context-tabs" aria-label="Selected harnesses">{progress.harnesses.map(id => <button type="button" disabled={operationBusy} key={id} aria-pressed={harness === id} onClick={() => setActiveHarness(id)}><span>{HARNESS_NAMES[id]}</span>{' '}<small>{setupStates[id] ?? 'Review setup'}</small></button>)}</div>
         {renderConnection(project, harness)}
       </section> : renderTest(project, progress.harnesses))}
       {progress.step === 'tour' && <section className="help-content">
