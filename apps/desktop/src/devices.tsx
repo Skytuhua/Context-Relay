@@ -851,6 +851,7 @@ function RecoveryEnrollmentPanel({
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const mountedRef = useRef(true);
+  const expiryCancelGeneration = useRef(0);
   const challengeRef = useRef<RecoveryEnrollmentChallenge | null>(null);
   const headingRef = useRef<HTMLHeadingElement>(null);
 
@@ -958,6 +959,7 @@ function RecoveryEnrollmentPanel({
 
     return () => {
       mountedRef.current = false;
+      expiryCancelGeneration.current += 1;
       const activeChallenge = challengeRef.current;
       challengeRef.current = null;
       if (activeChallenge) {
@@ -976,20 +978,22 @@ function RecoveryEnrollmentPanel({
   useEffect(() => {
     if (!challenge || Number(challenge.expiresAtMs) > nowMs) return;
     const expired = challenge;
+    const generation = ++expiryCancelGeneration.current;
     clearChallenge();
     setStatus(idleRecoveryStatus());
     setMessage(null);
     // Set the expiry message straight away so it never depends on the cancel
     // round trip, then extend it if the local service does not confirm the release.
     setError(RECOVERY_EXPIRED_GUIDANCE);
-    void gateway.recoveryEnrollmentCancel(expired.enrollmentId).catch(() =>
+    void gateway.recoveryEnrollmentCancel(expired.enrollmentId).catch(() => {
+      if (!mountedRef.current || expiryCancelGeneration.current !== generation) return;
       // The local challenge is already gone, so a cancel that fails leaves the
       // local service holding an enrollment this screen can no longer show or
       // stop. Saying so beats implying setup is fully wound down.
       setError(
         `${RECOVERY_EXPIRED_GUIDANCE} Context Relay could not confirm the local service released it, so close and reopen Context Relay before starting again.`,
-      ),
-    );
+      );
+    });
   }, [challenge, clearChallenge, gateway, nowMs]);
 
   useEffect(() => {
@@ -1015,6 +1019,9 @@ function RecoveryEnrollmentPanel({
   }, [applyRecoveryStatus, gateway, pollIntervalMs, status]);
 
   async function beginRecovery() {
+    // A delayed cleanup result belongs to the expired attempt, even while the
+    // next native phrase window is still opening and no new challenge is set.
+    expiryCancelGeneration.current += 1;
     setWorking(true);
     setError(null);
     setMessage(null);
@@ -1059,6 +1066,7 @@ function RecoveryEnrollmentPanel({
   }
 
   async function retryRecoveryStatus() {
+    expiryCancelGeneration.current += 1;
     setWorking(true);
     try {
       await refreshRecoveryStatus();
