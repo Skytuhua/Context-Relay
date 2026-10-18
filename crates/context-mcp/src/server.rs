@@ -44,6 +44,19 @@ enum Lifecycle {
     Ready,
 }
 
+/// Lock a registry, recovering the guard if a previous panic poisoned it.
+///
+/// A `std::sync::Mutex` stays poisoned forever once any thread panics while
+/// holding it, so every later `lock().unwrap()` on the same mutex panics too.
+/// Recover the existing request and rate-limit state rather than discarding it;
+/// in-flight entries must remain available for cancellation and cleanup. This
+/// does not clear the poison flag, so later callers recover the guard too.
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 pub struct Server<D> {
     daemon: D,
     binding: McpBinding,
@@ -213,7 +226,7 @@ impl<D: Daemon> Server<D> {
         tasks: &mut JoinSet<()>,
     ) -> Option<Value> {
         if let Some(id) = request.id.as_ref()
-            && self.active.lock().unwrap().contains_key(id)
+            && lock_unpoisoned(&self.active).contains_key(id)
         {
             return Some(error(
                 Some(id.clone()),
@@ -310,7 +323,7 @@ impl<D: Daemon> Server<D> {
         {
             let _ = reason;
             let cancellation = {
-                let mut active = self.active.lock().unwrap();
+                let mut active = lock_unpoisoned(&self.active);
                 active.get_mut(&request_id).and_then(|call| {
                     call.canceled.store(true, Ordering::SeqCst);
                     if call.cancel_dispatched {
@@ -421,7 +434,7 @@ impl<D: Daemon> Server<D> {
         {
             return Some(error(Some(id), INVALID_PARAMS, "Invalid tools/call params"));
         }
-        if !self.rate_limit.lock().unwrap().admit(Instant::now()) {
+        if !lock_unpoisoned(&self.rate_limit).admit(Instant::now()) {
             return Some(tool_error(id, &busy_error()));
         }
         let request_id = RecordId::new(Uuid::now_v7()).expect("UUIDv7 generator");
@@ -432,7 +445,7 @@ impl<D: Daemon> Server<D> {
         };
 
         let (call_permit, canceled) = {
-            let mut active = self.active.lock().unwrap();
+            let mut active = lock_unpoisoned(&self.active);
             if active.contains_key(&id) {
                 return Some(error(
                     Some(id),
@@ -556,7 +569,7 @@ async fn dispatch_call<D: Daemon>(
         .ok();
     let mut writer_permit = writer.reserve().await.ok();
     {
-        let mut active = active.lock().unwrap();
+        let mut active = lock_unpoisoned(active.as_ref());
         let still_current = active
             .get(&rpc_id)
             .is_some_and(|call| call.local_id == request_id);
@@ -758,4 +771,37 @@ fn tool_error_result(error: &BridgeError) -> Value {
             }
         }
     })
+}
+
+#[cfg(test)]
+mod poison_tests {
+    use super::lock_unpoisoned;
+    use std::{collections::HashMap, sync::Mutex};
+
+    #[test]
+    fn a_poisoned_registry_is_still_readable() {
+        let registry = Mutex::new(HashMap::<u64, ()>::new());
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut held = registry.lock().unwrap();
+            held.insert(42, ());
+            panic!("simulated data-dependent panic while the registry was locked");
+        }));
+        assert!(panicked.is_err(), "the original panic must propagate");
+
+        // The guard is released during unwinding, so the mutex is free but
+        // poisoned. The production helper must retain the existing entries.
+        assert!(registry.lock().is_err(), "the mutex should be poisoned");
+        let mut guard = lock_unpoisoned(&registry);
+        assert!(guard.contains_key(&42));
+        guard.insert(43, ());
+        drop(guard);
+        assert_eq!(lock_unpoisoned(&registry).len(), 2);
+    }
+
+    #[test]
+    fn an_unpoisoned_registry_is_unaffected() {
+        let registry = Mutex::new(HashMap::from([(1_u64, ())]));
+        assert_eq!(lock_unpoisoned(&registry).len(), 1);
+    }
 }

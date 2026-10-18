@@ -113,6 +113,11 @@ for the qualified Windows preview. Current Actions artifacts are development
 candidates. Do not use a candidate as the sole copy of irreplaceable information.
 The planned preview is unsigned and will use manual updates.
 
+Windows package builds include the offline WebView2 installer. If the UI runtime
+is missing, setup can install it without another network download. This makes
+the installer larger; the installed runtime still receives Microsoft's Evergreen
+updates when connectivity is available.
+
 **Want to build or contribute?** On Windows, install Node.js `24.14.0`, pnpm
 `11.9.0`, the pinned Rust `1.97.1` toolchain, Visual Studio C++ Build Tools with
 a Windows SDK, and Strawberry Perl on `PATH` for vendored OpenSSL/SQLCipher.

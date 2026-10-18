@@ -1,5 +1,8 @@
 use super::*;
-use std::{fs, sync::Arc};
+use std::{
+    fs,
+    sync::{Arc, mpsc},
+};
 
 static SERIAL: Mutex<()> = Mutex::new(());
 const CHILD_MODE: &str = "CONTEXT_RELAY_MANAGEMENT_CHILD_MODE";
@@ -9,6 +12,41 @@ impl Drop for Owner {
     fn drop(&mut self) {
         self.0.store(true, Ordering::SeqCst);
     }
+}
+
+// Pin the descendant's process object while its parent still owns the child
+// handle. Looking up the PID only after cleanup can observe a reused PID.
+fn observe_descendant(
+    directory: PathBuf,
+) -> (mpsc::Receiver<(u32, OwnedHandle)>, thread::JoinHandle<()>) {
+    let (sender, receiver) = mpsc::channel();
+    let observer = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !directory.join("descendant-ready").exists() {
+            assert!(Instant::now() < deadline, "descendant did not become ready");
+            thread::sleep(Duration::from_millis(5));
+        }
+        let pid = fs::read_to_string(directory.join("descendant-pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let process = owned(unsafe {
+            windows_sys::Win32::System::Threading::OpenProcess(
+                windows_sys::Win32::System::Threading::PROCESS_SYNCHRONIZE,
+                0,
+                pid,
+            )
+        })
+        .unwrap();
+        assert_eq!(
+            unsafe { WaitForSingleObject(raw(&process), 0) },
+            windows_sys::Win32::Foundation::WAIT_TIMEOUT,
+            "the fixture descendant must be alive before its parent exits"
+        );
+        sender.send((pid, process)).unwrap();
+        fs::write(directory.join("descendant-observed"), b"ready").unwrap();
+    });
+    (receiver, observer)
 }
 
 fn fixture(mode: &str) -> ProcessSpec {
@@ -98,6 +136,13 @@ fn management_child_fixture() {
                     .stderr(std::process::Stdio::null());
             }
             let child = child.spawn().unwrap();
+            fs::write("descendant-pid", child.id().to_string()).unwrap();
+            fs::write("descendant-ready", b"ready").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !Path::new("descendant-observed").exists() {
+                assert!(Instant::now() < deadline, "descendant was not observed");
+                thread::sleep(Duration::from_millis(5));
+            }
             println!("descendant={}", child.id());
             std::process::exit(0);
         }
@@ -107,7 +152,9 @@ fn management_child_fixture() {
 
 #[test]
 fn management_captures_both_streams_and_returns_runtime_owner() {
-    let _serial = SERIAL.lock().unwrap();
+    // Recover from poisoning: a panic in one test must not turn every later test
+    // into a PoisonError that hides the original failure.
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
     let released = Arc::new(AtomicBool::new(false));
     let (output, owner) = run_process(
         fixture("echo"),
@@ -127,7 +174,9 @@ fn management_captures_both_streams_and_returns_runtime_owner() {
 
 #[test]
 fn management_bounds_flood_timeout_and_cancellation() {
-    let _serial = SERIAL.lock().unwrap();
+    // Recover from poisoning: a panic in one test must not turn every later test
+    // into a PoisonError that hides the original failure.
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
     for (mode, expected) in [
         ("flood", ManagementError::OutputLimit),
         ("wait", ManagementError::Timeout),
@@ -170,16 +219,25 @@ fn management_bounds_flood_timeout_and_cancellation() {
 
 #[test]
 fn management_stops_descendants_with_open_or_closed_pipes() {
-    let _serial = SERIAL.lock().unwrap();
+    // Recover from poisoning: a panic in one test must not turn every later test
+    // into a PoisonError that hides the original failure.
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
     for mode in ["parent-pipes", "parent-closed-pipes"] {
-        let (output, ()) = run_process(
-            fixture(mode),
+        let temp = tempfile::tempdir().unwrap();
+        let mut spec = fixture(mode);
+        spec.directory = temp.path().to_owned();
+        let (observed, observer) = observe_descendant(spec.directory.clone());
+        let result = run_process(
+            spec,
             (),
             &AtomicBool::new(false),
             limits(),
             Faults::default(),
-        )
-        .unwrap();
+        );
+        let (expected_pid, process) = observed.try_recv().expect("retained descendant handle");
+        let at_return = unsafe { WaitForSingleObject(raw(&process), 0) };
+        observer.join().unwrap();
+        let (output, ()) = result.unwrap();
         let text = String::from_utf8_lossy(&output.stdout);
         let pid: u32 = text
             .lines()
@@ -187,25 +245,19 @@ fn management_stops_descendants_with_open_or_closed_pipes() {
             .expect("child PID")
             .parse()
             .unwrap();
-        let process = unsafe {
-            windows_sys::Win32::System::Threading::OpenProcess(
-                windows_sys::Win32::System::Threading::PROCESS_SYNCHRONIZE,
-                0,
-                pid,
-            )
-        };
-        if let Ok(process) = owned(process) {
-            assert_eq!(
-                unsafe { WaitForSingleObject(raw(&process), 0) },
-                WAIT_OBJECT_0
-            );
-        }
+        assert_eq!(pid, expected_pid);
+        assert_eq!(
+            at_return, WAIT_OBJECT_0,
+            "descendant was still alive when cleanup returned"
+        );
     }
 }
 
 #[test]
 fn management_launch_failures_and_uncertain_cleanup_preserve_ownership() {
-    let _serial = SERIAL.lock().unwrap();
+    // Recover from poisoning: a panic in one test must not turn every later test
+    // into a PoisonError that hides the original failure.
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
     for faults in [
         Faults {
             assignment: true,
@@ -253,7 +305,9 @@ fn management_launch_failures_and_uncertain_cleanup_preserve_ownership() {
 #[test]
 fn settings_readback_returns_owner_only_after_descendants_stop() {
     use std::os::windows::process::CommandExt as _;
-    let _serial = SERIAL.lock().unwrap();
+    // Recover from poisoning: a panic in one test must not turn every later test
+    // into a PoisonError that hides the original failure.
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
     let temp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(temp.path()).unwrap();
     fs::create_dir(root.join("python")).unwrap();
@@ -261,7 +315,7 @@ fn settings_readback_returns_owner_only_after_descendants_stop() {
     fs::write(
         &source,
         r#"
-use std::{env, process::{Command, Stdio}, thread, time::Duration};
+use std::{env, fs, path::Path, process::{Command, Stdio}, thread, time::{Duration, Instant}};
 fn main() {
     let args = env::args().collect::<Vec<_>>();
     if args.get(1).is_some_and(|v| v == "--child") {
@@ -271,6 +325,13 @@ fn main() {
     assert!(args[5].contains("load_config_readonly"));
     let child = Command::new(env::current_exe().unwrap()).arg("--child")
         .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    fs::write("descendant-pid", child.id().to_string()).unwrap();
+    fs::write("descendant-ready", b"ready").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !Path::new("descendant-observed").exists() {
+        assert!(Instant::now() < deadline, "descendant was not observed");
+        thread::sleep(Duration::from_millis(5));
+    }
     println!("{}", child.id());
 }
 "#,
@@ -290,40 +351,38 @@ fn main() {
         String::from_utf8_lossy(&compilation.stderr)
     );
     let released = Arc::new(AtomicBool::new(false));
-    let (output, owner) = read_hermes_settings_for_qualification(
+    let (observed, observer) = observe_descendant(root.clone());
+    let result = read_hermes_settings_for_qualification(
         &root,
         &root,
         Owner(released.clone()),
         &AtomicBool::new(false),
-    )
-    .unwrap();
+    );
+    let (expected_pid, process) = observed.try_recv().expect("retained descendant handle");
+    let at_return = unsafe { WaitForSingleObject(raw(&process), 0) };
+    observer.join().unwrap();
+    let (output, owner) = result.unwrap();
     assert_eq!(output.exit_code, 0);
     assert!(!released.load(Ordering::SeqCst));
-    let pid = String::from_utf8(output.stdout)
+    let pid: u32 = String::from_utf8(output.stdout)
         .unwrap()
         .trim()
         .parse()
         .unwrap();
-    let process = unsafe {
-        windows_sys::Win32::System::Threading::OpenProcess(
-            windows_sys::Win32::System::Threading::PROCESS_SYNCHRONIZE,
-            0,
-            pid,
-        )
-    };
-    if let Ok(process) = owned(process) {
-        assert_eq!(
-            unsafe { WaitForSingleObject(raw(&process), 0) },
-            WAIT_OBJECT_0
-        );
-    }
+    assert_eq!(pid, expected_pid);
+    assert_eq!(
+        at_return, WAIT_OBJECT_0,
+        "descendant was still alive when cleanup returned"
+    );
     drop(owner);
     assert!(released.load(Ordering::SeqCst));
 }
 
 #[test]
 fn management_retains_real_file_locks_until_cleanup_can_be_proved() {
-    let _serial = SERIAL.lock().unwrap();
+    // Recover from poisoning: a panic in one test must not turn every later test
+    // into a PoisonError that hides the original failure.
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
     let mut random = [0u8; 16];
     OsRng.try_fill_bytes(&mut random).unwrap();
     let suffix = random
@@ -386,7 +445,9 @@ fn management_retains_real_file_locks_until_cleanup_can_be_proved() {
 
 #[test]
 fn management_reports_output_limit_reached_during_final_drain() {
-    let _serial = SERIAL.lock().unwrap();
+    // Recover from poisoning: a panic in one test must not turn every later test
+    // into a PoisonError that hides the original failure.
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
     // The child can exit after writing more than one output read but before
     // collect sees the process exit. Cleanup must preserve any output error.
     let mut bound = limits();
@@ -406,7 +467,9 @@ fn management_reports_output_limit_reached_during_final_drain() {
 
 #[test]
 fn management_unwind_keeps_the_owner_until_a_later_reap() {
-    let _serial = SERIAL.lock().unwrap();
+    // Recover from poisoning: a panic in one test must not turn every later test
+    // into a PoisonError that hides the original failure.
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
     let released = Arc::new(AtomicBool::new(false));
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_process(
@@ -438,7 +501,9 @@ fn management_unwind_keeps_the_owner_until_a_later_reap() {
 
 #[test]
 fn management_keeps_reading_after_a_zero_byte_pipe_write() {
-    let _serial = SERIAL.lock().unwrap();
+    // Recover from poisoning: a panic in one test must not turn every later test
+    // into a PoisonError that hides the original failure.
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
     let (output, ()) = run_process(
         fixture("empty-write"),
         (),
@@ -478,7 +543,9 @@ fn management_zero_byte_completion_keeps_pipe_open_and_cap_active() {
 #[test]
 #[ignore = "requires an explicit CPython 3.11 home; runs only a disposable copy"]
 fn settings_readback_accepts_windows_path_aliases_and_rejects_external_paths() {
-    let _serial = SERIAL.lock().unwrap();
+    // Recover from poisoning: a panic in one test must not turn every later test
+    // into a PoisonError that hides the original failure.
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
     let source = PathBuf::from(std::env::var_os("CONTEXT_RELAY_TEST_PYTHON_HOME").unwrap());
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("runtime");

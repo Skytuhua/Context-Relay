@@ -49,6 +49,7 @@ import { uuidV7 } from './uuid';
 import { type HarnessGateway, requireHarnessAcknowledgment, validateHarnessPlan, validateHarnessProbe } from './harness-gateway';
 import { validateConnectionCheckStatus, validateHarnessPreparation, validateHarnessExecution, validateHarnessSetupRecord, validateHarnessSetupsPage, validateSearchIndexStatus } from './protocol-validation';
 import { validateOpenCodeMcpExport } from './protocol-validation';
+import { assertMemoryCandidate, assertMemoryRecord, assertProjectIdentity, assertTaskRecord } from './protocol-validation';
 
 export type PairingInviteResult = Extract<LocalResult, { kind: 'pairing_invite' }>;
 export type PairingRequestResult = Extract<LocalResult, { kind: 'pairing_request' }>;
@@ -564,7 +565,8 @@ export class LocalWorkspaceGateway implements WorkspaceGateway {
 
   async projects() {
     const result = await this.call({ method: 'projects_list', params: {} });
-    return result.kind === 'projects' ? result.data.projects : unexpected(result);
+    if (result.kind !== 'projects') unexpected(result);
+    return validatedList(result.data.projects, assertProjectIdentity, 'projects');
   }
 
   async createProject(name: string, path: string) {
@@ -592,7 +594,8 @@ export class LocalWorkspaceGateway implements WorkspaceGateway {
         includeArchived: false,
       },
     });
-    return result.kind === 'memories' ? result.data.memories : unexpected(result);
+    if (result.kind !== 'memories') unexpected(result);
+    return validatedList(result.data.memories, assertMemoryRecord, 'memories');
   }
 
   async createMemory(projectId: string | null, title: string, bodyMarkdown: string, attempt?: object) {
@@ -647,7 +650,8 @@ export class LocalWorkspaceGateway implements WorkspaceGateway {
       method: 'memory_search',
       params: { query, projectId: projectId as ProjectId | null },
     });
-    return result.kind === 'memories' ? result.data.memories : unexpected(result);
+    if (result.kind !== 'memories') unexpected(result);
+    return validatedList(result.data.memories, assertMemoryRecord, 'memories');
   }
 
   async searchIndexStatus() {
@@ -667,7 +671,8 @@ export class LocalWorkspaceGateway implements WorkspaceGateway {
       method: 'candidates_list',
       params: { projectId: projectId as ProjectId | null },
     });
-    return result.kind === 'candidates' ? result.data.candidates : unexpected(result);
+    if (result.kind !== 'candidates') unexpected(result);
+    return validatedList(result.data.candidates, assertMemoryCandidate, 'candidates');
   }
 
   async reviewCandidate(candidate: MemoryCandidate, accepted: boolean) {
@@ -679,9 +684,7 @@ export class LocalWorkspaceGateway implements WorkspaceGateway {
         operationId: uuidV7() as OperationId,
       },
     });
-    return result.kind === 'candidates' && result.data.candidates[0]
-      ? result.data.candidates[0]
-      : unexpected(result);
+    return candidateResult(result);
   }
 
   async tasks(projectId: string) {
@@ -689,7 +692,8 @@ export class LocalWorkspaceGateway implements WorkspaceGateway {
       method: 'tasks_list',
       params: { projectId: projectId as ProjectId },
     });
-    return result.kind === 'tasks' ? result.data.tasks : unexpected(result);
+    if (result.kind !== 'tasks') unexpected(result);
+    return validatedList(result.data.tasks, assertTaskRecord, 'tasks');
   }
 
   async createTask(projectId: string, title: string, bodyMarkdown: string, attempt?: object) {
@@ -837,17 +841,43 @@ function recoveryStatusResult(result: LocalResult) {
     : unexpected(result);
 }
 
+function validatedList<T>(
+  value: unknown,
+  assert: (item: unknown) => asserts item is T,
+  field: string,
+): T[] {
+  if (!Array.isArray(value)) throw new TypeError(`invalid ${field} list from the local workspace`);
+  for (const item of value) {
+    try {
+      assert(item);
+    } catch (cause) {
+      // Name the record set so a screen-level retry message can say which list
+      // the daemon returned badly, without echoing the record itself.
+      throw new TypeError(`invalid ${field} record from the local workspace: ${(cause as Error).message}`);
+    }
+  }
+  return value as T[];
+}
+
 function memoryResult(result: LocalResult) {
-  return result.kind === 'memory' && result.data.memory ? result.data.memory : unexpected(result);
+  if (result.kind !== 'memory' || !result.data.memory) unexpected(result);
+  const memory: MemoryRecord = result.data.memory;
+  assertMemoryRecord(memory);
+  return memory;
 }
 
 function taskResult(result: LocalResult) {
-  return result.kind === 'tasks' && result.data.tasks[0] ? result.data.tasks[0] : unexpected(result);
+  if (result.kind !== 'tasks' || !result.data.tasks[0]) unexpected(result);
+  const task: TaskRecord = result.data.tasks[0];
+  assertTaskRecord(task);
+  return task;
 }
 
 function candidateResult(result: LocalResult) {
-  return result.kind === 'candidates' && result.data.candidates[0]
-    ? result.data.candidates[0] : unexpected(result);
+  if (result.kind !== 'candidates' || !result.data.candidates[0]) unexpected(result);
+  const candidate: MemoryCandidate = result.data.candidates[0];
+  assertMemoryCandidate(candidate);
+  return candidate;
 }
 
 function unexpected(result: LocalResult): never {
