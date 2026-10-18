@@ -3,6 +3,7 @@ import type { HarnessSetupState, MemoryRecord, TaskRecord, ProjectIdentity } fro
 import type { WorkspaceGateway } from './workspace';
 import type { VerifiedRead } from './desktop-preferences';
 import { projectHarnessSetups } from './harness-history';
+import { HARNESS_NAMES as harnessNames } from './harness-names';
 
 type DashboardProps = {
   gateway: WorkspaceGateway;
@@ -51,7 +52,6 @@ function Section<T>({ title, description, action, load, children }: {
   </section>;
 }
 
-const harnessNames = { codex: 'Codex', claude_code: 'Claude Code', hermes: 'Hermes' };
 const setupStates: Record<HarnessSetupState, { label: string; next: string }> = {
   previewed: { label: 'Review needed', next: 'Review the proposed changes in Harnesses before saving.' },
   applying: { label: 'Saving settings', next: 'Open Harnesses to check progress or recovery options.' },
@@ -113,8 +113,8 @@ export function Dashboard(props: DashboardProps) {
   return <div data-tour-target="dashboard">
     <p>{props.project ? `Continue work in ${props.project.name}.` : 'Choose a project to see its context, tasks, and harness setup.'}</p>
     {props.lastVerifiedRead?.projectId === props.project?.projectId && props.lastVerifiedRead && <p className="help-text">Last successful context read: {harnessNames[props.lastVerifiedRead.harness]} · {new Date(Number(props.lastVerifiedRead.verifiedAt)).toLocaleString()}. This is a past test result; use setup to check again.</p>}
-    {props.setupDeferred && <section className="status-row" aria-label="Setup progress"><div><strong>Finish connecting your harness</strong><p>Your setup progress is saved. Continue from where you left off.</p></div><button className="primary" onClick={props.onResumeSetup}>Resume setup</button></section>}
+    {props.setupDeferred && <section className="status-row" aria-label="Setup progress"><div><strong>Finish connecting your harness</strong><p>Your setup progress is saved. Continue from where you left off.</p></div><button className="primary-action" onClick={props.onResumeSetup}>Resume setup</button></section>}
     {props.project ? <ProjectDashboard key={props.project.projectId} {...props} project={props.project} />
-      : <button className="primary" onClick={() => props.onNavigate('projects')}>Choose a project</button>}
+      : <button className="primary-action" onClick={() => props.onNavigate('projects')}>Choose a project</button>}
   </div>;
 }

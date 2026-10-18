@@ -25,6 +25,14 @@ pub fn primary_memory_instruction_component(
     clock: HybridLogicalClock,
 ) -> Result<ComponentRecord, ClientError> {
     let (name, metadata) = match harness {
+        HarnessId::OpenCode => {
+            return Err(ClientError {
+                code: ErrorCode::HarnessUnsupported,
+                message: "OpenCode supports manual MCP instructions only".to_owned(),
+                field_path: None,
+                retryable: false,
+            });
+        }
         HarnessId::ClaudeCode => (
             "CLAUDE.md",
             vec![("structuralLocation".to_owned(), "CLAUDE.md".to_owned())],
@@ -90,6 +98,7 @@ pub(crate) fn is_primary_memory_instruction_component(
         && component.provenance.harness == Some(harness)
         && component.provenance.source.is_none()
         && match harness {
+            HarnessId::OpenCode => false,
             HarnessId::ClaudeCode => {
                 component.name == "CLAUDE.md"
                     && component.metadata
@@ -127,6 +136,7 @@ fn primary_memory_record_id(
         HarnessId::ClaudeCode => "claude-code",
         HarnessId::Codex => "codex",
         HarnessId::Hermes => "hermes",
+        HarnessId::OpenCode => "opencode",
     };
     let mut bytes: [u8; 32] = Sha256::digest(format!(
         "context-relay|primary-memory-instruction|{harness}|{project_id}"

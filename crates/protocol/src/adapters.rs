@@ -893,6 +893,11 @@ impl<'de> Deserialize<'de> for SetupPlan {
 impl SetupPlan {
     pub fn validate(&self) -> Result<(), ValidationError> {
         match (self.harness, self.harness_profile.as_deref()) {
+            (HarnessId::OpenCode, _) => {
+                return Err(ValidationError::Invalid(
+                    "OpenCode supports manual MCP export only",
+                ));
+            }
             (HarnessId::Hermes, Some(profile)) => {
                 required_text(profile, "harnessProfile", MAX_TITLE_BYTES)?;
             }

@@ -16,6 +16,7 @@ import type { WorkspaceGateway } from './workspace';
 const id = (suffix: string) => `018f22e2-79b0-7cc8-98c4-dc0c0c0739${suffix}`;
 
 class FakeWorkspaceGateway implements WorkspaceGateway {
+  async opencodeMcpExport(): Promise<never> { throw new Error('Not used'); }
   async revokeDevice(): Promise<never> { throw new Error('Unexpected hosted mutation'); }
   async deviceRevocationStatus(): Promise<never> { throw new Error('Unexpected hosted mutation'); }
   async cancelDeviceRevocation(): Promise<never> { throw new Error('Unexpected hosted mutation'); }

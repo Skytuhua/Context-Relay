@@ -17,7 +17,7 @@
 
 # Context Relay
 
-**One shared memory and task workspace for Claude Code, Codex, and Hermes.**
+**One shared memory and task workspace for Claude Code, Codex, Hermes, and OpenCode.**
 
 Context Relay is an open-source desktop project for carrying decisions, useful
 knowledge, and unfinished work between coding agents. It combines an encrypted
@@ -68,6 +68,7 @@ flowchart LR
     A[Claude Code] <--> M[Local MCP bridge]
     B[Codex] <--> M
     C[Hermes] <--> M
+    O[OpenCode · manual MCP] <--> M
     M <--> D[Local daemon]
     U[Desktop review and approvals] <--> D
     D <--> V[(Encrypted memory and tasks)]
@@ -92,11 +93,18 @@ themselves.
 | Claude Code | [Supported surfaces, versions, and limits](adapters/claude-code/capabilities.md) |
 | Codex | [Supported surfaces, versions, and limits](adapters/codex/capabilities.md) |
 | Hermes | [Supported surfaces, versions, and limits](adapters/hermes/capabilities.md) |
+| OpenCode | [Manual project MCP export and saved-context read test](adapters/opencode/capabilities.md) |
 
 Managed setup is restricted to recognized executable versions and trusted project
 bindings. An unfamiliar version is not automatically safe to configure. Consult
 the capability pages and [preview version matrix](docs/releases/v0.1.1-alpha.1.md)
 before testing; version eligibility is separate from installed release acceptance.
+
+OpenCode uses a separate manual MCP panel in Harnesses. It exports configuration
+for a registered project and can verify a saved-note read, while automatic setup,
+native-memory management, lifecycle hooks, and managed Undo remain limited to the
+qualified adapters above. The [OpenCode guide](adapters/opencode/capabilities.md)
+explains configuration preservation and the path from first-run onboarding.
 
 ## Getting started
 
@@ -104,6 +112,11 @@ before testing; version eligibility is separate from installed release acceptanc
 for the qualified Windows preview. Current Actions artifacts are development
 candidates. Do not use a candidate as the sole copy of irreplaceable information.
 The planned preview is unsigned and will use manual updates.
+
+Windows package builds include the offline WebView2 installer. If the UI runtime
+is missing, setup can install it without another network download. This makes
+the installer larger; the installed runtime still receives Microsoft's Evergreen
+updates when connectivity is available.
 
 **Want to build or contribute?** On Windows, install Node.js `24.14.0`, pnpm
 `11.9.0`, the pinned Rust `1.97.1` toolchain, Visual Studio C++ Build Tools with

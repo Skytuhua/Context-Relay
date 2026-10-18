@@ -11,7 +11,7 @@ fn protocol_1_17_requires_one_revocation_operation_id_across_mutation_and_retry_
         PROTOCOL_VERSION,
         ProtocolVersion {
             major: 1,
-            minor: 17
+            minor: 18
         }
     );
     for (method, params) in [

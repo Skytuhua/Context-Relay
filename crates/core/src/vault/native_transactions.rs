@@ -1301,8 +1301,8 @@ fn cli_harness_name(harness: HarnessId) -> Result<&'static str, VaultError> {
     match harness {
         HarnessId::ClaudeCode => Ok("claude_code"),
         HarnessId::Codex => Ok("codex"),
-        HarnessId::Hermes => Err(VaultError::Validation(
-            "native CLI WAL does not support Hermes".to_owned(),
+        HarnessId::Hermes | HarnessId::OpenCode => Err(VaultError::Validation(
+            "native CLI WAL does not support this harness".to_owned(),
         )),
     }
 }

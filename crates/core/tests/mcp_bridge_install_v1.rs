@@ -214,6 +214,9 @@ fn bridge_components_are_stable_global_harness_specific_and_secret_free() {
                 HarnessId::ClaudeCode => "f4a4f9a2-0e8d-720e-8df4-a5a68da3e9c7",
                 HarnessId::Codex => "b5be495e-d4ee-7a2e-a29e-b589ebc5d7fd",
                 HarnessId::Hermes => "92cb3173-a859-79e2-97e1-3ef3633fcb3a",
+                HarnessId::OpenCode => {
+                    unreachable!("managed bridge fixtures do not include OpenCode")
+                }
             }
         );
         assert_eq!(component.name, BRIDGE_SERVER_NAME);

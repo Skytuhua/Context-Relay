@@ -595,7 +595,7 @@ fn instruction() -> Value {
     json!({"type":"object","properties":{"id":uuid(),"scope":scope(),"title":text(1,MAX_TITLE_BYTES),"bodyMarkdown":text(1,MAX_MARKDOWN_BYTES),"provenance":provenance(),"archived":{"type":"boolean"}},"required":["id","scope","title","bodyMarkdown","provenance","archived"],"additionalProperties":false})
 }
 fn candidate() -> Value {
-    json!({"type":"object","properties":{"id":uuid(),"proposedMemory":memory(),"evidenceSummary":text(1,MAX_EVIDENCE_BYTES),"sourceHarness":{"enum":["claude_code","codex","hermes"]},"state":{"enum":["pending","accepted","rejected"]}},"required":["id","proposedMemory","evidenceSummary","sourceHarness","state"],"additionalProperties":false})
+    json!({"type":"object","properties":{"id":uuid(),"proposedMemory":memory(),"evidenceSummary":text(1,MAX_EVIDENCE_BYTES),"sourceHarness":{"enum":["claude_code","codex","hermes","opencode"]},"state":{"enum":["pending","accepted","rejected"]}},"required":["id","proposedMemory","evidenceSummary","sourceHarness","state"],"additionalProperties":false})
 }
 fn task() -> Value {
     json!({"type":"object","properties":{"id":uuid(),"projectId":uuid(),"title":text(1,MAX_TITLE_BYTES),"bodyMarkdown":text(1,MAX_MARKDOWN_BYTES),"status":task_status(),"evidence":{"type":"array","maxItems":crate::MAX_EVIDENCE_ITEMS,"items":task_evidence()},"revision":uuid()},"required":["id","projectId","title","bodyMarkdown","status","evidence","revision"],"allOf":[{"if":{"properties":{"status":{"const":"done"}},"required":["status"]},"then":{"properties":{"evidence":{"type":"array","minItems":1}}}}],"additionalProperties":false})
@@ -626,7 +626,7 @@ fn hlc() -> Value {
     json!({"type":"object","properties":{"physicalMs":decimal_u64(),"logical":{"type":"integer","minimum":0,"maximum":4294967295u64},"node":uuid()},"required":["physicalMs","logical","node"],"additionalProperties":false})
 }
 fn provenance() -> Value {
-    json!({"type":"object","properties":{"originDevice":uuid(),"harness":{"oneOf":[{"type":"null"},{"enum":["claude_code","codex","hermes"]}]},"source":{"oneOf":[{"type":"null"},{"type":"object","properties":{"source":{"const":"record"},"recordId":uuid()},"required":["source","recordId"],"additionalProperties":false},{"type":"object","properties":{"source":{"const":"package"},"packageId":uuid()},"required":["source","packageId"],"additionalProperties":false}]},"createdHlc":hlc()},"required":["originDevice","harness","source","createdHlc"],"additionalProperties":false})
+    json!({"type":"object","properties":{"originDevice":uuid(),"harness":{"oneOf":[{"type":"null"},{"enum":["claude_code","codex","hermes","opencode"]}]},"source":{"oneOf":[{"type":"null"},{"type":"object","properties":{"source":{"const":"record"},"recordId":uuid()},"required":["source","recordId"],"additionalProperties":false},{"type":"object","properties":{"source":{"const":"package"},"packageId":uuid()},"required":["source","packageId"],"additionalProperties":false}]},"createdHlc":hlc()},"required":["originDevice","harness","source","createdHlc"],"additionalProperties":false})
 }
 fn task_evidence() -> Value {
     json!({"type":"object","properties":{"summary":text(1,MAX_EVIDENCE_BYTES),"evidenceKind":text(1,crate::MAX_TAG_BYTES),"reference":{"oneOf":[{"type":"null"},{"type":"string","maxLength":MAX_EVIDENCE_BYTES,"x-utf8-maxBytes":MAX_EVIDENCE_BYTES}]},"recordedHlc":hlc()},"required":["summary","evidenceKind","reference","recordedHlc"],"additionalProperties":false})

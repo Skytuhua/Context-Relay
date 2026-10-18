@@ -963,6 +963,9 @@ fn matrix_fixture(harness: HarnessId) -> MatrixFixture {
         HarnessId::ClaudeCode => claude_matrix_fixture(),
         HarnessId::Codex => codex_matrix_fixture(),
         HarnessId::Hermes => hermes_matrix_fixture(),
+        HarnessId::OpenCode => {
+            unreachable!("managed primary-memory fixtures do not include OpenCode")
+        }
     }
 }
 
@@ -1512,6 +1515,9 @@ fn frozen_harnesses_transact_authoritative_memory_with_recovery_and_raw_privacy(
                 assert!(intended.iter().all(|(_, bytes)| {
                     !String::from_utf8_lossy(bytes).contains("--hook-event")
                 }));
+            }
+            HarnessId::OpenCode => {
+                unreachable!("managed primary-memory fixtures do not include OpenCode")
             }
         }
         for registration in &opened.plan.native_memory_registrations {

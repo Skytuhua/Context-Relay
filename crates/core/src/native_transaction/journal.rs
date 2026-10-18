@@ -3,6 +3,9 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+#[cfg(test)]
+mod tests;
+
 use context_relay_protocol::PlanId;
 
 use super::{

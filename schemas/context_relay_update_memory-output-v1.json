@@ -97,7 +97,8 @@
                   "enum": [
                     "claude_code",
                     "codex",
-                    "hermes"
+                    "hermes",
+                    "opencode"
                   ]
                 }
               ]

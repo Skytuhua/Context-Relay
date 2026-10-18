@@ -82,6 +82,37 @@ params!(HarnessLaunchInfo {
     executable: WireNativeValue,
     project_root: WireNativeValue
 });
+// Read-only project configuration guidance, never a managed setup or connection receipt.
+params!(OpenCodeMcpExport {
+    project_id: ProjectId,
+    project_root: WireNativeValue,
+    config_path: WireNativeValue,
+    instruction_path: WireNativeValue,
+    config_fragment: String,
+    instruction_markdown: String
+});
+impl OpenCodeMcpExport {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        self.project_root.validate()?;
+        self.config_path.validate()?;
+        self.instruction_path.validate()?;
+        if self.project_root.platform != self.config_path.platform
+            || self.project_root.platform != self.instruction_path.platform
+        {
+            return Err(ValidationError::Invalid("openCodeMcpExport.platform"));
+        }
+        required_text(
+            &self.config_fragment,
+            "openCodeMcpExport.configFragment",
+            65_536,
+        )?;
+        required_text(
+            &self.instruction_markdown,
+            "openCodeMcpExport.instructionMarkdown",
+            8_192,
+        )
+    }
+}
 params!(ConnectionCheckStartParams {
     selection: HarnessParams,
     memory_id: MemoryId,
@@ -928,6 +959,8 @@ pub enum LocalRequest {
     AccessSet(AccessSetParams),
     HarnessProbe(HarnessParams),
     HarnessLaunchInfo(HarnessParams),
+    #[serde(rename = "opencode_mcp_export")]
+    OpenCodeMcpExport(ProjectParams),
     ConnectionCheckStart(ConnectionCheckStartParams),
     ConnectionCheckStatus(ConnectionCheckIdParams),
     ConnectionCheckCancel(ConnectionCheckIdParams),
@@ -1027,7 +1060,7 @@ impl LocalRequest {
             }
             Self::HarnessLaunchInfo(p) => {
                 validate_harness_profile(p)?;
-                if p.project_id.is_none() {
+                if p.project_id.is_none() || p.harness == HarnessId::OpenCode {
                     return Err(ValidationError::Invalid("harnessLaunch.projectId"));
                 }
                 Ok(())
@@ -1051,6 +1084,11 @@ impl LocalRequest {
                 crate::validate_mcp_fixture(&p.name, true, &p.arguments)
             }
             Self::NativeHookEvent(p) => {
+                if p.binding.harness == HarnessId::OpenCode {
+                    return Err(ValidationError::Invalid(
+                        "OpenCode has no qualified native hooks",
+                    ));
+                }
                 p.binding.working_directory.validate()?;
                 p.event.validate()
             }
@@ -1133,8 +1171,8 @@ fn validate_harness_profile(params: &HarnessParams) -> Result<(), ValidationErro
             required_text(profile, "harness.hermesProfile", MAX_TITLE_BYTES)
         }
         (HarnessId::Hermes, None) => Err(ValidationError::EmptyRequired("harness.hermesProfile")),
-        (HarnessId::ClaudeCode | HarnessId::Codex, None) => Ok(()),
-        (HarnessId::ClaudeCode | HarnessId::Codex, Some(_)) => {
+        (HarnessId::ClaudeCode | HarnessId::Codex | HarnessId::OpenCode, None) => Ok(()),
+        (HarnessId::ClaudeCode | HarnessId::Codex | HarnessId::OpenCode, Some(_)) => {
             Err(ValidationError::Invalid("harness.hermesProfile"))
         }
     }
@@ -1483,6 +1521,10 @@ pub enum LocalResult {
     HarnessLaunchInfo {
         info: HarnessLaunchInfo,
     },
+    #[ts(rename = "opencode_mcp_export")]
+    OpenCodeMcpExport {
+        export: OpenCodeMcpExport,
+    },
     ConnectionCheck {
         status: ConnectionCheckStatus,
     },
@@ -1625,6 +1667,10 @@ enum LocalResultSerde {
     },
     HarnessLaunchInfo {
         info: HarnessLaunchInfo,
+    },
+    #[serde(rename = "opencode_mcp_export")]
+    OpenCodeMcpExport {
+        export: OpenCodeMcpExport,
     },
     ConnectionCheck {
         status: ConnectionCheckStatus,
@@ -1778,12 +1824,15 @@ impl LocalResult {
             Self::HarnessSetups { page } => page.validate(),
             Self::HarnessLaunchInfo { info } => {
                 validate_harness_profile(&info.selection)?;
-                if info.selection.project_id.is_none() {
+                if info.selection.project_id.is_none()
+                    || info.selection.harness == HarnessId::OpenCode
+                {
                     return Err(ValidationError::Invalid("harnessLaunch.projectId"));
                 }
                 info.executable.validate()?;
                 info.project_root.validate()
             }
+            Self::OpenCodeMcpExport { export } => export.validate(),
             Self::ConnectionCheck { status } => {
                 validate_harness_profile(&status.selection)?;
                 if status.selection.project_id.is_none()

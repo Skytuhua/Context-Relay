@@ -495,6 +495,20 @@ it('shows bytes when the native display string is empty', async () => {
   expect(screen.getByText(/Executable: windows bytes \(base64url\): YwA/)).toBeVisible();
 });
 
+it('names the local service as the cause when it is the thing that is down', async () => {
+  // The shape safe_ipc_error produces when the daemon cannot be reached at all.
+  // Without this the user reads "Could not review this setup", which sends them
+  // looking at harness configuration instead of at the service that is not running.
+  operation = async () => {
+    throw { code: 'internal', message: 'The local service is unavailable' };
+  };
+  await open();
+  fireEvent.click(screen.getByRole('button', { name: 'Review setup' }));
+  const alert = await screen.findByRole('alert');
+  expect(alert).toHaveTextContent(/local workspace service is not running/i);
+  expect(alert).not.toHaveTextContent(/Could not review this setup/i);
+});
+
 it('rejects malformed previews without rendering plaintext errors or unsafe HTML', async () => {
   operation = async () => ({ kind: 'plan', data: { plan: { ...preview, batchHash: 'PRIVATE-MALFORMED' } } });
   await open(); fireEvent.click(screen.getByRole('button', { name: 'Review setup' }));

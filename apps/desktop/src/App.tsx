@@ -1,5 +1,5 @@
 import { AccountLifecyclePanel } from './account-lifecycle';
-import { type FormEvent, useCallback, useEffect, useRef, useState } from 'react';
+import { type FormEvent, type ReactNode, useCallback, useEffect, useRef, useState } from 'react';
 
 import type {
   MemoryCandidate,
@@ -24,8 +24,10 @@ import { SearchProgress } from './search-progress';
 import { HostedSignIn } from './hosted-sign-in';
 import { useSearchProgress } from './use-search-progress';
 import { useScopedEditor } from './use-scoped-editor';
-import { isServiceVersionMismatch, SERVICE_UPDATE_GUIDANCE } from './service-error';
+import { connectionFailureGuidance, type ConnectionFailureGuidance } from './service-error';
 import { LocalWorkspaceGateway, RecoveryStorageFullError, type WorkspaceGateway } from './workspace';
+import { SCREEN_SHORTCUTS, SHORTCUTS, displayKeys, matchShortcut } from './keyboard-shortcuts';
+import { ErrorBoundary } from './error-boundary';
 
 type ScreenId =
   | 'home'
@@ -44,7 +46,7 @@ const SCREENS: ReadonlyArray<{ id: ScreenId; label: string; summary: string }> =
   { id: 'memory', label: 'Context', summary: 'Decisions, preferences and project facts your connected harness can retrieve.' },
   { id: 'review', label: 'Suggestions', summary: 'Choose which notes from your harnesses are worth keeping.' },
   { id: 'tasks', label: 'Tasks', summary: 'Keep track of what to do next and what is finished.' },
-  { id: 'harnesses', label: 'Harnesses', summary: 'Let Codex, Claude Code or Hermes use your saved context.' },
+  { id: 'harnesses', label: 'Harnesses', summary: 'Let Codex, Claude Code, Hermes or OpenCode use your saved context.' },
   { id: 'devices', label: 'Devices', summary: 'Review trusted local devices.' },
   { id: 'settings', label: 'Settings', summary: 'Review local security settings.' },
   { id: 'help', label: 'Help', summary: 'Learn how to save context, continue work and connect your harnesses.' },
@@ -58,6 +60,7 @@ const NAV_GROUPS: ReadonlyArray<{ label: string; screens: ScreenId[] }> = [
 const DEFAULT_GATEWAY = new LocalWorkspaceGateway();
 const STARTUP_TIMEOUT_MS = 45_000;
 type SaveAction = 'memory' | 'task' | 'memory-edit' | 'task-edit' | 'archive' | 'review' | 'task-status' | 'task-complete';
+type ProjectBusySource = 'project' | 'recovery' | 'opencode';
 const SAVE_MESSAGES: Partial<Record<SaveAction, string>> = {
   archive: 'Archiving context…',
   review: 'Saving your review…',
@@ -111,7 +114,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
   const [status, setStatus] = useState<StatusOutput | null>(null);
   const [connectionState, setConnectionState] = useState<'connecting' | 'ready' | 'failed'>('connecting');
   const [connectionAttempt, setConnectionAttempt] = useState(0);
-  const [serviceVersionMismatch, setServiceVersionMismatch] = useState(false);
+  const [connectionFailure, setConnectionFailure] = useState<ConnectionFailureGuidance | null>(null);
   const [projects, setProjects] = useState<ProjectIdentity[]>([]);
   const [activeProject, setActiveProject] = useState<ProjectIdentity | null>(null);
   const [memories, setMemories] = useState<MemoryRecord[]>([]);
@@ -140,11 +143,19 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
     textDrafts.current.set(key, { title: String(data.get('title') ?? ''), body: String(data.get('body') ?? '') });
   }
   const [projectBusy, setProjectBusy] = useState(false);
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const projectBusyRef = useRef(false);
-  const recoveryBusy = useCallback((value: boolean) => {
-    projectBusyRef.current = value;
-    setProjectBusy(value);
+  const projectBusySources = useRef<Record<ProjectBusySource, boolean>>({ project: false, recovery: false, opencode: false });
+  const reportProjectBusy = useCallback((source: ProjectBusySource, value: boolean) => {
+    projectBusySources.current[source] = value;
+    // One child finishing or unmounting must not release another child's guard.
+    const busy = Object.values(projectBusySources.current).some(Boolean);
+    projectBusyRef.current = busy;
+    setProjectBusy(busy);
   }, []);
+  const recoveryBusy = useCallback((value: boolean) => reportProjectBusy('recovery', value), [reportProjectBusy]);
+  const projectFormBusy = useCallback((value: boolean) => reportProjectBusy('project', value), [reportProjectBusy]);
+  const openCodeBusy = useCallback((value: boolean) => reportProjectBusy('opencode', value), [reportProjectBusy]);
   const readGeneration = useRef(0);
   const [recordsLoading, setRecordsLoading] = useState(false);
   const [submittedSearch, setSubmittedSearch] = useState<{ query: string } | null>(null);
@@ -157,16 +168,22 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
   const dialogTriggerRef = useRef<HTMLButtonElement>(null);
   const archiveDialogRef = useRef<HTMLDialogElement>(null);
   const archiveTriggerRef = useRef<HTMLButtonElement>(null);
+  const shortcutsDialogRef = useRef<HTMLDialogElement>(null);
+  const shortcutsCloseRef = useRef<HTMLButtonElement>(null);
+  const shortcutsTriggerRef = useRef<HTMLElement | null>(null);
   const currentScreen = SCREENS.find((screen) => screen.id === activeScreen);
 
   useEffect(() => {
     let active = true;
     setConnectionState('connecting');
-    setServiceVersionMismatch(false);
+    setConnectionFailure(null);
     // Bound the initial reads even if the native bridge never settles. Retrying
     // these reads must not replay any workspace mutation or accept stale results.
     const timeout = window.setTimeout(() => {
       active = false;
+      setConnectionFailure(
+        connectionFailureGuidance({ code: 'timeout' }),
+      );
       setConnectionState('failed');
     }, STARTUP_TIMEOUT_MS);
     void Promise.all([gateway.status(), gateway.projects()])
@@ -181,7 +198,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
       .catch((failure: unknown) => {
         if (!active) return;
         window.clearTimeout(timeout);
-        setServiceVersionMismatch(isServiceVersionMismatch(failure));
+        setConnectionFailure(connectionFailureGuidance(failure));
         setConnectionState('failed');
       });
     return () => {
@@ -193,6 +210,51 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
   useEffect(() => {
     if (hasNavigatedRef.current) headingRef.current?.focus();
   }, [activeScreen]);
+
+  // selectScreen is a plain function rather than a stable callback, so hold it in
+  // a ref: including it in the effect deps would re-bind the listener every render.
+  const selectScreenRef = useRef(selectScreen);
+  selectScreenRef.current = selectScreen;
+  const selectProjectRef = useRef(selectProject);
+  selectProjectRef.current = selectProject;
+
+  useEffect(() => {
+    if (!shortcutsOpen) return;
+    shortcutsDialogRef.current?.showModal();
+    shortcutsCloseRef.current?.focus();
+  }, [shortcutsOpen]);
+
+  // Workspace shortcuts obey the same busy and project-transition rules as the
+  // visible controls. Setup and modal interactions keep their own keyboard flow.
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || event.isComposing || event.repeat || showSetup ||
+          savingRef.current || projectBusyRef.current || document.querySelector('dialog[open]')) return;
+      const id = matchShortcut(event, event.target);
+      if (!id) return;
+      const screen = SCREEN_SHORTCUTS[id] as ScreenId | undefined;
+      if (screen) { event.preventDefault(); void selectScreenRef.current(screen); return; }
+      if (id === 'showShortcuts') {
+        event.preventDefault();
+        shortcutsTriggerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+        setShortcutsOpen(true);
+        return;
+      }
+      if (id === 'focusSearch') { event.preventDefault(); void selectScreenRef.current('memory'); requestAnimationFrame(() => document.getElementById('memory-query')?.focus()); return; }
+      if (id === 'newContext') { event.preventDefault(); setCreatingContext(true); setEditingMemory(null); void selectScreenRef.current('memory'); return; }
+      if (id === 'newTask') { event.preventDefault(); setCreatingTask(true); setEditingTask(null); void selectScreenRef.current('tasks'); return; }
+      if (id === 'nextProject' || id === 'previousProject') {
+        event.preventDefault();
+        if (projects.length < 2) return;
+        const at = projects.findIndex((entry) => entry.projectId === activeProject?.projectId);
+        const step = id === 'nextProject' ? 1 : -1;
+        const next = at < 0 ? (step > 0 ? 0 : projects.length - 1) : (at + step + projects.length) % projects.length;
+        selectProjectRef.current(projects[next]);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [projects, activeProject, showSetup, setEditingMemory, setEditingTask]);
 
   useEffect(() => {
     if (activeScreen === 'memory' && creatingContext) document.getElementById('title-title')?.focus();
@@ -219,6 +281,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
   }, [activeScreen, submittedSearch, searchRevision, searchProjectId, gateway, connectionState]);
 
   if (!currentScreen) return null;
+  const screenResetKey = `${activeScreen}:${activeProject?.projectId ?? 'global'}`;
 
   function transitionProject(project: ProjectIdentity | null) {
     if (project?.projectId !== activeProject?.projectId) {
@@ -496,7 +559,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
       case 'projects':
         return (
           <section className="screen-content">
-            <ProjectForm gateway={gateway} ready={connectionState === 'ready'} initialDraft={projectDraft.current} onDraft={value => { projectDraft.current = value; }} onSaved={projectSaved} onBusy={(value) => { projectBusyRef.current = value; setProjectBusy(value); }} />
+            <ProjectForm gateway={gateway} ready={connectionState === 'ready'} initialDraft={projectDraft.current} onDraft={value => { projectDraft.current = value; }} onSaved={projectSaved} onBusy={projectFormBusy} />
             <RecordList title="Projects">
               {projects.map((project) => (
                 <li key={project.projectId}>
@@ -686,6 +749,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
     {preferenceError && <p className="form-error" role="alert">{preferenceError}</p>}
     {error && <p className="form-error" role="alert">{error}</p>}
     <SetupWizard gateway={gateway} projects={projects} progress={preferences.setup}
+      initialProjectDraft={projectDraft.current} onProjectDraft={draft => { projectDraft.current = draft; }}
       onChange={next => { if (next.projectId !== preferences.setup.projectId) { setTestVerified(false); const project = projects.find(item => item.projectId === next.projectId); if (project || next.projectId === null) transitionProject(project ?? null); } updateSetup(next); }}
       onProjectSaved={project => { setProjects(current => current.some(item => item.projectId === project.projectId) ? current : [...current, project]); transitionProject(project); }}
       onFinishLater={() => updateSetup({ ...preferences.setup, status: 'deferred' })}
@@ -746,7 +810,14 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
           {(activeScreen === 'memory' || activeScreen === 'review') && <div className="context-tabs" role="group" aria-label="Context views"><button type="button" aria-pressed={activeScreen === 'memory'} onClick={() => void selectScreen('memory')}>Saved</button><button type="button" aria-pressed={activeScreen === 'review'} onClick={() => void selectScreen('review')}>Suggestions</button></div>}
           {connectionState === 'failed' && (
             <div className="form-error" role="alert">
-              <p>{serviceVersionMismatch ? SERVICE_UPDATE_GUIDANCE : 'Could not connect to the local workspace. Retry the connection to continue.'}</p>
+              <p>{connectionFailure?.message ?? 'Could not connect to the local workspace.'}</p>
+              {connectionFailure && connectionFailure.steps.length > 0 && (
+                <ol className="recovery-steps">
+                  {connectionFailure.steps.map((step) => (
+                    <li key={step}>{step}</li>
+                  ))}
+                </ol>
+              )}
               <button onClick={() => setConnectionAttempt((attempt) => attempt + 1)} type="button">Retry connection</button>
             </div>
           )}
@@ -756,22 +827,48 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
           </div>}
           {saving && SAVE_MESSAGES[saving] && <p role="status">{SAVE_MESSAGES[saving]}</p>}
           {recordsLoading && <p role="status">Loading your saved records…</p>}
-          {renderScreen(activeScreen)}
-          {recoveryStorageFull && activeScreen !== 'home' && <WriteRecovery gateway={gateway} projects={projects} onBusy={recoveryBusy} onConfirmed={() => {
+          <ErrorBoundary label={currentScreen.label} resetKey={screenResetKey}><ScreenContent render={() => renderScreen(activeScreen)} /></ErrorBoundary>
+          {shortcutsOpen && (
+            <dialog className="shortcut-dialog" aria-labelledby="shortcuts-title" ref={shortcutsDialogRef}
+              onCancel={event => { event.preventDefault(); shortcutsDialogRef.current?.close(); }}
+              onClose={() => { setShortcutsOpen(false); shortcutsTriggerRef.current?.focus(); }}>
+                <h2 id="shortcuts-title">Keyboard shortcuts</h2>
+                {['Go to', 'Create', 'Switch project', 'General'].map((group) => (
+                  <div key={group}>
+                    <h3>{group}</h3>
+                    <dl className="shortcut-list">
+                      {SHORTCUTS.filter((shortcut) => shortcut.group === group).map((shortcut) => (
+                        <div key={shortcut.id}>
+                          <dt>{shortcut.label}</dt>
+                          <dd><kbd>{displayKeys(shortcut.keys)}</kbd></dd>
+                        </div>
+                      ))}
+                    </dl>
+                  </div>
+                ))}
+                <button className="primary-action" type="button" ref={shortcutsCloseRef} onClick={() => shortcutsDialogRef.current?.close()}>Close</button>
+            </dialog>
+          )}
+          {recoveryStorageFull && activeScreen !== 'home' && <ErrorBoundary label="Write recovery" resetKey={screenResetKey}><WriteRecovery gateway={gateway} projects={projects} onBusy={recoveryBusy} onConfirmed={() => {
             if (activeScreen === 'memory' || activeScreen === 'tasks') refreshSavedRecords(activeScreen === 'memory' ? 'memory' : 'task', activeProject?.projectId ?? null);
             else if (activeScreen === 'review') refreshSavedRecords('review', activeProject?.projectId ?? null);
-          }} />}
+          }} /></ErrorBoundary>}
           <div hidden={activeScreen !== 'harnesses'}>
-            <HarnessesScreen gateway={gateway} projects={projects} preferredProjectId={activeProject?.projectId} onProjectChange={(id) => {
+            <ErrorBoundary label="Harnesses" resetKey={screenResetKey}><HarnessesScreen gateway={gateway} openCodeGateway={gateway} onOpenCodeBusy={openCodeBusy} projects={projects} preferredProjectId={activeProject?.projectId} onProjectChange={(id) => {
               const project = projects.find((item) => item.projectId === id);
               if (project) selectProject(project);
-            }} onAddProject={() => void selectScreen('projects')} onSaveContext={() => { setCreatingContext(true); setEditingMemory(null); void selectScreen('memory'); }} active={activeScreen === 'harnesses'} />
+            }} onAddProject={() => void selectScreen('projects')} onSaveContext={() => { setCreatingContext(true); setEditingMemory(null); void selectScreen('memory'); }} active={activeScreen === 'harnesses'} /></ErrorBoundary>
           </div>
           </div>
         </main>
       </div>
     </>
   );
+}
+
+// Evaluate screen rendering inside the boundary, including inline record lists.
+function ScreenContent({ render }: { render: () => ReactNode }) {
+  return render();
 }
 
 function Field({

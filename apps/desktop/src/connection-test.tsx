@@ -10,8 +10,10 @@ function missingCheck(error: unknown): boolean {
   return !!error && typeof error === 'object' && 'code' in error && error.code === 'not_found';
 }
 
+export type ConnectionTestGateway = Pick<WorkspaceGateway, 'memories' | 'createMemory' | 'archiveMemory' | 'connectionCheckStart' | 'connectionCheckStatus' | 'connectionCheckCancel'>;
+
 interface Props {
-  gateway: WorkspaceGateway;
+  gateway: ConnectionTestGateway;
   project: ProjectIdentity;
   harnesses: HarnessId[];
   noteId: string | null;
@@ -53,6 +55,7 @@ export function ConnectionTest({ gateway, project, harnesses, noteId, checkId, o
   const name = HARNESS_NAMES[harness];
   const { canOpenWindow, terminal } = harnessLaunchPresentation();
   const macos = !canOpenWindow;
+  const manualLaunch = harness === 'opencode';
   const verified = check?.phase === 'verified' && !restoring && !restoreFailed && !checkError && !!note && matches(check, note);
   const prompt = note ? `Use the Context Relay context_relay_get tool to read saved context note ${note.id} in project ${project.projectId}. Read this exact note now, then quote its contents and explain how you will use it. Do not answer from an earlier message, a search result or another file.` : '';
 
@@ -211,16 +214,16 @@ export function ConnectionTest({ gateway, project, harnesses, noteId, checkId, o
       <blockquote>{note.bodyMarkdown}</blockquote>
       {check?.phase === 'waiting' && <>
         <p role="status">Waiting for {name} to read this note. The check expires in about {Math.max(1, Math.ceil(check.expiresInSeconds / 60))} minutes.</p>
-        <ol><li>{macos ? `Copy the launch command and run it in Terminal to open ${name} for this project.` : `Open ${name} for this project.`} Complete any sign-in or project approval it requests.</li><li>Copy the test prompt below and send it in that harness.</li><li>Return here. Context Relay will confirm when the connected harness reads the note.</li></ol>
+        <ol><li>{manualLaunch ? 'Open OpenCode yourself in the project folder where you saved its MCP configuration.' : macos ? `Copy the launch command and run it in Terminal to open ${name} for this project.` : `Open ${name} for this project.`} Complete any sign-in or project approval it requests.</li><li>Copy the test prompt below and send it in that harness.</li><li>Return here. Context Relay will confirm when the connected harness reads the note.</li></ol>
         <div className="toolbar-actions">
-          {!macos && <button type="button" disabled={busy} onClick={() => void run(async () => { await onOpenHarness(selection); })}>Open {name}</button>}
-          <button type="button" className={macos ? 'primary-action' : 'secondary-action'} disabled={busy} onClick={() => void run(async () => {
+          {!manualLaunch && !macos && <button type="button" disabled={busy} onClick={() => void run(async () => { await onOpenHarness(selection); })}>Open {name}</button>}
+          {!manualLaunch && <button type="button" className={macos ? 'primary-action' : 'secondary-action'} disabled={busy} onClick={() => void run(async () => {
             await onCopyCommand(selection);
             if (mounted.current) setNotice(`Launch command copied. Run it in ${terminal}, then send the test prompt in your harness.`);
-          })}>Copy launch command</button>
+          })}>Copy launch command</button>}
           <button type="button" disabled={busy} onClick={() => void run(async () => { await onCopyPrompt(prompt); setNotice('Test prompt copied. Paste it into your harness.'); })}>Copy test prompt</button>
         </div>
-        <p className="help-text">The launch command is for {terminal}. The test prompt is for your harness after it opens.</p>
+        <p className="help-text">{!manualLaunch && `The launch command is for ${terminal}. `}The test prompt is for your harness after it opens.</p>
         <details><summary>View test prompt</summary><p>{prompt}</p></details>
         <button type="button" disabled={busy} onClick={() => void run(async () => { callbacks.current.onVerified(false); await gateway.connectionCheckCancel(check.checkId); setCheck(null); setCheckError(null); callbacks.current.onVerified(false); callbacks.current.onProgress(note.id, null, harness); })}>Cancel check</button>
       </>}

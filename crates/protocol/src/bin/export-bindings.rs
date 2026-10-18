@@ -129,6 +129,7 @@ export type PackageId = UuidV7 & {{ readonly __packageId: unique symbol }};\nexp
         HostedAuthStatus,
         HarnessPrepareParams,
         HarnessLaunchInfo,
+        OpenCodeMcpExport,
         ConnectionCheckStartParams,
         ConnectionCheckIdParams,
         ConnectionCheckPhase,

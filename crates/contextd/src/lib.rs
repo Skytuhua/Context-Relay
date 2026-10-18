@@ -458,8 +458,8 @@ impl ProductionBridgeCliRecoveryIo {
                 let mut executor = adapter.cli_executor();
                 operation(&mut executor, &bound.mutations)
             }
-            HarnessId::Hermes => Err(BoundaryError::new(
-                "Hermes plans cannot contain native CLI recovery mutations",
+            HarnessId::Hermes | HarnessId::OpenCode => Err(BoundaryError::new(
+                "This harness cannot contain native CLI recovery mutations",
             )),
         }
     }
@@ -1198,6 +1198,7 @@ fn route_request(role: ClientRole, request: LocalRequest) -> RoutedRequest {
             | LocalRequest::HostedAuthCancel(_)
             | LocalRequest::HostedAuthLogout(_)
             | LocalRequest::HarnessLaunchInfo(_)
+            | LocalRequest::OpenCodeMcpExport(_)
             | LocalRequest::ConnectionCheckStart(_)
             | LocalRequest::ConnectionCheckStatus(_)
             | LocalRequest::ConnectionCheckCancel(_)
@@ -1258,6 +1259,7 @@ fn route_request(role: ClientRole, request: LocalRequest) -> RoutedRequest {
             RoutedRequest::Work(VaultCommand::ProjectPathSet(params))
         }
         request @ (LocalRequest::HarnessLaunchInfo(_)
+        | LocalRequest::OpenCodeMcpExport(_)
         | LocalRequest::ConnectionCheckStart(_)
         | LocalRequest::ConnectionCheckStatus(_)
         | LocalRequest::ConnectionCheckCancel(_)) => {
@@ -2311,6 +2313,10 @@ fn execute_workspace_request(
             selection,
         )
         .map(|info| LocalResult::HarnessLaunchInfo { info }),
+        LocalRequest::OpenCodeMcpExport(params) => state
+            .bridge_install
+            .opencode_mcp_export(&state.vault, params.project_id)
+            .map(|export| LocalResult::OpenCodeMcpExport { export }),
         LocalRequest::ConnectionCheckStart(params) => {
             LocalRequest::ConnectionCheckStart(params.clone())
                 .validate()

@@ -1,5 +1,5 @@
 import { beforeEach, expect, it, vi } from 'vitest';
-import type { MemoryCandidate, MemoryRecord, TaskRecord } from './bindings';
+import type { MemoryRecord, TaskRecord } from './bindings';
 
 const invoke = vi.hoisted(() => vi.fn());
 vi.mock('@tauri-apps/api/core', () => ({ invoke: async (command: string, args: { request: { method: string; params: { operationId: string; taskId?: string | null; accepted?: boolean } } }) => {
@@ -20,10 +20,11 @@ vi.mock('@tauri-apps/api/core', () => ({ invoke: async (command: string, args: {
   return result;
 } }));
 import { LocalWorkspaceGateway } from './workspace';
+import { fixtureCandidate, fixtureMemory, fixtureTask } from './test-fixtures';
 
-const memory = { id: 'memory', revision: 'revision' } as MemoryRecord;
-const task = { id: 'task', projectId: 'project', revision: 'revision', status: 'open' } as TaskRecord;
-const candidate = { id: 'candidate' } as MemoryCandidate;
+const memory = fixtureMemory();
+const task = fixtureTask();
+const candidate = fixtureCandidate();
 const cases = [
   { name: 'create context', run: (g: LocalWorkspaceGateway) => g.createMemory('project', 'Title', 'Text'), result: { kind: 'memory', data: { memory } } },
   { name: 'edit context', run: (g: LocalWorkspaceGateway) => g.updateMemory(memory, 'Title', 'Text'), result: { kind: 'memory', data: { memory } } },
@@ -91,7 +92,12 @@ it('an identical retry after a lost committed reply returns the original record'
   invoke.mockImplementation(async (_command, { request }) => {
     const id = request.params.operationId;
     if (!records.has(id)) {
-      records.set(id, { id, title: request.params.title });
+      records.set(id, fixtureMemory({
+      id: id as unknown as MemoryRecord['id'],
+      revision: id as unknown as MemoryRecord['revision'],
+      title: request.params.title,
+      bodyMarkdown: request.params.bodyMarkdown,
+    }));
       throw new Error('committed, reply lost');
     }
     return { kind: 'memory', data: { memory: records.get(id) } };
@@ -114,8 +120,10 @@ it.each(['context', 'task'] as const)('allows a new identical %s after a later a
       createdId = request.params.operationId;
       throw new Error('committed, reply lost');
     }
-    const record = { id: creation ? request.params.operationId : createdId };
-    return kind === 'context' ? { kind: 'memory', data: { memory: record } } : { kind: 'tasks', data: { tasks: [record] } };
+    const id = creation ? request.params.operationId : createdId;
+    return kind === 'context'
+      ? { kind: 'memory', data: { memory: fixtureMemory({ id: id as unknown as MemoryRecord['id'], revision: id as unknown as MemoryRecord['revision'] }) } }
+      : { kind: 'tasks', data: { tasks: [fixtureTask({ id: id as unknown as TaskRecord['id'], revision: id as unknown as TaskRecord['revision'] })] } };
   });
   const create = () => kind === 'context' ? gateway.createMemory('project', 'Title', 'Text') : gateway.createTask('project', 'Title', 'Text');
   await expect(create()).rejects.toThrow();

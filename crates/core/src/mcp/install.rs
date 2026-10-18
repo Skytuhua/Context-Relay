@@ -25,6 +25,7 @@ pub const fn harness_cli_name(harness: HarnessId) -> &'static str {
         HarnessId::ClaudeCode => "claude-code",
         HarnessId::Codex => "codex",
         HarnessId::Hermes => "hermes",
+        HarnessId::OpenCode => "opencode",
     }
 }
 
@@ -80,6 +81,9 @@ pub fn attest_bridge_executable(path: &Path) -> Result<BridgeExecutable, ClientE
 }
 
 pub fn is_managed_bridge_component(harness: HarnessId, component: &ComponentRecord) -> bool {
+    if harness == HarnessId::OpenCode {
+        return false;
+    }
     if component.id
         != match stable_bridge_record_id(harness) {
             Ok(id) => id,
@@ -135,12 +139,13 @@ fn bridge_metadata(harness: HarnessId) -> Vec<(String, String)> {
             "structuralLocation".to_owned(),
             HERMES_STRUCTURAL_LOCATION.to_owned(),
         )],
-        HarnessId::ClaudeCode | HarnessId::Codex => Vec::new(),
+        HarnessId::ClaudeCode | HarnessId::Codex | HarnessId::OpenCode => Vec::new(),
     }
 }
 
 fn canonical_bridge_body(harness: HarnessId, command: &str) -> Result<String, ClientError> {
     let value = match harness {
+        HarnessId::OpenCode => return Err(invalid("OpenCode uses a manual project MCP export")),
         HarnessId::Hermes => json!({
             "args": ["--harness", harness_cli_name(harness)],
             "command": command,

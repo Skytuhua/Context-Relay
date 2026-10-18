@@ -135,6 +135,28 @@ fn session_metadata(owner: &HostedSessionOwner) -> Result<(u64, LoginCancellatio
     Ok((session.expires_at(), owner.cancellation()?))
 }
 
+async fn refresh_with_retry<T, C, F>(
+    cancellation: &LoginCancellation,
+    mut refresh: C,
+) -> Result<T, LoginError>
+where
+    C: FnMut() -> F,
+    F: std::future::Future<Output = Result<T, LoginError>>,
+{
+    let mut retry = Duration::from_secs(5);
+    loop {
+        if cancellation.is_canceled() {
+            return Err(LoginError::Canceled);
+        }
+        let result = refresh().await;
+        if !matches!(result, Err(LoginError::Unavailable | LoginError::Busy)) {
+            return result;
+        }
+        tokio::time::sleep(retry).await;
+        retry = (retry * 2).min(Duration::from_secs(60));
+    }
+}
+
 async fn maintain_session(
     weak: Weak<Inner>,
     generation: OperationId,
@@ -190,21 +212,26 @@ async fn maintain_session(
                 break;
             }
         }
-        let mut retry = Duration::from_secs(5);
-        loop {
+        // The access token may expire during an outage; saved refresh credentials
+        // must still recover when connectivity returns. Bound the retry rate,
+        // and stop this generation on cancellation or a terminal auth error.
+        // Login, logout, and shutdown also abort the owned maintenance task.
+        metadata = refresh_with_retry(&cancellation, || {
             let refreshing_owner = owner.clone();
             let refreshing_cancellation = cancellation.clone();
-            metadata = tokio::task::spawn_blocking(move || {
-                refreshing_owner.refresh_cancellable(&refreshing_cancellation, now()?)?;
-                session_metadata(&refreshing_owner)
-            })
-            .await
-            .unwrap_or(Err(LoginError::Unavailable));
-            if !matches!(metadata, Err(LoginError::Unavailable | LoginError::Busy)) {
-                break;
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    refreshing_owner.refresh_cancellable(&refreshing_cancellation, now()?)?;
+                    session_metadata(&refreshing_owner)
+                })
+                .await
+                .unwrap_or(Err(LoginError::Unavailable))
             }
-            tokio::time::sleep(retry).await;
-            retry = (retry * 2).min(Duration::from_secs(60));
+        })
+        .await;
+        if let Err(error) = &metadata {
+            publish(&weak, generation, failed(*error));
+            return;
         }
     }
 }
@@ -503,6 +530,87 @@ impl HostedAuthService {
         if let Some(owner) = &self.0.owner {
             let _ = owner.suspend();
         }
+    }
+}
+
+#[cfg(test)]
+mod refresh_retry_tests {
+    use super::{Duration, LoginCancellation, LoginError, refresh_with_retry};
+    use std::{
+        future::ready,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    #[tokio::test(start_paused = true)]
+    async fn a_transient_outage_longer_than_fifteen_minutes_can_recover() {
+        let cancellation = LoginCancellation::default();
+        let started = tokio::time::Instant::now();
+        let recovery = started + Duration::from_secs(16 * 60);
+        let mut attempts = 0_u32;
+
+        let result = refresh_with_retry(&cancellation, || {
+            attempts += 1;
+            ready(if tokio::time::Instant::now() >= recovery {
+                Ok("renewed session")
+            } else if attempts.is_multiple_of(2) {
+                Err(LoginError::Busy)
+            } else {
+                Err(LoginError::Unavailable)
+            })
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(result, "renewed session");
+        assert!(tokio::time::Instant::now() >= recovery);
+        assert!(tokio::time::Instant::now() <= recovery + Duration::from_secs(60));
+        assert!(
+            (2..25).contains(&attempts),
+            "transient failures must back off"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_terminal_refresh_error_is_not_retried() {
+        let cancellation = LoginCancellation::default();
+        let started = tokio::time::Instant::now();
+        let mut attempts = 0;
+        let result = refresh_with_retry(&cancellation, || {
+            attempts += 1;
+            ready(Err::<(), _>(LoginError::Denied))
+        })
+        .await;
+
+        assert!(matches!(result, Err(LoginError::Denied)));
+        assert_eq!(attempts, 1);
+        assert_eq!(tokio::time::Instant::now(), started);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_during_backoff_prevents_another_refresh() {
+        let cancellation = LoginCancellation::default();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let task_cancellation = cancellation.clone();
+        let task_attempts = attempts.clone();
+        let task = tokio::spawn(async move {
+            refresh_with_retry(&task_cancellation, || {
+                task_attempts.fetch_add(1, Ordering::SeqCst);
+                ready(Err::<(), _>(LoginError::Unavailable))
+            })
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(!task.is_finished());
+        cancellation.cancel();
+        tokio::time::advance(Duration::from_secs(5)).await;
+
+        assert!(matches!(task.await.unwrap(), Err(LoginError::Canceled)));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 }
 

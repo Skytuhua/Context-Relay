@@ -9,17 +9,19 @@ use crate::{
 };
 
 macro_rules! closed_enum {
-    ($name:ident { $($variant:ident),+ $(,)? }) => {
+    ($name:ident { $($(#[$attr:meta])* $variant:ident),+ $(,)? }) => {
         #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
         #[serde(rename_all = "snake_case")]
-        pub enum $name { $($variant),+ }
+        pub enum $name { $($(#[$attr])* $variant),+ }
     };
 }
 
 closed_enum!(HarnessId {
     ClaudeCode,
     Codex,
-    Hermes
+    Hermes,
+    #[serde(rename = "opencode")]
+    OpenCode
 });
 closed_enum!(MemoryKind {
     Fact,
