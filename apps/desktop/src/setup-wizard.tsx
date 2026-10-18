@@ -18,6 +18,8 @@ interface Props {
   progress: SetupProgress;
   onChange: (progress: SetupProgress) => void;
   onProjectSaved: (project: ProjectIdentity) => void;
+  initialProjectDraft?: { name: string; path: string };
+  onProjectDraft?: (draft: { name: string; path: string }) => void;
   onFinishLater: () => void;
   onTour: () => void;
   onSkipTour?: () => void;
@@ -28,7 +30,7 @@ interface Props {
   operationBusy?: boolean;
 }
 
-export function SetupWizard({ gateway, projects, progress, onChange, onProjectSaved, onFinishLater, onTour, onSkipTour, onOpenGuide, renderConnection, renderTest, testComplete = false, operationBusy = false }: Props) {
+export function SetupWizard({ gateway, projects, progress, onChange, onProjectSaved, initialProjectDraft, onProjectDraft, onFinishLater, onTour, onSkipTour, onOpenGuide, renderConnection, renderTest, testComplete = false, operationBusy = false }: Props) {
   const [reports, setReports] = useState<Partial<Record<HarnessId, ProbeReport | 'failed'>>>({});
   const [refresh, setRefresh] = useState(0);
   const [projectBusy, setProjectBusy] = useState(false);
@@ -121,7 +123,7 @@ export function SetupWizard({ gateway, projects, progress, onChange, onProjectSa
         {projects.length > 0 && <fieldset><legend>Use an existing project</legend>{projects.map(item => <label className="status-row" key={item.projectId}>
           <input type="radio" name="setup-project" checked={progress.projectId === item.projectId} onChange={() => update({ projectId: item.projectId, noteId: null, checkId: null })} />{item.name}
         </label>)}</fieldset>}
-        <ProjectForm gateway={gateway} ready onBusy={setProjectBusy} onSaved={item => { onProjectSaved(item); update({ projectId: item.projectId, noteId: null, checkId: null }); }} />
+        <ProjectForm gateway={gateway} ready onBusy={setProjectBusy} initialDraft={initialProjectDraft} onDraft={onProjectDraft} onSaved={item => { onProjectSaved(item); update({ projectId: item.projectId, noteId: null, checkId: null }); }} />
       </section>}
       {(progress.step === 'connect' || progress.step === 'test') && (!project || !harness ? <section>
         <p>Choose a project to continue. Your previous selection may no longer be available.</p><button type="button" onClick={() => step(progress.harnesses.length ? 'project' : 'harnesses')}>Choose a project</button>
