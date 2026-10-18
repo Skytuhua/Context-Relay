@@ -159,6 +159,9 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
   const dialogTriggerRef = useRef<HTMLButtonElement>(null);
   const archiveDialogRef = useRef<HTMLDialogElement>(null);
   const archiveTriggerRef = useRef<HTMLButtonElement>(null);
+  const shortcutsDialogRef = useRef<HTMLDialogElement>(null);
+  const shortcutsCloseRef = useRef<HTMLButtonElement>(null);
+  const shortcutsTriggerRef = useRef<HTMLElement | null>(null);
   const currentScreen = SCREENS.find((screen) => screen.id === activeScreen);
 
   useEffect(() => {
@@ -200,17 +203,31 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
   // a ref: including it in the effect deps would re-bind the listener every render.
   const selectScreenRef = useRef(selectScreen);
   selectScreenRef.current = selectScreen;
+  const selectProjectRef = useRef(selectProject);
+  selectProjectRef.current = selectProject;
 
-  // Global shortcuts. A single keydown listener on the window rather than one
-  // per screen, so navigation stays reachable from anywhere including dialogs.
+  useEffect(() => {
+    if (!shortcutsOpen) return;
+    shortcutsDialogRef.current?.showModal();
+    shortcutsCloseRef.current?.focus();
+  }, [shortcutsOpen]);
+
+  // Workspace shortcuts obey the same busy and project-transition rules as the
+  // visible controls. Setup and modal interactions keep their own keyboard flow.
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape' && shortcutsOpen) { setShortcutsOpen(false); return; }
+      if (event.defaultPrevented || event.isComposing || event.repeat || showSetup ||
+          savingRef.current || projectBusyRef.current || document.querySelector('dialog[open]')) return;
       const id = matchShortcut(event, event.target);
       if (!id) return;
       const screen = SCREEN_SHORTCUTS[id] as ScreenId | undefined;
       if (screen) { event.preventDefault(); void selectScreenRef.current(screen); return; }
-      if (id === 'showShortcuts') { event.preventDefault(); setShortcutsOpen(true); return; }
+      if (id === 'showShortcuts') {
+        event.preventDefault();
+        shortcutsTriggerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+        setShortcutsOpen(true);
+        return;
+      }
       if (id === 'focusSearch') { event.preventDefault(); void selectScreenRef.current('memory'); requestAnimationFrame(() => document.getElementById('memory-query')?.focus()); return; }
       if (id === 'newContext') { event.preventDefault(); setCreatingContext(true); setEditingMemory(null); void selectScreenRef.current('memory'); return; }
       if (id === 'newTask') { event.preventDefault(); setCreatingTask(true); setEditingTask(null); void selectScreenRef.current('tasks'); return; }
@@ -219,12 +236,13 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
         if (projects.length < 2) return;
         const at = projects.findIndex((entry) => entry.projectId === activeProject?.projectId);
         const step = id === 'nextProject' ? 1 : -1;
-        setActiveProject(projects[(at + step + projects.length) % projects.length]);
+        const next = at < 0 ? (step > 0 ? 0 : projects.length - 1) : (at + step + projects.length) % projects.length;
+        selectProjectRef.current(projects[next]);
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [projects, activeProject, shortcutsOpen, setEditingMemory, setEditingTask]);
+  }, [projects, activeProject, showSetup, setEditingMemory, setEditingTask]);
 
   useEffect(() => {
     if (activeScreen === 'memory' && creatingContext) document.getElementById('title-title')?.focus();
@@ -790,8 +808,9 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
           {recordsLoading && <p role="status">Loading your saved records…</p>}
           {renderScreen(activeScreen)}
           {shortcutsOpen && (
-            <div className="shortcut-overlay" role="dialog" aria-modal="true" aria-labelledby="shortcuts-title">
-              <div className="screen-error">
+            <dialog className="shortcut-dialog" aria-labelledby="shortcuts-title" ref={shortcutsDialogRef}
+              onCancel={event => { event.preventDefault(); shortcutsDialogRef.current?.close(); }}
+              onClose={() => { setShortcutsOpen(false); shortcutsTriggerRef.current?.focus(); }}>
                 <h2 id="shortcuts-title">Keyboard shortcuts</h2>
                 {['Go to', 'Create', 'Switch project', 'General'].map((group) => (
                   <div key={group}>
@@ -806,9 +825,8 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
                     </dl>
                   </div>
                 ))}
-                <button className="primary-action" type="button" onClick={() => setShortcutsOpen(false)}>Close</button>
-              </div>
-            </div>
+                <button className="primary-action" type="button" ref={shortcutsCloseRef} onClick={() => shortcutsDialogRef.current?.close()}>Close</button>
+            </dialog>
           )}
           {recoveryStorageFull && activeScreen !== 'home' && <WriteRecovery gateway={gateway} projects={projects} onBusy={recoveryBusy} onConfirmed={() => {
             if (activeScreen === 'memory' || activeScreen === 'tasks') refreshSavedRecords(activeScreen === 'memory' ? 'memory' : 'task', activeProject?.projectId ?? null);
