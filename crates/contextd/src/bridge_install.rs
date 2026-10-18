@@ -28,8 +28,8 @@ use context_relay_native_runner::{
 };
 use context_relay_protocol::{
     ClientError, DeviceId, ErrorCode, HarnessAdapter as _, HarnessId, HarnessParams,
-    HybridLogicalClock, NativePlatform, NativeScope, PlanId, PlanParams, ProbeContext, ProbeReport,
-    ProjectId, SetupPlan, Sha256Digest, WireNativeValue,
+    HybridLogicalClock, NativePlatform, NativeScope, OpenCodeMcpExport, PlanId, PlanParams,
+    ProbeContext, ProbeReport, ProjectId, SetupPlan, Sha256Digest, WireNativeValue,
 };
 
 #[cfg(not(windows))]
@@ -44,6 +44,13 @@ pub(crate) const NON_LAUNCHING_WINDOWS_SID: &str = "S-1-15-2-1-2-3-4-5-6-7";
 /// protocol DTOs; callers cannot inject paths, digests, commands, or plan
 /// bodies into apply and rollback.
 pub trait BridgeInstallEngine: Send + Sync {
+    fn opencode_mcp_export(
+        &self,
+        _vault: &Vault,
+        _project_id: ProjectId,
+    ) -> Result<OpenCodeMcpExport, ClientError> {
+        Err(unsupported("OpenCode MCP export is unavailable"))
+    }
     fn preview_prepared(
         &self,
         _vault: &mut Vault,
@@ -203,6 +210,40 @@ impl ProductionBridgeInstallEngine {
 }
 
 impl BridgeInstallEngine for ProductionBridgeInstallEngine {
+    fn opencode_mcp_export(
+        &self,
+        vault: &Vault,
+        project_id: ProjectId,
+    ) -> Result<OpenCodeMcpExport, ClientError> {
+        if !vault
+            .projects()
+            .map_err(|_| invalid("Registered projects cannot be loaded"))?
+            .iter()
+            .any(|project| project.project_id == project_id)
+        {
+            return Err(not_found(
+                "Choose a registered project for OpenCode MCP export",
+            ));
+        }
+        let binding = project_binding(vault, Some(project_id))?;
+        let resolved = context_relay_core::mcp::binding::resolve_binding(
+            vault,
+            &context_relay_protocol::McpBinding {
+                harness: HarnessId::OpenCode,
+                working_directory: wire_native_path(&binding.root),
+            },
+        )?;
+        if resolved.active_project.map(|project| project.project_id) != Some(project_id) {
+            return Err(invalid(
+                "The OpenCode working directory does not uniquely identify this project",
+            ));
+        }
+        context_relay_core::mcp::opencode::project_export(
+            project_id,
+            &binding.root,
+            &self.bridge.locate()?,
+        )
+    }
     fn preview_prepared(
         &self,
         vault: &mut Vault,
@@ -312,6 +353,9 @@ impl BridgeInstallEngine for ProductionBridgeInstallEngine {
             requested_profile: params.hermes_profile.clone(),
         };
         match params.harness {
+            HarnessId::OpenCode => Err(unsupported(
+                "OpenCode supports manual MCP export; managed discovery is unavailable",
+            )),
             HarnessId::ClaudeCode => ClaudeCodeAdapter::discover(
                 &binding.root,
                 binding.project_id,
@@ -367,6 +411,9 @@ impl BridgeInstallEngine for ProductionBridgeInstallEngine {
         let binding = project_binding(vault, project_id)?;
         let observed_hlc = HybridLogicalClock::new(now_ms, 0, device_id);
         match harness {
+            HarnessId::OpenCode => Err(unsupported(
+                "OpenCode supports manual MCP export; managed setup is unavailable",
+            )),
             HarnessId::ClaudeCode => BridgeInstallService::new(
                 vault,
                 ClaudeCodeAdapter::discover(
@@ -523,6 +570,9 @@ impl ProductionBridgePlanExecutor<'_> {
         // This branch never constructs a restricted executor, native filesystem,
         // journal, CLI writer, gateway lease, or bridge executable.
         match plan.setup.harness {
+            HarnessId::OpenCode => Err(unsupported(
+                "OpenCode does not support managed registration",
+            )),
             HarnessId::ClaudeCode => {
                 let adapter = ClaudeCodeAdapter::discover_for_registration(
                     &root,
@@ -602,6 +652,9 @@ impl ProductionBridgePlanExecutor<'_> {
         let mut hook = NoFault;
 
         let result = match plan.setup.harness {
+            HarnessId::OpenCode => {
+                return Err(invalid("OpenCode has no managed setup transaction").into());
+            }
             HarnessId::ClaudeCode => {
                 let mut adapter =
                     ClaudeCodeAdapter::discover(&root, project_id, self.device_id, observed_hlc)?;
@@ -885,6 +938,9 @@ impl BridgeRestrictedExecutor {
             .map_err(|_| unsupported("Persisted bridge execution is unavailable on this host"))?;
         let expected_command = SidecarCommand::RuleSyncGenerate {
             target: match harness {
+                HarnessId::OpenCode => {
+                    return Err(unsupported("OpenCode has no managed sidecar target"));
+                }
                 HarnessId::ClaudeCode | HarnessId::Hermes => RuleSyncTarget::ClaudeCode,
                 HarnessId::Codex => RuleSyncTarget::CodexCli,
             },
@@ -1975,6 +2031,70 @@ pub(crate) mod tests {
         adapter_root.display = canonical.to_str().map(str::to_owned);
         assert_eq!(binding.registered.unwrap().root, adapter_root);
         assert_eq!(vault.path(&project.to_string()).unwrap(), Some(saved));
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn opencode_export_requires_unique_registered_project_and_adjacent_attested_bridge() {
+        let temp = TempVault::new("opencode-export-binding");
+        let mut vault = Vault::open(
+            temp.path(),
+            "opencode-export-binding",
+            &MemoryKeyStore::default(),
+        )
+        .unwrap();
+        let root = temp.path().parent().unwrap().join("project");
+        fs::create_dir(&root).unwrap();
+        let engine = ProductionBridgeInstallEngine::with_daemon_executable(
+            temp.path().parent().unwrap().join("contextd.exe"),
+        );
+        let project: ProjectId = "018f22e2-79b0-7cc8-98c4-dc0c0c07398f".parse().unwrap();
+        vault
+            .put_path(&project.to_string(), &wire_native_path(&root))
+            .unwrap();
+        assert!(engine.opencode_mcp_export(&vault, project).is_err());
+        let identity = context_relay_protocol::ProjectIdentity {
+            project_id: project,
+            github_repository_id: None,
+            git_remote_fingerprint: None,
+            monorepo_subdirectory: None,
+            name: "OpenCode project".into(),
+        };
+        vault.put_project(&identity).unwrap();
+        assert!(engine.opencode_mcp_export(&vault, project).is_err());
+        let bridge = engine.bridge.bridge_path().unwrap();
+        fs::write(&bridge, b"not executed: installed bridge fixture").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&bridge, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        assert_eq!(
+            engine
+                .opencode_mcp_export(&vault, project)
+                .unwrap()
+                .project_id,
+            project
+        );
+        assert!(!root.join("opencode.json").exists());
+        assert!(!root.join(".context-relay-opencode.md").exists());
+        let other: ProjectId = "018f22e2-79b0-7cc8-98c4-dc0c0c073990".parse().unwrap();
+        vault
+            .put_project(&context_relay_protocol::ProjectIdentity {
+                project_id: other,
+                ..identity
+            })
+            .unwrap();
+        vault
+            .put_path(&other.to_string(), &wire_native_path(&root))
+            .unwrap();
+        assert_eq!(
+            engine
+                .opencode_mcp_export(&vault, project)
+                .unwrap_err()
+                .code,
+            ErrorCode::ScopeDenied
+        );
     }
 
     #[test]

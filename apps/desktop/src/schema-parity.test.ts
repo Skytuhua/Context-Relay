@@ -135,7 +135,7 @@ describe('package and export schema parity', () => {
     expect(packageSchema.properties.components.maxItems).toBe(10_000);
     expect(packageSchema.properties.secretRefs.maxItems).toBe(10_000);
     expect(packageSchema.properties.extensions.maxProperties).toBe(10_000);
-    expect(packageSchema.properties.harnessTargets.maxItems).toBe(3);
+    expect(packageSchema.properties.harnessTargets.maxItems).toBe(4);
     expect(permission.properties.permissions).toMatchObject({ maxItems: 10_000, uniqueItems: true });
     expect(skill.properties.dependencies.maxItems).toBe(10_000);
     expect(instruction.properties.title.maxLength).toBe(512);

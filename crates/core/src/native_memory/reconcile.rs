@@ -208,6 +208,7 @@ pub(crate) fn native_memory_title(source: &NativeMemorySource) -> String {
             HarnessId::ClaudeCode => "Claude Code",
             HarnessId::Codex => "Codex",
             HarnessId::Hermes => "Hermes",
+            HarnessId::OpenCode => "OpenCode",
         },
         match source.document_kind {
             super::NativeMemoryDocumentKind::Agent => "agent",
@@ -225,6 +226,7 @@ pub(crate) fn native_memory_tags(harness: HarnessId) -> Vec<String> {
             HarnessId::ClaudeCode => "claude-code",
             HarnessId::Codex => "codex",
             HarnessId::Hermes => "hermes",
+            HarnessId::OpenCode => "opencode",
         }
         .to_owned(),
     ]

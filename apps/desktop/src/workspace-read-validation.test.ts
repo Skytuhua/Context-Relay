@@ -123,3 +123,18 @@ it('validates a project identity before it drives the project switcher', async (
   });
   await expect(new LocalWorkspaceGateway().projects()).rejects.toThrow(/invalid project\.projectId/);
 });
+
+it('accepts OpenCode candidates while retaining the harness allowlist at the read boundary', async () => {
+  const candidate = {
+    id: '018f22e2-79b0-7cc8-98c4-dc0c0c075609',
+    proposedMemory: { ...memory, provenance: { ...memory.provenance, harness: 'opencode' } },
+    evidenceSummary: 'OpenCode proposed the requested preference.',
+    sourceHarness: 'opencode',
+    state: 'pending',
+  };
+  invoke.mockResolvedValueOnce({ kind: 'candidates', data: { candidates: [candidate] } });
+  await expect(new LocalWorkspaceGateway().candidates(null)).resolves.toEqual([candidate]);
+
+  invoke.mockResolvedValueOnce({ kind: 'candidates', data: { candidates: [{ ...candidate, sourceHarness: 'unrecognized_harness' }] } });
+  await expect(new LocalWorkspaceGateway().candidates(null)).rejects.toThrow(/invalid candidate\.sourceHarness/);
+});

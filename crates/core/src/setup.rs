@@ -1987,6 +1987,9 @@ where
         // Claude captures its live CLI declaration. Native configuration
         // writers classify their imported projection and seal complete files.
         let captured_mutations = match harness {
+            HarnessId::OpenCode => {
+                return Err(unsupported("OpenCode supports manual MCP export only"));
+            }
             HarnessId::ClaudeCode => Some(self.harness.bridge_mutations(&desired, &intended)?),
             HarnessId::Codex if self.harness.bridge_adapter_version() < 2 => {
                 Some(self.harness.bridge_mutations(&desired, &intended)?)
@@ -2130,6 +2133,9 @@ where
                 command_template_digest: digest(b"bridge-preview-sidecar-command-v1"),
                 command: SidecarCommand::RuleSyncGenerate {
                     target: match harness {
+                        HarnessId::OpenCode => {
+                            return Err(unsupported("OpenCode has no managed sidecar target"));
+                        }
                         HarnessId::ClaudeCode => RuleSyncTarget::ClaudeCode,
                         HarnessId::Codex => RuleSyncTarget::CodexCli,
                         HarnessId::Hermes => RuleSyncTarget::ClaudeCode,
@@ -2264,6 +2270,9 @@ where
             command_template_digest: digest(b"bridge-preview-sidecar-command-v1"),
             command: SidecarCommand::RuleSyncGenerate {
                 target: match harness {
+                    HarnessId::OpenCode => {
+                        return Err(unsupported("OpenCode has no managed sidecar target"));
+                    }
                     HarnessId::ClaudeCode | HarnessId::Hermes => RuleSyncTarget::ClaudeCode,
                     HarnessId::Codex => RuleSyncTarget::CodexCli,
                 },
@@ -2358,6 +2367,7 @@ fn bridge_change(
     cli_mutation: Option<&ApprovedCliMutation>,
 ) -> Result<Option<ClassifiedChange>, ClientError> {
     let class = match harness {
+        HarnessId::OpenCode => return Err(unsupported("OpenCode has no managed bridge changes")),
         HarnessId::ClaudeCode => bridge_cli_change(cli_mutation, intended)?,
         HarnessId::Codex if cli_mutation.is_some() => bridge_cli_change(cli_mutation, intended)?,
         HarnessId::Codex => match imported.iter().find(|component| {
@@ -2376,6 +2386,7 @@ fn bridge_change(
         HarnessId::Hermes => bridge_hermes_change(profile, imported, intended)?,
     };
     let target = match harness {
+        HarnessId::OpenCode => return Err(unsupported("OpenCode has no managed bridge target")),
         HarnessId::ClaudeCode => format!("claude-mcp:global:{BRIDGE_SERVER_NAME}"),
         HarnessId::Codex => format!("codex-mcp|global|{BRIDGE_SERVER_NAME}"),
         HarnessId::Hermes => format!(
@@ -2595,6 +2606,7 @@ fn harness_cli_name(harness: HarnessId) -> &'static str {
         HarnessId::ClaudeCode => "claude-code",
         HarnessId::Codex => "codex",
         HarnessId::Hermes => "hermes",
+        HarnessId::OpenCode => "opencode",
     }
 }
 

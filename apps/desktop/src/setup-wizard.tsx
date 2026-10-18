@@ -3,7 +3,7 @@ import type { HarnessId, ProbeReport, ProjectIdentity } from './bindings';
 import type { SetupProgress, SetupStep } from './desktop-preferences';
 import { ProjectForm } from './project-form';
 import type { WorkspaceGateway } from './workspace';
-import { HARNESS_NAMES } from './harness-names';
+import { HARNESS_NAMES, MANAGED_HARNESS_IDS } from './harness-names';
 import { projectHarnessSetups } from './harness-history';
 
 // A disabled Continue tells a first-time user nothing about what to do next, and
@@ -79,7 +79,7 @@ export function SetupWizard({ gateway, projects, progress, onChange, onProjectSa
     if (progress.step !== 'harnesses') return;
     let canceled = false;
     setReports({});
-    for (const id of Object.keys(HARNESS_NAMES) as HarnessId[]) {
+    for (const id of MANAGED_HARNESS_IDS) {
       void gateway.harnessProbe({ harness: id, projectId: null, hermesProfile: id === 'hermes' ? 'default' : null })
         .then(report => { if (!canceled) setReports(current => ({ ...current, [id]: report })); })
         .catch(() => { if (!canceled) setReports(current => ({ ...current, [id]: 'failed' })); });
@@ -119,7 +119,7 @@ export function SetupWizard({ gateway, projects, progress, onChange, onProjectSa
       <header><p className="help-text">Step {index + 1} of {STEPS.length}</p><h1 ref={heading} tabIndex={-1}>{STEPS[index].label}</h1></header>
       {progress.step === 'harnesses' && <section aria-label="Harness selection">
         <p>A harness is the tool you work in, such as Codex, Claude Code or Hermes. Choose the ones you want to use with your saved context.</p>
-        <div className="harness-choices">{(Object.keys(HARNESS_NAMES) as HarnessId[]).map(id => {
+        <div className="harness-choices">{MANAGED_HARNESS_IDS.map(id => {
           const report = reports[id];
           const text = !report ? 'Checking installation…' : report === 'failed' ? 'Could not check installation'
             : report.capability === 'missing' ? 'Not installed' : report.capability === 'import_only' ? 'Needs setup review'
@@ -134,6 +134,7 @@ export function SetupWizard({ gateway, projects, progress, onChange, onProjectSa
           </div>;
         })}</div>
         <button type="button" className="secondary-action" onClick={() => setRefresh(value => value + 1)}>Check again</button>
+        <p className="help-text">OpenCode uses manual MCP setup. Choose Finish later, add your project in Projects, then open the OpenCode panel in Harnesses to prepare configuration and test a saved-context read.</p>
       </section>}
       {progress.step === 'project' && <section aria-label="Project selection">
         <p>A project is the folder you work in. Its saved context and tasks stay together, so your harness gets the right information.</p>

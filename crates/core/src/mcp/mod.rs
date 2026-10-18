@@ -1,6 +1,7 @@
 pub mod binding;
 mod handoff;
 pub mod install;
+pub mod opencode;
 mod secret_text;
 mod tools;
 

@@ -1288,6 +1288,7 @@ fn native_hook_operation_id(
             HarnessId::ClaudeCode => b"claude_code",
             HarnessId::Codex => b"codex",
             HarnessId::Hermes => b"hermes",
+            HarnessId::OpenCode => b"opencode",
         },
     );
     hash_identity_field(&mut hasher, session_id.as_bytes());

@@ -253,7 +253,7 @@ fn validate_cli_mutations(plan: &NativeTransactionPlan) -> Result<(), ApprovalEr
             )));
         }
         targets.push(target);
-        if mutation.stable_id != managed_bridge_stable_id(target.0) {
+        if mutation.stable_id != managed_bridge_stable_id(target.0)? {
             return Err(ApprovalError::Invalid(
                 "cli mutation does not use the managed bridge stable id".into(),
             ));
@@ -525,15 +525,21 @@ fn harness_name(harness: HarnessId) -> &'static str {
         HarnessId::ClaudeCode => "claude-code",
         HarnessId::Codex => "codex",
         HarnessId::Hermes => "hermes",
+        HarnessId::OpenCode => "opencode",
     }
 }
 
-fn managed_bridge_stable_id(harness: HarnessId) -> &'static str {
-    match harness {
+fn managed_bridge_stable_id(harness: HarnessId) -> Result<&'static str, ApprovalError> {
+    Ok(match harness {
         HarnessId::ClaudeCode => "f4a4f9a2-0e8d-720e-8df4-a5a68da3e9c7",
         HarnessId::Codex => "b5be495e-d4ee-7a2e-a29e-b589ebc5d7fd",
         HarnessId::Hermes => "92cb3173-a859-79e2-97e1-3ef3633fcb3a",
-    }
+        HarnessId::OpenCode => {
+            return Err(ApprovalError::Invalid(
+                "OpenCode has no managed bridge identity".into(),
+            ));
+        }
+    })
 }
 
 fn cli_approval_value(plan: &NativeTransactionPlan) -> Result<Value, ApprovalError> {

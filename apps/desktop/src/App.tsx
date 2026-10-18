@@ -46,7 +46,7 @@ const SCREENS: ReadonlyArray<{ id: ScreenId; label: string; summary: string }> =
   { id: 'memory', label: 'Context', summary: 'Decisions, preferences and project facts your connected harness can retrieve.' },
   { id: 'review', label: 'Suggestions', summary: 'Choose which notes from your harnesses are worth keeping.' },
   { id: 'tasks', label: 'Tasks', summary: 'Keep track of what to do next and what is finished.' },
-  { id: 'harnesses', label: 'Harnesses', summary: 'Let Codex, Claude Code or Hermes use your saved context.' },
+  { id: 'harnesses', label: 'Harnesses', summary: 'Let Codex, Claude Code, Hermes or OpenCode use your saved context.' },
   { id: 'devices', label: 'Devices', summary: 'Review trusted local devices.' },
   { id: 'settings', label: 'Settings', summary: 'Review local security settings.' },
   { id: 'help', label: 'Help', summary: 'Learn how to save context, continue work and connect your harnesses.' },
@@ -60,6 +60,7 @@ const NAV_GROUPS: ReadonlyArray<{ label: string; screens: ScreenId[] }> = [
 const DEFAULT_GATEWAY = new LocalWorkspaceGateway();
 const STARTUP_TIMEOUT_MS = 45_000;
 type SaveAction = 'memory' | 'task' | 'memory-edit' | 'task-edit' | 'archive' | 'review' | 'task-status' | 'task-complete';
+type ProjectBusySource = 'project' | 'recovery' | 'opencode';
 const SAVE_MESSAGES: Partial<Record<SaveAction, string>> = {
   archive: 'Archiving context…',
   review: 'Saving your review…',
@@ -144,10 +145,17 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
   const [projectBusy, setProjectBusy] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const projectBusyRef = useRef(false);
-  const recoveryBusy = useCallback((value: boolean) => {
-    projectBusyRef.current = value;
-    setProjectBusy(value);
+  const projectBusySources = useRef<Record<ProjectBusySource, boolean>>({ project: false, recovery: false, opencode: false });
+  const reportProjectBusy = useCallback((source: ProjectBusySource, value: boolean) => {
+    projectBusySources.current[source] = value;
+    // One child finishing or unmounting must not release another child's guard.
+    const busy = Object.values(projectBusySources.current).some(Boolean);
+    projectBusyRef.current = busy;
+    setProjectBusy(busy);
   }, []);
+  const recoveryBusy = useCallback((value: boolean) => reportProjectBusy('recovery', value), [reportProjectBusy]);
+  const projectFormBusy = useCallback((value: boolean) => reportProjectBusy('project', value), [reportProjectBusy]);
+  const openCodeBusy = useCallback((value: boolean) => reportProjectBusy('opencode', value), [reportProjectBusy]);
   const readGeneration = useRef(0);
   const [recordsLoading, setRecordsLoading] = useState(false);
   const [submittedSearch, setSubmittedSearch] = useState<{ query: string } | null>(null);
@@ -551,7 +559,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
       case 'projects':
         return (
           <section className="screen-content">
-            <ProjectForm gateway={gateway} ready={connectionState === 'ready'} initialDraft={projectDraft.current} onDraft={value => { projectDraft.current = value; }} onSaved={projectSaved} onBusy={(value) => { projectBusyRef.current = value; setProjectBusy(value); }} />
+            <ProjectForm gateway={gateway} ready={connectionState === 'ready'} initialDraft={projectDraft.current} onDraft={value => { projectDraft.current = value; }} onSaved={projectSaved} onBusy={projectFormBusy} />
             <RecordList title="Projects">
               {projects.map((project) => (
                 <li key={project.projectId}>
@@ -846,7 +854,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
             else if (activeScreen === 'review') refreshSavedRecords('review', activeProject?.projectId ?? null);
           }} /></ErrorBoundary>}
           <div hidden={activeScreen !== 'harnesses'}>
-            <ErrorBoundary label="Harnesses" resetKey={screenResetKey}><HarnessesScreen gateway={gateway} projects={projects} preferredProjectId={activeProject?.projectId} onProjectChange={(id) => {
+            <ErrorBoundary label="Harnesses" resetKey={screenResetKey}><HarnessesScreen gateway={gateway} openCodeGateway={gateway} onOpenCodeBusy={openCodeBusy} projects={projects} preferredProjectId={activeProject?.projectId} onProjectChange={(id) => {
               const project = projects.find((item) => item.projectId === id);
               if (project) selectProject(project);
             }} onAddProject={() => void selectScreen('projects')} onSaveContext={() => { setCreatingContext(true); setEditingMemory(null); void selectScreen('memory'); }} active={activeScreen === 'harnesses'} /></ErrorBoundary>

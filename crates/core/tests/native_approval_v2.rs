@@ -34,6 +34,9 @@ fn declaration(harness: HarnessId, server_name: &str, command: &str) -> Canonica
         HarnessId::ClaudeCode => "claude-code",
         HarnessId::Codex => "codex",
         HarnessId::Hermes => "hermes",
+        HarnessId::OpenCode => {
+            unreachable!("managed approval fixtures do not include OpenCode")
+        }
     };
     let canonical_body = serde_json::to_string(&serde_json::json!({
         "args": ["--harness", harness_name],

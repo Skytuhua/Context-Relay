@@ -56,7 +56,8 @@
                     "enum": [
                       "claude_code",
                       "codex",
-                      "hermes"
+                      "hermes",
+                      "opencode"
                     ]
                   }
                 ]
@@ -265,7 +266,8 @@
                     "enum": [
                       "claude_code",
                       "codex",
-                      "hermes"
+                      "hermes",
+                      "opencode"
                     ]
                   }
                 ]

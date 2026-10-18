@@ -665,10 +665,11 @@
         "enum": [
           "claude_code",
           "codex",
-          "hermes"
+          "hermes",
+          "opencode"
         ]
       },
-      "maxItems": 3,
+      "maxItems": 4,
       "minItems": 1,
       "type": "array",
       "uniqueItems": true

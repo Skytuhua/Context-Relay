@@ -127,6 +127,11 @@ async fn request_shutdown(
                     major: 1,
                     minor: 16,
                 })
+            && server_hello.protocol
+                != (ProtocolVersion {
+                    major: 1,
+                    minor: 17,
+                })
         {
             return Err(IpcError::ProtocolVersionUnsupported);
         }

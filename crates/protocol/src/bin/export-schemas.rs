@@ -67,7 +67,7 @@ fn hlc() -> Value {
     json!({"type":"object","properties":{"physicalMs":decimal_u64(),"logical":{"type":"integer","minimum":0,"maximum":4294967295u64},"node":uuid()},"required":["physicalMs","logical","node"],"additionalProperties":false})
 }
 fn provenance() -> Value {
-    json!({"type":"object","properties":{"originDevice":uuid(),"harness":{"oneOf":[{"type":"null"},{"enum":["claude_code","codex","hermes"]}]},"source":{"oneOf":[{"type":"null"},{"type":"object","properties":{"source":{"const":"record"},"recordId":uuid()},"required":["source","recordId"],"additionalProperties":false},{"type":"object","properties":{"source":{"const":"package"},"packageId":uuid()},"required":["source","packageId"],"additionalProperties":false}]},"createdHlc":hlc()},"required":["originDevice","harness","source","createdHlc"],"additionalProperties":false})
+    json!({"type":"object","properties":{"originDevice":uuid(),"harness":{"oneOf":[{"type":"null"},{"enum":["claude_code","codex","hermes","opencode"]}]},"source":{"oneOf":[{"type":"null"},{"type":"object","properties":{"source":{"const":"record"},"recordId":uuid()},"required":["source","recordId"],"additionalProperties":false},{"type":"object","properties":{"source":{"const":"package"},"packageId":uuid()},"required":["source","packageId"],"additionalProperties":false}]},"createdHlc":hlc()},"required":["originDevice","harness","source","createdHlc"],"additionalProperties":false})
 }
 fn scope() -> Value {
     json!({"oneOf":[{"type":"object","properties":{"scope":{"const":"global"}},"required":["scope"],"additionalProperties":false},{"type":"object","properties":{"scope":{"const":"project"},"projectId":uuid()},"required":["scope","projectId"],"additionalProperties":false}]})
@@ -180,7 +180,7 @@ fn package_schema() -> Value {
     ]}});
     let secret = json!({"type":"object","properties":{"id":uuid(),"name":required_text(MAX_TITLE_BYTES),"provider":required_text(MAX_TITLE_BYTES),"requiredOnDevice":{"type":"boolean"}},"required":["id","name","provider","requiredOnDevice"],"additionalProperties":false});
     root(
-        json!({"format":{"const":"context-relay.package.v1"},"packageId":uuid(),"components":components,"secretRefs":{"type":"array","maxItems":MAX_BATCH_OPERATIONS,"items":secret},"harnessTargets":{"type":"array","minItems":1,"maxItems":3,"uniqueItems":true,"items":{"enum":["claude_code","codex","hermes"]}},"extensions":{"type":"object","maxProperties":MAX_BATCH_OPERATIONS,"propertyNames":extension_namespace(),"additionalProperties":namespaced_extension()}}),
+        json!({"format":{"const":"context-relay.package.v1"},"packageId":uuid(),"components":components,"secretRefs":{"type":"array","maxItems":MAX_BATCH_OPERATIONS,"items":secret},"harnessTargets":{"type":"array","minItems":1,"maxItems":4,"uniqueItems":true,"items":{"enum":["claude_code","codex","hermes","opencode"]}},"extensions":{"type":"object","maxProperties":MAX_BATCH_OPERATIONS,"propertyNames":extension_namespace(),"additionalProperties":namespaced_extension()}}),
         vec![
             "format",
             "packageId",

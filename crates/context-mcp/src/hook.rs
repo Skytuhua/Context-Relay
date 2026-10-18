@@ -67,6 +67,7 @@ fn parse_harness_name(value: OsString) -> Option<HarnessId> {
         "claude-code" => Some(HarnessId::ClaudeCode),
         "codex" => Some(HarnessId::Codex),
         "hermes" => Some(HarnessId::Hermes),
+        "opencode" => Some(HarnessId::OpenCode),
         _ => None,
     }
 }

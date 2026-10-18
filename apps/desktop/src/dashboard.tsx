@@ -3,6 +3,7 @@ import type { HarnessSetupState, MemoryRecord, TaskRecord, ProjectIdentity } fro
 import type { WorkspaceGateway } from './workspace';
 import type { VerifiedRead } from './desktop-preferences';
 import { projectHarnessSetups } from './harness-history';
+import { HARNESS_NAMES as harnessNames } from './harness-names';
 
 type DashboardProps = {
   gateway: WorkspaceGateway;
@@ -51,7 +52,6 @@ function Section<T>({ title, description, action, load, children }: {
   </section>;
 }
 
-const harnessNames = { codex: 'Codex', claude_code: 'Claude Code', hermes: 'Hermes' };
 const setupStates: Record<HarnessSetupState, { label: string; next: string }> = {
   previewed: { label: 'Review needed', next: 'Review the proposed changes in Harnesses before saving.' },
   applying: { label: 'Saving settings', next: 'Open Harnesses to check progress or recovery options.' },

@@ -261,6 +261,11 @@ fn derive_source_id(
     limits: NativeMemoryLimits,
     managed_fence: bool,
 ) -> Result<NativeMemorySourceId, NativeMemoryError> {
+    if harness == HarnessId::OpenCode {
+        return Err(NativeMemoryError::InvalidSource(
+            "OpenCode has no qualified native memory source",
+        ));
+    }
     validate_source_fields(adapter_version, path, limits)?;
 
     let mut hasher = Sha256::new();
@@ -287,6 +292,11 @@ fn derive_legacy_source_id(
     path: &WireNativeValue,
     limits: NativeMemoryLimits,
 ) -> Result<NativeMemorySourceId, NativeMemoryError> {
+    if harness == HarnessId::OpenCode {
+        return Err(NativeMemoryError::InvalidSource(
+            "OpenCode has no qualified native memory source",
+        ));
+    }
     validate_source_fields(adapter_version, path, limits)?;
 
     let mut hasher = Sha256::new();
@@ -368,6 +378,7 @@ const fn harness_name(harness: HarnessId) -> &'static str {
         HarnessId::ClaudeCode => "claude_code",
         HarnessId::Codex => "codex",
         HarnessId::Hermes => "hermes",
+        HarnessId::OpenCode => "opencode",
     }
 }
 
