@@ -1,14 +1,13 @@
 import { Component, type ErrorInfo, type ReactNode } from 'react';
 
-type Props = { children: ReactNode; label: string };
+type Props = { children: ReactNode; label: string; resetKey?: string };
 type State = { failure: Error | null };
 
 /**
  * Contain a render failure to one part of the window.
  *
- * The workspace holds unsaved form text in refs, which hold no recoverable
- * copy, so a single throw during render unmounts everything and the user loses
- * every half-written note with no explanation. A per-screen boundary keeps the
+ * The workspace holds unsaved form text in refs, so unmounting the whole app
+ * loses every half-written note. A per-screen boundary keeps the
  * sidebar, toolbar and project switcher alive so they can navigate away, and
  * reports the failure instead of showing a blank window.
  */
@@ -17,6 +16,12 @@ export class ErrorBoundary extends Component<Props, State> {
 
   static getDerivedStateFromError(failure: Error): State {
     return { failure };
+  }
+
+  componentDidUpdate(previous: Props) {
+    if (this.state.failure && previous.resetKey !== this.props.resetKey) {
+      this.setState({ failure: null });
+    }
   }
 
   componentDidCatch(failure: Error, info: ErrorInfo) {

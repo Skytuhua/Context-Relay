@@ -1,5 +1,5 @@
 import { AccountLifecyclePanel } from './account-lifecycle';
-import { type FormEvent, useCallback, useEffect, useRef, useState } from 'react';
+import { type FormEvent, type ReactNode, useCallback, useEffect, useRef, useState } from 'react';
 
 import type {
   MemoryCandidate,
@@ -220,6 +220,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
   }, [activeScreen, submittedSearch, searchRevision, searchProjectId, gateway, connectionState]);
 
   if (!currentScreen) return null;
+  const screenResetKey = `${activeScreen}:${activeProject?.projectId ?? 'global'}`;
 
   function transitionProject(project: ProjectIdentity | null) {
     if (project?.projectId !== activeProject?.projectId) {
@@ -757,13 +758,13 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
           </div>}
           {saving && SAVE_MESSAGES[saving] && <p role="status">{SAVE_MESSAGES[saving]}</p>}
           {recordsLoading && <p role="status">Loading your saved records…</p>}
-          <ErrorBoundary label={currentScreen.label}>{renderScreen(activeScreen)}</ErrorBoundary>
-          {recoveryStorageFull && activeScreen !== 'home' && <ErrorBoundary label="Write recovery"><WriteRecovery gateway={gateway} projects={projects} onBusy={recoveryBusy} onConfirmed={() => {
+          <ErrorBoundary label={currentScreen.label} resetKey={screenResetKey}><ScreenContent render={() => renderScreen(activeScreen)} /></ErrorBoundary>
+          {recoveryStorageFull && activeScreen !== 'home' && <ErrorBoundary label="Write recovery" resetKey={screenResetKey}><WriteRecovery gateway={gateway} projects={projects} onBusy={recoveryBusy} onConfirmed={() => {
             if (activeScreen === 'memory' || activeScreen === 'tasks') refreshSavedRecords(activeScreen === 'memory' ? 'memory' : 'task', activeProject?.projectId ?? null);
             else if (activeScreen === 'review') refreshSavedRecords('review', activeProject?.projectId ?? null);
           }} /></ErrorBoundary>}
           <div hidden={activeScreen !== 'harnesses'}>
-            <ErrorBoundary label="Harnesses"><HarnessesScreen gateway={gateway} projects={projects} preferredProjectId={activeProject?.projectId} onProjectChange={(id) => {
+            <ErrorBoundary label="Harnesses" resetKey={screenResetKey}><HarnessesScreen gateway={gateway} projects={projects} preferredProjectId={activeProject?.projectId} onProjectChange={(id) => {
               const project = projects.find((item) => item.projectId === id);
               if (project) selectProject(project);
             }} onAddProject={() => void selectScreen('projects')} onSaveContext={() => { setCreatingContext(true); setEditingMemory(null); void selectScreen('memory'); }} active={activeScreen === 'harnesses'} /></ErrorBoundary>
@@ -773,6 +774,11 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
       </div>
     </>
   );
+}
+
+// Evaluate screen rendering inside the boundary, including inline record lists.
+function ScreenContent({ render }: { render: () => ReactNode }) {
+  return render();
 }
 
 function Field({
