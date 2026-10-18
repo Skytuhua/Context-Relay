@@ -106,7 +106,7 @@ export function SetupWizard({ gateway, projects, progress, onChange, onProjectSa
       {progress.step === 'project' && <section aria-label="Project selection">
         <p>A project is the folder you work in. Its saved context and tasks stay together, so your harness gets the right information.</p>
         {projects.length > 0 && <fieldset><legend>Use an existing project</legend>{projects.map(item => <label className="status-row" key={item.projectId}>
-          <input type="radio" name="setup-project" checked={progress.projectId === item.projectId} onChange={() => update({ projectId: item.projectId, noteId: null, checkId: null })} />{item.name}
+          <input type="radio" name="setup-project" disabled={projectBusy || operationBusy} checked={progress.projectId === item.projectId} onChange={() => update({ projectId: item.projectId, noteId: null, checkId: null })} />{item.name}
         </label>)}</fieldset>}
         <ProjectForm gateway={gateway} ready onBusy={setProjectBusy} onSaved={item => { onProjectSaved(item); update({ projectId: item.projectId, noteId: null, checkId: null }); }} />
       </section>}
