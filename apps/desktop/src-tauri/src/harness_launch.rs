@@ -184,6 +184,7 @@ fn guide(harness: HarnessId) -> &'static str {
         HarnessId::Codex => "https://developers.openai.com/codex/cli/",
         HarnessId::ClaudeCode => "https://code.claude.com/docs/en/quickstart",
         HarnessId::Hermes => "https://hermes-agent.nousresearch.com/docs/",
+        HarnessId::OpenCode => "https://opencode.ai/docs/",
     }
 }
 

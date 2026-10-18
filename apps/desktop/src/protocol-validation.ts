@@ -1,7 +1,7 @@
 import Ajv2020 from 'ajv/dist/2020.js';
 import type { AccountDeletionIntentSummary, DeviceRevocationStatus, DeviceRevocationSummary, LocalResult, OperationId, HostedAuthStatus, RecoveryRestoreStatus, RecoveryHistoryCandidatesPage } from './bindings';
 
-import type { ConnectionCheckStatus, HarnessPreparationStatus, HarnessExecutionStatus, HarnessSetupRecord, HarnessSetupsPage, MemoryRecord, ProbeReport, SearchIndexStatus, SetupPlan, SyncOperationV1, TaskRecord } from './bindings';
+import type { ConnectionCheckStatus, HarnessPreparationStatus, HarnessExecutionStatus, HarnessSetupRecord, HarnessSetupsPage, MemoryRecord, OpenCodeMcpExport, ProbeReport, SearchIndexStatus, SetupPlan, SyncOperationV1, TaskRecord, WireNativeValue } from './bindings';
 
 const utf8 = new TextEncoder();
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -188,7 +188,7 @@ const scope = (value: unknown, field: string) => {
 const provenance = (value: unknown, field: string) => {
   const item = object(value, ['originDevice', 'harness', 'source', 'createdHlc'], field);
   id(item.originDevice, `${field}.originDevice`);
-  if (item.harness !== null) choice(item.harness, ['claude_code', 'codex', 'hermes'], `${field}.harness`);
+  if (item.harness !== null) choice(item.harness, ['claude_code', 'codex', 'hermes', 'opencode'], `${field}.harness`);
   if (item.source !== null) {
     const tagged = item.source as Record<string, unknown>;
     const key = tagged.source === 'record' ? 'recordId' : 'packageId';
@@ -402,7 +402,7 @@ export function validateConnectionCheckStatus(value: unknown): ConnectionCheckSt
   id(item.memoryId, 'connectionCheck.memoryId');
   id(item.expectedRevision, 'connectionCheck.expectedRevision');
   const selection = object(item.selection, ['harness', 'projectId', 'hermesProfile'], 'connectionCheck.selection');
-  choice(selection.harness, ['codex', 'claude_code', 'hermes'], 'connectionCheck.harness');
+  choice(selection.harness, ['codex', 'claude_code', 'hermes', 'opencode'], 'connectionCheck.harness');
   id(selection.projectId, 'connectionCheck.projectId');
   if (selection.harness === 'hermes') text(selection.hermesProfile, 512, 'connectionCheck.hermesProfile');
   else if (selection.hermesProfile !== null) fail('connectionCheck.hermesProfile');
@@ -411,6 +411,44 @@ export function validateConnectionCheckStatus(value: unknown): ConnectionCheckSt
   if ((item.phase === 'verified') !== (item.verifiedAt !== null)) fail('connectionCheck.verifiedAt');
   if (item.verifiedAt !== null) u64(item.verifiedAt, 'connectionCheck.verifiedAt');
   return value as ConnectionCheckStatus;
+}
+
+export function validateOpenCodeMcpExport(value: unknown): OpenCodeMcpExport {
+  const item = object(value, ['projectId', 'projectRoot', 'configPath', 'instructionPath', 'configFragment', 'instructionMarkdown'], 'OpenCode export');
+  id(item.projectId, 'OpenCode project');
+  for (const field of ['projectRoot', 'configPath', 'instructionPath']) native(item[field], `OpenCode ${field}`);
+  const exported = value as OpenCodeMcpExport;
+  const platform = exported.projectRoot.platform;
+  if (exported.configPath.platform !== platform || exported.instructionPath.platform !== platform) fail('OpenCode platform');
+  const path = (native: WireNativeValue): string => {
+    const raw = atob(native.bytes.replace(/-/g, '+').replace(/_/g, '/'));
+    const decoded = new TextDecoder(platform === 'windows' ? 'utf-16le' : 'utf-8', { fatal: true })
+      .decode(Uint8Array.from(raw, character => character.charCodeAt(0)));
+    if (!decoded || unsafeNativeDisplay(decoded)) fail('OpenCode native path');
+    return decoded;
+  };
+  const root = path(exported.projectRoot);
+  const absolute = (value: string) => platform === 'windows' ? /^(?:[A-Za-z]:\\|\\\\)/.test(value) : value.startsWith('/');
+  if (!absolute(root) || /\{(?:env|file):/.test(root)) fail('OpenCode project root');
+  const prefix = root.replace(platform === 'windows' ? /\\$/ : /\/$/, '') + (platform === 'windows' ? '\\' : '/');
+  if (![`${prefix}opencode.json`, `${prefix}opencode.jsonc`].includes(path(exported.configPath)) ||
+    path(exported.instructionPath) !== `${prefix}.context-relay-opencode.md`) fail('OpenCode project files');
+  const config = object(JSON.parse(text(item.configFragment, 65_536, 'OpenCode configuration')), ['mcp', 'instructions'], 'OpenCode configuration');
+  const mcp = object(config.mcp, ['context-relay'], 'OpenCode mcp');
+  const server = object(mcp['context-relay'], ['type', 'command', 'enabled', 'cwd', 'timeout'], 'OpenCode server');
+  choice(server.type, ['local'], 'OpenCode server type');
+  choice(server.enabled, [true], 'OpenCode server enabled');
+  choice(server.timeout, [60_000], 'OpenCode timeout');
+  if (server.cwd !== root) fail('OpenCode cwd');
+  const command = list(server.command, 3, 'OpenCode command');
+  const executable = text(command[0], 32_768, 'OpenCode executable');
+  if (command.length !== 3 || command[1] !== '--harness' || command[2] !== 'opencode' ||
+    !absolute(executable) || unsafeNativeDisplay(executable) || /\{(?:env|file):/.test(executable) ||
+    (platform === 'windows' && !executable.toLowerCase().endsWith('.exe'))) fail('OpenCode command');
+  const instructions = list(config.instructions, 1, 'OpenCode instructions');
+  if (instructions.length !== 1 || instructions[0] !== '.context-relay-opencode.md') fail('OpenCode instructions');
+  text(item.instructionMarkdown, 8_192, 'OpenCode instruction text');
+  return exported;
 }
 
 export function validateAccountDeletion(value: unknown): Extract<LocalResult, { kind: 'account_deletion' }>['data'] {

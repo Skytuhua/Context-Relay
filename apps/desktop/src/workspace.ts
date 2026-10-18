@@ -20,6 +20,7 @@ import type {
   MemoryId,
   MemoryRecord,
   OperationId,
+  OpenCodeMcpExport,
   PairingCode,
   PairingId,
   PairingSafetyNumber,
@@ -47,6 +48,7 @@ import { validateAccountDeletion, validateAccountDeletionIntents, validateDevice
 import { uuidV7 } from './uuid';
 import { type HarnessGateway, requireHarnessAcknowledgment, validateHarnessPlan, validateHarnessProbe } from './harness-gateway';
 import { validateConnectionCheckStatus, validateHarnessPreparation, validateHarnessExecution, validateHarnessSetupRecord, validateHarnessSetupsPage, validateSearchIndexStatus } from './protocol-validation';
+import { validateOpenCodeMcpExport } from './protocol-validation';
 
 export type PairingInviteResult = Extract<LocalResult, { kind: 'pairing_invite' }>;
 export type PairingRequestResult = Extract<LocalResult, { kind: 'pairing_request' }>;
@@ -113,6 +115,7 @@ export interface DeviceGateway {
 }
 
 export interface WorkspaceGateway extends DeviceGateway, HarnessGateway {
+  opencodeMcpExport(projectId: ProjectId): Promise<OpenCodeMcpExport>;
   accountDeletionStatus(): Promise<Extract<LocalResult, { kind: 'account_deletion' }>['data']>;
   accountDeletionIntents(after: OperationId | null): Promise<AccountDeletionIntentSummary[]>;
   accountDeletionBegin(operationId: OperationId, confirmation: string): Promise<Extract<LocalResult, { kind: 'account_deletion' }>['data']>;
@@ -294,6 +297,13 @@ export class LocalWorkspaceGateway implements WorkspaceGateway {
       throw new Error('Harness discovery was not returned.');
     }
     return validateHarnessProbe(result.data.report, params);
+  }
+
+  async opencodeMcpExport(projectId: ProjectId): Promise<OpenCodeMcpExport> {
+    const result = await this.call({ method: 'opencode_mcp_export', params: { projectId } });
+    const exported = validateOpenCodeMcpExport(controlResult(result, 'opencode_mcp_export', 'export'));
+    if (exported.projectId !== projectId) throw new Error('OpenCode export does not match the selected project.');
+    return exported;
   }
 
   async harnessExecutionStart(params: HarnessExecutionParams) {

@@ -3,7 +3,7 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { SetupWizard } from './setup-wizard';
 import { defaultPreferences } from './desktop-preferences';
 import type { WorkspaceGateway } from './workspace';
-import type { ProjectIdentity } from './bindings';
+import type { HarnessParams, ProjectIdentity } from './bindings';
 
 afterEach(cleanup);
 const project = { projectId: '018f22e2-79b0-7cc8-98c4-dc0c0c073980', name: 'Installer verification 專案 🚀' } as ProjectIdentity;
@@ -19,6 +19,18 @@ it('explains harnesses, permits multiple selections and offers finishing later',
   fireEvent.click(screen.getByRole('button', { name: 'Finish later' }));
   expect(props.onFinishLater).toHaveBeenCalled();
   await screen.findAllByText('Not installed');
+});
+
+it('keeps OpenCode out of managed setup choices and explains the manual path', async () => {
+  const probe = vi.fn(async (selection: HarnessParams) => {
+    void selection;
+    return { capability: 'missing', harnessVersion: null };
+  });
+  render(<SetupWizard {...props} gateway={{ ...gateway, harnessProbe: probe } as unknown as WorkspaceGateway} />);
+  await screen.findAllByText('Not installed');
+  expect(screen.queryByRole('checkbox', { name: /OpenCode/ })).not.toBeInTheDocument();
+  expect(screen.getByText(/OpenCode uses manual MCP setup/)).toBeVisible();
+  expect(probe.mock.calls.map(call => (call[0] as { harness: string }).harness).sort()).toEqual(['claude_code', 'codex', 'hermes']);
 });
 
 it('requires choosing an existing project rather than silently choosing the first record', () => {

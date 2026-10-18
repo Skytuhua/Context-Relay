@@ -180,6 +180,65 @@ fn no_matching_project_resolves_global_only_under_the_default_policy() {
 }
 
 #[test]
+fn opencode_policy_is_independent_and_keeps_project_and_write_restrictions() {
+    let mut fixture = Fixture::new("opencode-policy");
+    let root = fixture.root("project");
+    fs::create_dir(&root).unwrap();
+    fixture.register(&project_a(), &root);
+    fixture
+        .vault
+        .set_access_policy(HarnessId::Codex, &HarnessAccessPolicy::Disabled)
+        .unwrap();
+    fixture
+        .vault
+        .set_access_policy(
+            HarnessId::OpenCode,
+            &HarnessAccessPolicy::ActiveProjectOnly { read_only: true },
+        )
+        .unwrap();
+    let binding = McpBinding {
+        harness: HarnessId::OpenCode,
+        working_directory: wire_path(&root),
+    };
+    let resolved = resolve_binding(&fixture.vault, &binding).unwrap();
+    assert_eq!(resolved.harness, HarnessId::OpenCode);
+    assert_eq!(
+        resolved
+            .access
+            .read_scope(McpScopeSelector::ActiveProject)
+            .unwrap(),
+        project_scope(project_a().project_id)
+    );
+    assert_denied(
+        resolved
+            .access
+            .read_scope(McpScopeSelector::Global)
+            .unwrap_err(),
+    );
+    assert_denied(
+        resolved
+            .access
+            .write_scope(McpScopeSelector::ActiveProject)
+            .unwrap_err(),
+    );
+    assert_eq!(
+        fixture.vault.access_policy(HarnessId::Codex).unwrap(),
+        HarnessAccessPolicy::Disabled
+    );
+    fixture
+        .vault
+        .set_access_policy(HarnessId::OpenCode, &HarnessAccessPolicy::Disabled)
+        .unwrap();
+    assert_denied(
+        resolve_binding(&fixture.vault, &binding)
+            .unwrap()
+            .access
+            .read_scope(McpScopeSelector::ActiveProject)
+            .unwrap_err(),
+    );
+}
+
+#[test]
 fn unusable_registered_roots_are_ignored_without_rewriting_them() {
     let mut fixture = Fixture::new("mcp-missing-root");
     let missing = fixture.root("missing");

@@ -23,7 +23,7 @@ pub fn managed_memory_hooks(
     bridge_executable
         .validate()
         .map_err(|_| invalid("Product memory hook executable is invalid"))?;
-    if harness == HarnessId::Hermes {
+    if matches!(harness, HarnessId::Hermes | HarnessId::OpenCode) {
         return Ok(Vec::new());
     }
     let executable = literal_executable(harness, bridge_executable)?;
@@ -44,7 +44,9 @@ pub fn managed_memory_hooks(
     let (name, location) = match harness {
         HarnessId::ClaudeCode => ("hooks", "settings.json#hooks"),
         HarnessId::Codex => ("hooks.json", "hooks.json#hooks"),
-        HarnessId::Hermes => unreachable!("Hermes has no frozen lifecycle hooks"),
+        HarnessId::Hermes | HarnessId::OpenCode => {
+            unreachable!("This harness has no frozen lifecycle hooks")
+        }
     };
     let device = DeviceId::from_str(DRAFT_DEVICE_ID)
         .map_err(|_| invalid("Product memory hook provenance cannot be derived"))?;
@@ -107,12 +109,12 @@ pub(crate) fn has_managed_memory_hook_identity(
                             "hooks.json#hooks".to_owned(),
                         )]
             }
-            HarnessId::Hermes => false,
+            HarnessId::Hermes | HarnessId::OpenCode => false,
         }
 }
 
 fn valid_managed_hook_body(harness: HarnessId, body: &str) -> bool {
-    if harness == HarnessId::Hermes {
+    if matches!(harness, HarnessId::Hermes | HarnessId::OpenCode) {
         return false;
     }
     let events = managed_events(harness);
@@ -237,7 +239,7 @@ fn canonical_literal_executable(harness: HarnessId, literal: &str, allow_legacy:
     let path = match harness {
         HarnessId::ClaudeCode => bash_literal_path(literal),
         HarnessId::Codex => powershell_literal_path(literal),
-        HarnessId::Hermes => None,
+        HarnessId::Hermes | HarnessId::OpenCode => None,
     };
     if let Some(path) = path {
         let bytes = path
@@ -249,7 +251,7 @@ fn canonical_literal_executable(harness: HarnessId, literal: &str, allow_legacy:
             match harness {
                 HarnessId::ClaudeCode => bash_quote(&path.replace('\\', "/")) == literal,
                 HarnessId::Codex => powershell_quote(&path) == literal,
-                HarnessId::Hermes => false,
+                HarnessId::Hermes | HarnessId::OpenCode => false,
             }
         });
     }
@@ -330,7 +332,7 @@ fn managed_events(harness: HarnessId) -> &'static [(&'static str, &'static str)]
     match harness {
         HarnessId::ClaudeCode => CLAUDE_EVENTS.as_slice(),
         HarnessId::Codex => CODEX_EVENTS.as_slice(),
-        HarnessId::Hermes => &[],
+        HarnessId::Hermes | HarnessId::OpenCode => &[],
     }
 }
 
@@ -375,7 +377,9 @@ fn literal_executable(harness: HarnessId, value: &WireNativeValue) -> Result<Str
     match harness {
         HarnessId::ClaudeCode => Ok(bash_quote(&path.replace('\\', "/"))),
         HarnessId::Codex => Ok(powershell_quote(&path)),
-        HarnessId::Hermes => Err(invalid("Hermes has no lifecycle hook command")),
+        HarnessId::Hermes | HarnessId::OpenCode => {
+            Err(invalid("This harness has no lifecycle hook command"))
+        }
     }
 }
 

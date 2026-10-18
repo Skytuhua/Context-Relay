@@ -5,13 +5,15 @@ import { useHarnessExecution } from './use-harness-execution';
 import { useHarnessPreparation } from './use-harness-preparation';
 import { isServiceVersionMismatch, SERVICE_UPDATE_GUIDANCE } from './service-error';
 import { copyHarnessCommand, harnessLaunchPresentation, openHarness } from './harness-launch';
+import { HARNESS_NAMES as harnessNames, MANAGED_HARNESS_IDS, isManagedHarness } from './harness-names';
+import { OpenCodeMcpSetup, type OpenCodeMcpGateway } from './opencode-mcp-setup';
 
-const harnessNames: Record<HarnessId, string> = { claude_code: 'Claude Code', codex: 'Codex', hermes: 'Hermes' };
 type ReviewedPlan = { plan: SetupPlan; params: HarnessParams; projectName: string; state?: HarnessSetupState };
 type BusyAction = 'preview' | 'loading' | 'checking' | 'preparing' | 'apply' | 'rollback' | null;
 
-export function HarnessesScreen({ gateway, projects, preferredProjectId, preferredHarness, preferredHermesProfile = 'default', onProfileChange, embedded = false, onBusy, onProjectChange, onAddProject, onSaveContext, active = true }: { gateway: HarnessGateway; projects: ProjectIdentity[]; preferredProjectId?: string; preferredHarness?: HarnessId; preferredHermesProfile?: string; onProfileChange?: (profile: string) => void; embedded?: boolean; onBusy?: (busy: boolean) => void; onProjectChange?: (id: string) => void; onAddProject?: () => void; onSaveContext?: () => void; active?: boolean }) {
+export function HarnessesScreen({ gateway, openCodeGateway, projects, preferredProjectId, preferredHarness, preferredHermesProfile = 'default', onProfileChange, embedded = false, onBusy, onOpenCodeBusy, onProjectChange, onAddProject, onSaveContext, active = true }: { gateway: HarnessGateway; openCodeGateway?: OpenCodeMcpGateway; projects: ProjectIdentity[]; preferredProjectId?: string; preferredHarness?: HarnessId; preferredHermesProfile?: string; onProfileChange?: (profile: string) => void; embedded?: boolean; onBusy?: (busy: boolean) => void; onOpenCodeBusy?: (busy: boolean) => void; onProjectChange?: (id: string) => void; onAddProject?: () => void; onSaveContext?: () => void; active?: boolean }) {
   const [selectedProjectId, setProjectId] = useState<string | null>(null);
+  const [openCodeBusy, setOpenCodeBusy] = useState(false);
   const projectId = preferredProjectId ?? selectedProjectId ?? projects[0]?.projectId ?? '';
   const [harness, setHarness] = useState<HarnessId>('codex');
   const [profile, setProfile] = useState(preferredHermesProfile);
@@ -52,7 +54,7 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, preferr
 
   // Read-only discovery can block settings changes without trapping navigation.
   // Once a mutation is submitted or discovered, keep its navigation guard.
-  const navigationBusy = localBusy !== null || execution.starting || execution.pending !== null || preparation.busy;
+  const navigationBusy = localBusy !== null || execution.starting || execution.pending !== null || preparation.busy || openCodeBusy;
   const resultSelection = execution.outcome ? reviewed(execution.outcome.setup, projects).params : null;
   const currentResult = resultSelection !== null && resultSelection.harness === harness &&
     resultSelection.projectId === projectId && resultSelection.hermesProfile === (harness === 'hermes' ? canonicalProfile : null);
@@ -63,9 +65,14 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, preferr
   const showLaunchHelp = !embedded || (!busy && !review && !preparation.target && needsProjectTrust);
 
   useEffect(() => { onBusy?.(navigationBusy); }, [navigationBusy, onBusy]);
+  useEffect(() => () => onBusy?.(false), [onBusy]);
+  // Normal workspace navigation remains available during managed observation.
+  // OpenCode owns local note/check state, so only its pending work adds a guard.
+  useEffect(() => { onOpenCodeBusy?.(openCodeBusy); }, [openCodeBusy, onOpenCodeBusy]);
+  useEffect(() => () => onOpenCodeBusy?.(false), [onOpenCodeBusy]);
 
   useEffect(() => {
-    if (!preferredHarness || preferredHarness === harness) return;
+    if (!preferredHarness || !isManagedHarness(preferredHarness) || preferredHarness === harness) return;
     generation.current += 1;
     setHarness(preferredHarness);
     setLaunchNotice(null);
@@ -304,7 +311,7 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, preferr
         <p>{embedded ? `Review the changes for ${project?.name ?? 'your project'}, then save the settings you approve.` : 'Choose your project and harness to check compatibility and review the settings.'}</p>
         {!embedded && <div className="field">
           <label htmlFor="harness-project">Project</label>
-          <select id="harness-project" value={projectId} disabled={busy === 'apply' || busy === 'rollback' || preparation.busy} onChange={(event) => { clearReview(); if (onProjectChange) onProjectChange(event.target.value); else setProjectId(event.target.value); }}>
+          <select id="harness-project" value={projectId} disabled={busy === 'apply' || busy === 'rollback' || preparation.busy || openCodeBusy} onChange={(event) => { clearReview(); if (onProjectChange) onProjectChange(event.target.value); else setProjectId(event.target.value); }}>
             <option value="">Choose your project</option>
             {projects.map((item) => <option key={item.projectId} value={item.projectId}>{item.name}</option>)}
           </select>
@@ -312,7 +319,7 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, preferr
         {!embedded && <div className="field">
           <label htmlFor="harness-kind">Harness</label>
           <select id="harness-kind" value={harness} disabled={busy === 'apply' || busy === 'rollback' || preparation.busy} onChange={(event) => { clearReview(); setHarness(event.target.value as HarnessId); }}>
-            {Object.entries(harnessNames).map(([id, name]) => <option key={id} value={id}>{name}</option>)}
+            {MANAGED_HARNESS_IDS.map(id => <option key={id} value={id}>{harnessNames[id]}</option>)}
           </select>
         </div>}
         {harness === 'hermes' && <div className="field">
@@ -320,8 +327,9 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, preferr
           <input id="hermes-profile" value={profile} maxLength={64} required aria-invalid={!validProfile} aria-describedby="hermes-profile-help" disabled={busy === 'apply' || busy === 'rollback' || preparation.busy} onChange={(event) => { clearReview(); setProfile(event.target.value); const next = event.target.value.trim().toLowerCase(); if (/^[a-z0-9][a-z0-9_-]{0,63}$/.test(next)) onProfileChange?.(next); }} />
           <p id="hermes-profile-help">Use a profile name, such as default or coder. Leave default selected unless you created another profile. Folder paths are not profile names.</p>
         </div>}
-        <button className={embedded && (review || guidedSaved) ? 'secondary-action' : 'primary-action'} type="submit" disabled={!!busy || preparation.target !== null || !project || (harness === 'hermes' && !validProfile)}>{busy === 'preview' ? 'Checking harness…' : 'Review setup'}</button>
+        <button className={embedded && (review || guidedSaved) ? 'secondary-action' : 'primary-action'} type="submit" disabled={!!busy || openCodeBusy || preparation.target !== null || !project || (harness === 'hermes' && !validProfile)}>{busy === 'preview' ? 'Checking harness…' : 'Review setup'}</button>
       </form>
+      {!embedded && project && openCodeGateway && <OpenCodeMcpSetup key={project.projectId} gateway={openCodeGateway} project={project} disabled={!!busy} onBusy={setOpenCodeBusy} />}
       {project && showLaunchHelp && <section className="help-content" aria-label="Open harness for project">
         <p>{canOpenWindow ? 'Open ' : 'Copy the launch command to open '}{harnessNames[harness]} in <strong>{project.name}</strong>{canOpenWindow ? '' : ' using Terminal'} to review its sign-in or project approval prompts. Return here and check again when you finish.</p>
         <div className="toolbar-actions">
