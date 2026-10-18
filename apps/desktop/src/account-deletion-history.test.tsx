@@ -9,7 +9,7 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-const id = (n: number) => `018f22e2-79b0-7cc8-98c4-dc0c0c0750${String(n).padStart(2, '0')}` as never;
+const id = (n: number) => `018f22e2-79b0-7cc8-98c4-${String(n).padStart(12, '0')}` as never;
 
 const firstPage = Array.from({ length: 50 }, (_, i) => ({
   operationId: id(i + 10),
@@ -24,13 +24,16 @@ const secondPage = Array.from({ length: 3 }, (_, i) => ({
   createdAt: String(1758000000000 + i),
 }));
 
-function renderHistory() {
+function renderHistory(pages = [firstPage, secondPage]) {
   const seen: (string | null)[] = [];
   const gateway = {
     accountDeletionStatus: vi.fn().mockResolvedValue({ state: 'active' }),
     accountDeletionIntents: vi.fn(async (after: string | null) => {
       seen.push(after);
-      return after === null ? firstPage : secondPage;
+      if (after === null) return pages[0];
+      const previousPage = pages.findIndex(page => page.at(-1)?.operationId === after);
+      if (previousPage < 0) throw new Error('Unexpected history cursor');
+      return pages[previousPage + 1] ?? [];
     }),
   } as unknown as WorkspaceGateway;
   render(<AccountLifecyclePanel gateway={gateway} />);
@@ -79,4 +82,41 @@ it('offers Next on a short page only while results remain', async () => {
   // A partial page means the history is exhausted, so no further Next.
   await waitFor(() => expect(screen.getByText(/Showing page 2/)).toBeTruthy());
   expect(screen.queryByRole('button', { name: 'Next requests' })).toBeNull();
+});
+
+it('moves backward and forward through three pages without losing earlier requests', async () => {
+  const middlePage = firstPage.map((request, index) => ({ ...request, operationId: id(80 + index) }));
+  const lastPage = secondPage.map((request, index) => ({ ...request, operationId: id(160 + index) }));
+  const { seen } = renderHistory([firstPage, middlePage, lastPage]);
+  await screen.findByRole('button', { name: 'Next requests' });
+
+  fireEvent.click(screen.getByRole('button', { name: 'Next requests' }));
+  await screen.findByText('Showing page 2');
+  fireEvent.click(screen.getByRole('button', { name: 'Next requests' }));
+  await screen.findByText('Showing page 3');
+  expect(screen.getByRole('button', { name: new RegExp(lastPage[0].operationId) })).toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole('button', { name: 'Previous requests' }));
+  await screen.findByText('Showing page 2');
+  expect(screen.getByRole('button', { name: new RegExp(middlePage[0].operationId) })).toBeInTheDocument();
+  fireEvent.click(screen.getByRole('button', { name: 'Previous requests' }));
+  await screen.findByRole('button', { name: new RegExp(firstPage[0].operationId) });
+  expect(screen.queryByRole('button', { name: 'Previous requests' })).not.toBeInTheDocument();
+  expect(screen.queryByText(/Showing page/)).not.toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole('button', { name: 'Next requests' }));
+  await screen.findByText('Showing page 2');
+  fireEvent.click(screen.getByRole('button', { name: 'Next requests' }));
+  await screen.findByText('Showing page 3');
+  fireEvent.click(screen.getByRole('button', { name: 'Previous requests' }));
+  await screen.findByText('Showing page 2');
+  fireEvent.click(screen.getByRole('button', { name: 'Next requests' }));
+  await screen.findByText('Showing page 3');
+  expect(screen.queryByRole('button', { name: 'Next requests' })).not.toBeInTheDocument();
+  expect(seen).toEqual([
+    null, firstPage[49].operationId, middlePage[49].operationId,
+    firstPage[49].operationId, null,
+    firstPage[49].operationId, middlePage[49].operationId,
+    firstPage[49].operationId, middlePage[49].operationId,
+  ]);
 });

@@ -47,7 +47,11 @@ export function AccountLifecyclePanel({ gateway }: { gateway: Gateway }) {
       setHistoryReady(history.status === 'fulfilled');
       if (history.status === 'fulfilled') {
         setIntents(history.value);
-        setPageCursors(pages => (after === null ? [null] : pages.includes(after) ? pages : [...pages, after]));
+        setPageCursors(pages => {
+          if (after === null) return [null];
+          const visited = pages.indexOf(after);
+          return visited >= 0 ? pages.slice(0, visited + 1) : [...pages, after];
+        });
       }
       if (remote.status === 'rejected') {
         const cause: unknown = remote.reason;
