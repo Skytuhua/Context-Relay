@@ -1344,7 +1344,10 @@ mod endpoint_tests {
         tokio::task::yield_now().await;
         task.await.unwrap().unwrap();
 
-        assert_eq!(tokio::time::Instant::now() - started, Duration::from_secs(8));
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            Duration::from_secs(8)
+        );
         assert_eq!(observed_launches.load(Ordering::SeqCst), 1);
         assert!(observed_connects.load(Ordering::SeqCst) >= 3);
     }
