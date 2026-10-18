@@ -130,6 +130,7 @@ fn windows_reserved_name(component: &str) -> bool {
 
 fn entry_is_plain_file(
     entry: &zip::read::ZipFile<'_, impl Read + ?Sized>,
+    path: &str,
 ) -> Result<(), QuarantineError> {
     if entry.is_dir() {
         return Ok(());
@@ -139,22 +140,17 @@ fn entry_is_plain_file(
         // Reject symlink/mode bits and non-regular file types.
         if mode & 0o170000 != 0o100000 {
             return Err(QuarantineError::UnsafeEntry(format!(
-                "{}: not a regular file",
-                entry.name()
+                "{path}: not a regular file"
             )));
         }
         // Packages never carry executables; active content is installed
         // through the sealed native transaction instead.
         if mode & 0o111 != 0 {
-            return Err(QuarantineError::UnexpectedExecutable(
-                entry.name().to_owned(),
-            ));
+            return Err(QuarantineError::UnexpectedExecutable(path.to_owned()));
         }
     }
-    if unexpected_executable_name(entry.name()) {
-        return Err(QuarantineError::UnexpectedExecutable(
-            entry.name().to_owned(),
-        ));
+    if unexpected_executable_name(path) {
+        return Err(QuarantineError::UnexpectedExecutable(path.to_owned()));
     }
     if entry.compressed_size() > u64::from(u32::MAX)
         || entry.size() > MAX_PACKAGE_ENTRY_BYTES as u64
@@ -190,9 +186,12 @@ pub fn inspect_archive(bytes: &[u8]) -> Result<QuarantinedArchive, QuarantineErr
         let mut entry = archive
             .by_index(index)
             .map_err(|error| QuarantineError::Malformed(error.to_string()))?;
-        let raw_path = entry.name().to_owned();
+        let raw_path = entry
+            .name()
+            .map_err(|error| QuarantineError::Malformed(error.to_string()))?
+            .into_owned();
         reject_entry_path(&raw_path)?;
-        entry_is_plain_file(&entry)?;
+        entry_is_plain_file(&entry, &raw_path)?;
         // Windows alternate data streams hide payload after ':'; the path
         // policy above already rejects ':' outright, so any surviving name
         // is stream-free. Normalize for collision detection.
@@ -342,6 +341,63 @@ mod tests {
             .collect();
         let bytes = build_archive(&borrowed).unwrap();
         assert_eq!(inspect_archive(&bytes), Err(QuarantineError::TooLarge));
+    }
+
+    #[test]
+    fn rejects_entries_that_expand_beyond_the_declared_size() {
+        let content = [b'x'; 128];
+        let mut bytes = build_archive(&[("content.txt", &content)]).unwrap();
+        assert_eq!(inspect_archive(&bytes).unwrap().total_bytes, 128);
+
+        // Keep the compressed bytes and CRC valid, but understate the
+        // uncompressed size in both headers. Trusting only this metadata
+        // would let a compressed payload bypass the pre-read size limits.
+        assert_eq!(&bytes[..4], b"PK\x03\x04");
+        bytes[22..26].copy_from_slice(&1_u32.to_le_bytes());
+        let central_directory = bytes
+            .windows(4)
+            .position(|signature| signature == b"PK\x01\x02")
+            .unwrap();
+        bytes[central_directory + 24..central_directory + 28].copy_from_slice(&1_u32.to_le_bytes());
+        let mut archive = ZipArchive::new(std::io::Cursor::new(&bytes)).unwrap();
+        assert_eq!(archive.by_index(0).unwrap().size(), 1);
+
+        assert!(matches!(
+            inspect_archive(&bytes),
+            Err(QuarantineError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn preserves_utf8_and_cp437_entry_names_in_binding_digests() {
+        let utf8_bytes = build_archive(&[("é.txt", b"content")]).unwrap();
+        let utf8 = inspect_archive(&utf8_bytes).unwrap();
+        assert_eq!(utf8.entries[0].path, "é.txt");
+
+        // Older ZIP writers can encode the same name as CP437 without the
+        // UTF-8 flag. Both decoded forms must bind to the same entry path.
+        let mut cp437_bytes = build_archive(&[("x.txt", b"content")]).unwrap();
+        assert_eq!(
+            u16::from_le_bytes([cp437_bytes[6], cp437_bytes[7]]) & (1 << 11),
+            0
+        );
+        cp437_bytes[30] = 0x82;
+        let central_directory = cp437_bytes
+            .windows(4)
+            .position(|signature| signature == b"PK\x01\x02")
+            .unwrap();
+        assert_eq!(
+            u16::from_le_bytes([
+                cp437_bytes[central_directory + 8],
+                cp437_bytes[central_directory + 9],
+            ]) & (1 << 11),
+            0
+        );
+        cp437_bytes[central_directory + 46] = 0x82;
+
+        let cp437 = inspect_archive(&cp437_bytes).unwrap();
+        assert_eq!(cp437.entries, utf8.entries);
+        assert_eq!(cp437.binding_digest(), utf8.binding_digest());
     }
 }
 
