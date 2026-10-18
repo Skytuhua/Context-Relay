@@ -2,6 +2,7 @@ import { beforeAll, describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { devCspPlugin } from '../dev-csp-plugin';
 
 // The dev server used to render the app completely unstyled. index.html carries
 // a Content-Security-Policy meta tag, and Vite injects styles at runtime during
@@ -31,18 +32,8 @@ beforeAll(() => {
   }
 });
 
-// The transform is reimplemented here rather than imported, because importing
-// vite.config pulls Vite in, which does not load under Node 26. The duplication
-// is the point: 'registers the dev-only relaxation' reads the real config, so the
-// two are cross-checked and cannot drift apart unnoticed.
-function transform(html: string): string {
-  return html.replace(
-    /(<meta\s+http-equiv="Content-Security-Policy"\s+content=")([^"]*)(")/,
-    (_match, open: string, policy: string, close: string) =>
-      `${open}${policy.replace("style-src 'self'", "style-src 'self' 'unsafe-inline'")}${close}`,
-  );
-}
-
+// Import the production plugin directly without loading the Vite configuration
+// or its runtime dependencies into the test environment.
 const viteConfig = readFileSync(join(appDir, 'vite.config.ts'), 'utf8');
 
 describe('Content-Security-Policy delivery', () => {
@@ -73,24 +64,29 @@ describe('Content-Security-Policy delivery', () => {
   it('registers the plugin in the dev-only position', () => {
     // 'apply: serve' is what keeps this out of `vite build`; without it the
     // relaxation would ship in the packaged app.
-    expect(viteConfig).toContain("apply: 'serve'");
-    expect(viteConfig).toContain("name: 'context-relay-dev-csp'");
-    expect(viteConfig).toContain('devCspPlugin');
+    expect(devCspPlugin.apply).toBe('serve');
+    expect(devCspPlugin.name).toBe('context-relay-dev-csp');
+    expect(viteConfig).toContain("import { devCspPlugin } from './dev-csp-plugin'");
     expect(viteConfig).toMatch(/plugins:\s*\[react\(\),\s*devCspPlugin\]/);
   });
 
   it('lets the dev server inject styles', () => {
-    expect(transform(indexHtml)).toContain("style-src 'self' 'unsafe-inline'");
+    expect(devCspPlugin.transformIndexHtml(indexHtml)).toContain("style-src 'self' 'unsafe-inline'");
   });
 
   it('leaves every other directive untouched', () => {
     const after =
-      /<meta\s+http-equiv="Content-Security-Policy"\s+content="([^"]*)"/.exec(transform(indexHtml))?.[1] ?? '';
+      /<meta\s+http-equiv="Content-Security-Policy"\s+content="([^"]*)"/.exec(devCspPlugin.transformIndexHtml(indexHtml))?.[1] ?? '';
     // Undo only the one intended relaxation; everything else must be byte-equal.
     const normalise = (policy: string) => policy.replace("style-src 'self' 'unsafe-inline'", "style-src 'self'");
     expect(normalise(after)).toBe(cspMeta?.[1] ?? '');
     expect(after).toContain("default-src 'self'");
     expect(after).toContain("object-src 'none'");
     expect(after).toContain("base-uri 'none'");
+  });
+
+  it('leaves a document without the CSP meta tag unchanged', () => {
+    const html = '<!doctype html><html><head><title>Preview</title></head><body></body></html>';
+    expect(devCspPlugin.transformIndexHtml(html)).toBe(html);
   });
 });
