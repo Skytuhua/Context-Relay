@@ -576,8 +576,12 @@ mod tests {
                 Duration::from_millis(500),
             );
             assert_eq!(result.is_ok(), mode == "valid", "{mode}: {result:?}");
+            // The probe's own timeout is 500ms; this budget only has to cover
+            // process teardown, so it is generous on purpose. A tight bound
+            // here failed under `cargo test -j 2`, where a loaded scheduler
+            // delays teardown well past any small margin.
             assert!(
-                start.elapsed() < Duration::from_secs(5),
+                start.elapsed() < Duration::from_secs(20),
                 "{mode} exceeded deadline"
             );
             assert!(
@@ -595,7 +599,18 @@ mod tests {
             }
             cases.push(case);
         }
-        thread::sleep(Duration::from_millis(1700));
+        // Allow scheduler delays beyond the descendant's 1500ms write delay.
+        // Every case has started, so observe them together for one full window
+        // after the final probe instead of waiting 20 seconds for each case.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            if cases.iter().any(|case| case.join("escaped").exists()) {
+                break;
+            }
+            thread::sleep(
+                Duration::from_millis(50).min(deadline.saturating_duration_since(Instant::now())),
+            );
+        }
         for case in cases {
             assert!(
                 !case.join("escaped").exists(),
