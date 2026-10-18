@@ -255,7 +255,10 @@ pub struct Client {
     inner: ClientConnection<ConnectedStream>,
 }
 
-const DAEMON_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+// A cold daemon must open its credential store and vault and finish startup
+// recovery before binding the endpoint. Keep this allowance separate from the
+// authentication and request deadlines after a connection has been established.
+const DAEMON_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const DAEMON_STARTUP_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
 impl Client {
@@ -1304,6 +1307,46 @@ mod endpoint_tests {
         assert!(matches!(error, IpcError::AuthenticationFailed));
         assert_eq!(connect_calls, 2);
         assert_eq!(launch_calls, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cold_daemon_can_bind_after_five_seconds_without_relaunching() {
+        let connect_calls = Arc::new(AtomicUsize::new(0));
+        let launch_calls = Arc::new(AtomicUsize::new(0));
+        let observed_connects = connect_calls.clone();
+        let observed_launches = launch_calls.clone();
+        let started = tokio::time::Instant::now();
+        let ready_at = started + Duration::from_secs(8);
+        let task = tokio::spawn(connect_endpoint_with(
+            move || {
+                connect_calls.fetch_add(1, Ordering::SeqCst);
+                ready(if tokio::time::Instant::now() >= ready_at {
+                    Ok(())
+                } else {
+                    Err(IpcError::EndpointNotFound)
+                })
+            },
+            move || {
+                launch_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        ));
+
+        tokio::task::yield_now().await;
+        assert_eq!(observed_launches.load(Ordering::SeqCst), 1);
+
+        tokio::time::advance(Duration::from_secs(6)).await;
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        assert_eq!(observed_launches.load(Ordering::SeqCst), 1);
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        task.await.unwrap().unwrap();
+
+        assert_eq!(tokio::time::Instant::now() - started, Duration::from_secs(8));
+        assert_eq!(observed_launches.load(Ordering::SeqCst), 1);
+        assert!(observed_connects.load(Ordering::SeqCst) >= 3);
     }
 
     #[tokio::test(start_paused = true)]
