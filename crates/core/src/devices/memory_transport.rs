@@ -2,7 +2,8 @@ use std::{
     collections::BTreeMap,
     fmt,
     str::FromStr,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard, Weak},
+    time::{Duration, Instant},
 };
 
 #[cfg(feature = "test-support")]
@@ -36,12 +37,11 @@ const INVITE_LIFETIME_MS: u64 = 600_000;
 const MAX_FAILED_ATTEMPTS: u8 = 5;
 const MAX_SESSION_ID_BYTES: usize = 128;
 const MAX_ENTROPY_RETRIES: usize = 32;
-/// Cap on concurrently tracked join sessions.
-///
-/// A join session id arrives from an unauthenticated caller and is inserted
-/// with `entry().or_default()`, so without a cap any local process could grow
-/// the map without bound simply by asking for new ids.
+/// Bound both live clients and recently used anonymous session identifiers.
 const MAX_JOIN_SESSIONS: usize = 64;
+/// Preserve attempt history across short-lived RPC clients without making the
+/// first 64 session identifiers occupy capacity for the provider's lifetime.
+const JOIN_SESSION_IDLE_RETENTION: Duration = Duration::from_secs(60 * 60);
 /// How long an expired invite is kept so a caller can still be told it expired
 /// rather than that it is missing. An hour is far longer than a client needs to
 /// ask about a code it just watched lapse.
@@ -96,9 +96,10 @@ enum ProviderEntropy {
     Fixed(VecDeque<[u8; 32]>),
 }
 
-#[derive(Default)]
 struct JoinSession {
     failed_attempts: u8,
+    last_seen: Instant,
+    clients: Weak<()>,
 }
 
 struct InviteRecord {
@@ -129,6 +130,7 @@ enum TerminalState {
 pub struct InMemoryPairingJoinClient {
     shared: Arc<SharedProvider>,
     session_id: Arc<str>,
+    _session_lifetime: Arc<()>,
 }
 
 #[derive(Clone)]
@@ -256,18 +258,44 @@ impl InMemoryPairingProvider {
         &self,
         session_id: &str,
     ) -> Result<InMemoryPairingJoinClient, PairingTransportError> {
+        self.join_session_client_at(session_id, Instant::now())
+    }
+
+    fn join_session_client_at(
+        &self,
+        session_id: &str,
+        now: Instant,
+    ) -> Result<InMemoryPairingJoinClient, PairingTransportError> {
         if session_id.is_empty() || session_id.len() > MAX_SESSION_ID_BYTES {
             return Err(PairingTransportError::Unauthorized);
         }
         let mut state = lock(&self.shared)?;
+        state.sessions.retain(|_, session| {
+            session.clients.strong_count() > 0
+                || now.saturating_duration_since(session.last_seen) < JOIN_SESSION_IDLE_RETENTION
+        });
         if !state.sessions.contains_key(session_id) && state.sessions.len() >= MAX_JOIN_SESSIONS {
             return Err(PairingTransportError::Transient);
         }
-        state.sessions.entry(session_id.to_owned()).or_default();
+        let session = state
+            .sessions
+            .entry(session_id.to_owned())
+            .or_insert_with(|| JoinSession {
+                failed_attempts: 0,
+                last_seen: now,
+                clients: Weak::new(),
+            });
+        session.last_seen = session.last_seen.max(now);
+        let lifetime = session.clients.upgrade().unwrap_or_else(|| {
+            let lifetime = Arc::new(());
+            session.clients = Arc::downgrade(&lifetime);
+            lifetime
+        });
         drop(state);
         Ok(InMemoryPairingJoinClient {
             shared: Arc::clone(&self.shared),
             session_id: Arc::from(session_id),
+            _session_lifetime: lifetime,
         })
     }
 
@@ -362,11 +390,12 @@ impl PairingJoinTransport for InMemoryPairingJoinClient {
     ) -> Result<PairingId, PairingTransportError> {
         let mut state = lock(&self.shared)?;
         sweep_invites(&mut state, now_ms);
-        if state
+        let session = state
             .sessions
-            .get(self.session_id.as_ref())
-            .is_none_or(|session| session.failed_attempts >= MAX_FAILED_ATTEMPTS)
-        {
+            .get_mut(self.session_id.as_ref())
+            .ok_or(PairingTransportError::Exhausted)?;
+        session.last_seen = session.last_seen.max(Instant::now());
+        if session.failed_attempts >= MAX_FAILED_ATTEMPTS {
             return Err(PairingTransportError::Exhausted);
         }
 
@@ -974,29 +1003,8 @@ fn prune_reported_expired(state: &mut ProviderState) {
     });
 }
 
-/// Expire and drop every invite whose lifetime has elapsed.
-///
-/// `prune_reported_expired` only removes an invite once a caller has observed
-/// it expire, and that observation happens on a targeted read. An invite nobody
-/// ever queries therefore stayed `Active` forever, so a caller who kept
-/// creating invites grew the map without bound: 120 invites created over 120
-/// hours all remained resident.
-///
-/// Retention here depends only on the timestamp, not on whether the invite was
-/// ever read. A lapsed invite is dropped immediately; nothing is waiting on a
-/// read that may never arrive.
-/// Expire lapsed invites and drop the ones nobody is waiting to hear about.
-///
-/// The original sweep only removed an invite once a caller had observed it
-/// expire, and that observation happens on a targeted read. An invite nobody
-/// ever queried therefore stayed resident forever: 120 invites created over 120
-/// hours all remained, and a caller who kept creating invites grew the map
-/// without bound.
-///
-/// An invite is retained until its expiry has been *reported*, so a caller that
-/// does ask about a lapsed invite still learns that it expired rather than that
-/// it is missing. The gap this closes is the invite that lapses and is never
-/// read, which no one is waiting on.
+/// Expire lapsed invites, retaining them until expiry is reported or the grace
+/// window ends. An unread invite cannot remain resident indefinitely.
 fn sweep_invites(state: &mut ProviderState, now_ms: u64) {
     for invite in state.invites.values_mut() {
         expire_if_due(invite, now_ms);
@@ -1081,5 +1089,105 @@ impl fmt::Debug for InMemoryPairingApprovalClient {
             .field("scope", &self.scope)
             .field("device_id", &self.device_id)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod session_retention_tests {
+    use super::*;
+
+    fn provider() -> InMemoryPairingProvider {
+        InMemoryPairingProvider::from_parts([0x11; 32], ProviderEntropy::Os)
+    }
+
+    #[test]
+    fn idle_sessions_release_capacity_after_the_retention_window() {
+        let provider = provider();
+        let now = Instant::now();
+        for index in 0..MAX_JOIN_SESSIONS {
+            provider
+                .join_session_client_at(&format!("inactive-{index}"), now)
+                .unwrap();
+        }
+        assert!(matches!(
+            provider.join_session_client_at(
+                "next",
+                now + JOIN_SESSION_IDLE_RETENTION - Duration::from_nanos(1)
+            ),
+            Err(PairingTransportError::Transient)
+        ));
+
+        let next = provider
+            .join_session_client_at("next", now + JOIN_SESSION_IDLE_RETENTION)
+            .unwrap();
+        assert_eq!(next.session_id.as_ref(), "next");
+        assert_eq!(provider.retained_state_counts().unwrap().1, 1);
+    }
+
+    #[test]
+    fn live_client_clones_keep_their_capacity_until_the_last_handle_drops() {
+        let provider = provider();
+        let now = Instant::now();
+        let mut clients = (0..MAX_JOIN_SESSIONS)
+            .map(|index| {
+                provider
+                    .join_session_client_at(&format!("active-{index}"), now)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let client = clients.pop().unwrap();
+        let clone = client.clone();
+        drop(client);
+        let after_retention = now + JOIN_SESSION_IDLE_RETENTION;
+        assert!(matches!(
+            provider.join_session_client_at("next", after_retention),
+            Err(PairingTransportError::Transient)
+        ));
+
+        drop(clone);
+        let _next = provider
+            .join_session_client_at("next", after_retention)
+            .unwrap();
+        assert_eq!(
+            provider.retained_state_counts().unwrap().1,
+            MAX_JOIN_SESSIONS
+        );
+    }
+
+    #[test]
+    fn recreating_an_rpc_client_preserves_its_failed_attempt_budget() {
+        let provider = provider();
+        let now = Instant::now();
+        let wrong = PairingCode::new("00000-00000".into()).unwrap();
+        for attempt in 1..=MAX_FAILED_ATTEMPTS {
+            let client = provider
+                .join_session_client_at("reconnecting", now + Duration::from_secs(attempt.into()))
+                .unwrap();
+            assert_eq!(
+                client.resolve_code(&wrong, 0),
+                Err(if attempt == MAX_FAILED_ATTEMPTS {
+                    PairingTransportError::Exhausted
+                } else {
+                    PairingTransportError::Invalid
+                })
+            );
+        }
+
+        let client = provider
+            .join_session_client_at("reconnecting", now + JOIN_SESSION_IDLE_RETENTION / 2)
+            .unwrap();
+        assert_eq!(
+            client.resolve_code(&wrong, u64::MAX),
+            Err(PairingTransportError::Exhausted),
+            "pairing timestamps must not clear monotonic session history"
+        );
+        let _other = provider
+            .join_session_client_at("other", now + JOIN_SESSION_IDLE_RETENTION * 2)
+            .unwrap();
+        assert_eq!(
+            client.resolve_code(&wrong, 0),
+            Err(PairingTransportError::Exhausted),
+            "a live client must retain its attempt budget after idle retention"
+        );
     }
 }
