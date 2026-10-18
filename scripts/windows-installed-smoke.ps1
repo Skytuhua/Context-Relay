@@ -48,6 +48,26 @@ function Get-ContainedPath([string]$Root, [string]$Relative) {
     return $full
 }
 
+function Assert-RegisteredInstallLocation($Value, [string]$ExpectedRoot) {
+    if ($Value -isnot [string] -or [string]::IsNullOrWhiteSpace($Value)) {
+        throw 'Invalid registered install location.'
+    }
+    $path = $Value
+    # Tauri CLI 2.11.4's NSIS template stores InstallLocation with one quote
+    # pair. Remove only that wrapper; this value is never a command line.
+    if ($path.Length -ge 2 -and $path.StartsWith('"') -and $path.EndsWith('"')) {
+        $path = $path.Substring(1, $path.Length - 2)
+    }
+    if ($path -match '[\p{Cc}"]' -or $path -notmatch '^[A-Za-z]:[\\/]') {
+        throw 'Registered install location must be a fully qualified local path without arguments.'
+    }
+    $full = [IO.Path]::GetFullPath($path).TrimEnd('\')
+    if (-not [string]::Equals($full, $ExpectedRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Installer did not register the expected current-user destination.'
+    }
+    Assert-RegularPath $full
+}
+
 function Read-BoundedText([string]$Path, [long]$Limit = 1048576) {
     Assert-RegularPath $Path
     $item = Get-Item -LiteralPath $Path
@@ -622,10 +642,10 @@ try {
     Assert-RegularPath $installRoot
     $script:evidence.stages.install = 'passed'
     $entries = @(Get-ProductEntries)
-    if ($entries.Count -ne 1 -or $entries[0].PSPath -notlike '*HKEY_CURRENT_USER*' -or
-        -not [string]::Equals(([IO.Path]::GetFullPath($entries[0].InstallLocation)).TrimEnd('\'), $installRoot, [StringComparison]::OrdinalIgnoreCase)) {
+    if ($entries.Count -ne 1 -or $entries[0].PSPath -notlike '*HKEY_CURRENT_USER*') {
         throw 'Installer did not register the expected current-user destination.'
     }
+    Assert-RegisteredInstallLocation $entries[0].InstallLocation $installRoot
     $uninstallValue = [string]$entries[0].UninstallString
     if ($uninstallValue -match '^"([^"\r\n]+\.exe)"$') { $uninstallPath = $Matches[1] }
     elseif ($uninstallValue -match '^[^"\r\n]+\.exe$') { $uninstallPath = $uninstallValue }
