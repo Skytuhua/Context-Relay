@@ -686,6 +686,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
     {preferenceError && <p className="form-error" role="alert">{preferenceError}</p>}
     {error && <p className="form-error" role="alert">{error}</p>}
     <SetupWizard gateway={gateway} projects={projects} progress={preferences.setup}
+      initialProjectDraft={projectDraft.current} onProjectDraft={draft => { projectDraft.current = draft; }}
       onChange={next => { if (next.projectId !== preferences.setup.projectId) { setTestVerified(false); const project = projects.find(item => item.projectId === next.projectId); if (project || next.projectId === null) transitionProject(project ?? null); } updateSetup(next); }}
       onProjectSaved={project => { setProjects(current => current.some(item => item.projectId === project.projectId) ? current : [...current, project]); transitionProject(project); }}
       onFinishLater={() => updateSetup({ ...preferences.setup, status: 'deferred' })}
