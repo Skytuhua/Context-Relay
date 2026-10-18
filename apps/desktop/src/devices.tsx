@@ -100,6 +100,11 @@ export function DevicesScreen({
     return () => clearInterval(timer);
   }, [invite]);
 
+  // A spent code cannot be approved. Without this the countdown settles on
+  // "0 seconds remaining" and every control stays live, so the user is told to
+  // hand over a code that can no longer work.
+  const inviteExpired = !!invite && Number(invite.expiresAt) <= nowMs;
+
   const applyStatus = useCallback(
     async (result: PairingStatusResult, currentRole: PairingRole | null) => {
       const invalidForRole = () => {
@@ -376,7 +381,7 @@ export function DevicesScreen({
       setApproval(null);
       setRejected(false);
       setAwaitingConfirmation(false);
-      setMessage('Pairing canceled.');
+      setMessage(inviteExpired ? 'Expired pairing closed. Select Create pairing code to try again.' : 'Pairing canceled.');
     } catch (cause) {
       setError(safePairingError(cause, 'Pairing could not be canceled.'));
     } finally {
@@ -390,6 +395,7 @@ export function DevicesScreen({
     setRevocationOperationId(null);
     setRevocationStatus(null);
     setError(null);
+    setDialogError(null);
     revocationDialogRef.current?.showModal();
   }
 
@@ -399,6 +405,7 @@ export function DevicesScreen({
     setRevocationOperationId(intent.operationId);
     setRevocationStatus(intent);
     setError(null);
+    setDialogError(null);
     revocationDialogRef.current?.showModal();
   }
 
@@ -418,18 +425,24 @@ export function DevicesScreen({
     }
   }
 
+  // Revocation and pairing-decision failures happen inside a modal. The
+  // workspace-level error renders above the dialog, so a rejected request left
+  // the dialog unchanged with no visible feedback and invited a second attempt.
+  const [dialogError, setDialogError] = useState<string | null>(null);
+
   async function revokeDevice() {
     if (!revocationTarget) return;
     const operationId = revocationOperationId ?? uuidV7() as OperationId;
     setRevocationOperationId(operationId);
     setWorking(true);
     setError(null);
+    setDialogError(null);
     try {
       await applyRevocationStatus(
         await gateway.revokeDevice(operationId, revocationTarget.deviceId as DeviceId),
       );
     } catch (cause) {
-      setError(safePairingError(cause, 'The revocation request could not be confirmed.'));
+      setDialogError(safePairingError(cause, 'The revocation request could not be confirmed.'));
     } finally {
       setWorking(false);
     }
@@ -439,10 +452,11 @@ export function DevicesScreen({
     if (!revocationOperationId) return;
     setWorking(true);
     setError(null);
+    setDialogError(null);
     try {
       await applyRevocationStatus(await gateway.deviceRevocationStatus(revocationOperationId));
     } catch (cause) {
-      setError(safePairingError(cause, 'The revocation status could not be refreshed.'));
+      setDialogError(safePairingError(cause, 'The revocation status could not be refreshed.'));
     } finally {
       setWorking(false);
     }
@@ -452,10 +466,11 @@ export function DevicesScreen({
     if (!revocationOperationId) return;
     setWorking(true);
     setError(null);
+    setDialogError(null);
     try {
       await applyRevocationStatus(await gateway.cancelDeviceRevocation(revocationOperationId));
     } catch (cause) {
-      setError(safePairingError(cause, 'Future revocation sends could not be stopped.'));
+      setDialogError(safePairingError(cause, 'Future revocation sends could not be stopped.'));
     } finally {
       setWorking(false);
     }
@@ -584,16 +599,20 @@ export function DevicesScreen({
           <div className="pairing-step">
             <h3>One-time pairing code</h3>
             <code className="pairing-code">{invite.code}</code>
-            <p>
-              Expires {formatTimestamp(invite.expiresAt)} · {formatRemaining(invite.expiresAt, nowMs)} remaining
-            </p>
+            {inviteExpired ? (
+              <p role="status">This code expired. Close this pairing, then create a new code.</p>
+            ) : (
+              <p>
+                Expires {formatTimestamp(invite.expiresAt)} · {formatRemaining(invite.expiresAt, nowMs)} remaining
+              </p>
+            )}
             <button
               className="secondary-action"
               disabled={working}
               onClick={() => void cancelPairing()}
               type="button"
             >
-              Cancel pairing
+              {inviteExpired ? 'Close expired pairing' : 'Cancel pairing'}
             </button>
           </div>
         )}
@@ -770,6 +789,7 @@ export function DevicesScreen({
         {revocationStatus && (
           <p aria-live="polite" role="status">{revocationStatusMessage(revocationStatus)}</p>
         )}
+        {dialogError && <p className="form-error" role="alert">{dialogError}</p>}
         <div className="pairing-dialog-actions">
           {revocationStatus?.outcome.state !== 'accepted' &&
             revocationStatus?.outcome.state !== 'conflict' &&
@@ -851,6 +871,7 @@ function RecoveryEnrollmentPanel({
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const mountedRef = useRef(true);
+  const expiryCancelGeneration = useRef(0);
   const challengeRef = useRef<RecoveryEnrollmentChallenge | null>(null);
   const headingRef = useRef<HTMLHeadingElement>(null);
 
@@ -958,6 +979,7 @@ function RecoveryEnrollmentPanel({
 
     return () => {
       mountedRef.current = false;
+      expiryCancelGeneration.current += 1;
       const activeChallenge = challengeRef.current;
       challengeRef.current = null;
       if (activeChallenge) {
@@ -976,11 +998,22 @@ function RecoveryEnrollmentPanel({
   useEffect(() => {
     if (!challenge || Number(challenge.expiresAtMs) > nowMs) return;
     const expired = challenge;
+    const generation = ++expiryCancelGeneration.current;
     clearChallenge();
     setStatus(idleRecoveryStatus());
     setMessage(null);
-    setError('Recovery setup expired. Start again with a new phrase.');
-    void gateway.recoveryEnrollmentCancel(expired.enrollmentId).catch(() => undefined);
+    // Set the expiry message straight away so it never depends on the cancel
+    // round trip, then extend it if the local service does not confirm the release.
+    setError(RECOVERY_EXPIRED_GUIDANCE);
+    void gateway.recoveryEnrollmentCancel(expired.enrollmentId).catch(() => {
+      if (!mountedRef.current || expiryCancelGeneration.current !== generation) return;
+      // The local challenge is already gone, so a cancel that fails leaves the
+      // local service holding an enrollment this screen can no longer show or
+      // stop. Saying so beats implying setup is fully wound down.
+      setError(
+        `${RECOVERY_EXPIRED_GUIDANCE} Context Relay could not confirm the local service released it, so close and reopen Context Relay before starting again.`,
+      );
+    });
   }, [challenge, clearChallenge, gateway, nowMs]);
 
   useEffect(() => {
@@ -1006,6 +1039,9 @@ function RecoveryEnrollmentPanel({
   }, [applyRecoveryStatus, gateway, pollIntervalMs, status]);
 
   async function beginRecovery() {
+    // A delayed cleanup result belongs to the expired attempt, even while the
+    // next native phrase window is still opening and no new challenge is set.
+    expiryCancelGeneration.current += 1;
     setWorking(true);
     setError(null);
     setMessage(null);
@@ -1050,6 +1086,7 @@ function RecoveryEnrollmentPanel({
   }
 
   async function retryRecoveryStatus() {
+    expiryCancelGeneration.current += 1;
     setWorking(true);
     try {
       await refreshRecoveryStatus();
@@ -1278,6 +1315,8 @@ function isClientError(cause: unknown, code: ClientError['code']): cause is Clie
     (cause as { code?: unknown }).code === code
   );
 }
+
+const RECOVERY_EXPIRED_GUIDANCE = 'Recovery setup expired. Start again with a new phrase.';
 
 function safePairingError(cause: unknown, fallback: string) {
   if (isClientError(cause, 'harness_unsupported')) return HOSTED_PAIRING_UNAVAILABLE;

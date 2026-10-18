@@ -1,5 +1,5 @@
 import Ajv2020 from 'ajv/dist/2020.js';
-import type { AccountDeletionIntentSummary, DeviceRevocationStatus, DeviceRevocationSummary, LocalResult, OperationId, HostedAuthStatus, RecoveryRestoreStatus, RecoveryHistoryCandidatesPage } from './bindings';
+import type { AccountDeletionIntentSummary, DeviceRevocationStatus, DeviceRevocationSummary, LocalResult, MemoryCandidate, OperationId, ProjectIdentity, HostedAuthStatus, RecoveryRestoreStatus, RecoveryHistoryCandidatesPage } from './bindings';
 
 import type { ConnectionCheckStatus, HarnessPreparationStatus, HarnessExecutionStatus, HarnessSetupRecord, HarnessSetupsPage, MemoryRecord, ProbeReport, SearchIndexStatus, SetupPlan, SyncOperationV1, TaskRecord } from './bindings';
 
@@ -198,7 +198,7 @@ const provenance = (value: unknown, field: string) => {
   hlc(item.createdHlc, `${field}.createdHlc`);
 };
 
-export const assertMemoryRecord = (value: unknown): asserts value is MemoryRecord => {
+export const assertMemoryRecord: (value: unknown) => asserts value is MemoryRecord = (value) => {
   const item = object(value, ['id', 'scope', 'kind', 'title', 'bodyMarkdown', 'tags', 'origin', 'provenance', 'revision', 'createdHlc', 'updatedHlc', 'archived'], 'memory');
   id(item.id, 'memory.id'); scope(item.scope, 'memory.scope');
   choice(item.kind, ['fact', 'decision', 'preference', 'pattern', 'procedure', 'note'], 'memory.kind');
@@ -211,7 +211,7 @@ export const assertMemoryRecord = (value: unknown): asserts value is MemoryRecor
   if (typeof item.archived !== 'boolean') fail('memory.archived');
 };
 
-export const assertTaskRecord = (value: unknown): asserts value is TaskRecord => {
+export const assertTaskRecord: (value: unknown) => asserts value is TaskRecord = (value) => {
   const item = object(value, ['id', 'projectId', 'title', 'bodyMarkdown', 'status', 'evidence', 'revision'], 'task');
   id(item.id, 'task.id'); id(item.projectId, 'task.projectId'); text(item.title, 512, 'task.title'); text(item.bodyMarkdown, 1024 * 1024, 'task.bodyMarkdown');
   choice(item.status, ['open', 'in_progress', 'blocked', 'done', 'canceled'], 'task.status');
@@ -223,6 +223,24 @@ export const assertTaskRecord = (value: unknown): asserts value is TaskRecord =>
     optionalText(nested.reference, 16 * 1024, 'task.evidence.reference'); hlc(nested.recordedHlc, 'task.evidence.recordedHlc');
   }
   id(item.revision, 'task.revision');
+};
+
+export const assertMemoryCandidate: (value: unknown) => asserts value is MemoryCandidate = (value) => {
+  const item = object(value, ['id', 'proposedMemory', 'evidenceSummary', 'sourceHarness', 'state'], 'candidate');
+  id(item.id, 'candidate.id');
+  assertMemoryRecord(item.proposedMemory);
+  text(item.evidenceSummary, 16 * 1024, 'candidate.evidenceSummary');
+  choice(item.sourceHarness, ['codex', 'claude_code', 'hermes'], 'candidate.sourceHarness');
+  choice(item.state, ['pending', 'accepted', 'rejected'], 'candidate.state');
+};
+
+export const assertProjectIdentity = (value: unknown): asserts value is ProjectIdentity => {
+  const item = object(value, ['projectId', 'githubRepositoryId', 'gitRemoteFingerprint', 'monorepoSubdirectory', 'name'], 'project');
+  id(item.projectId, 'project.projectId');
+  for (const name of ['githubRepositoryId', 'gitRemoteFingerprint', 'monorepoSubdirectory'] as const) {
+    if (item[name] !== null) text(item[name], 1024, `project.${name}`);
+  }
+  text(item.name, 512, 'project.name');
 };
 
 const native = (value: unknown, field: string) => {

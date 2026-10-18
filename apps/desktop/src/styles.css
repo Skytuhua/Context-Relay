@@ -133,6 +133,8 @@ summary { min-height: 28px; padding-block: 3px; }
 .field input[type='checkbox'], .field input[type='radio'] { width: 18px; }
 .field-error, .form-error { color: var(--color-danger); font-weight: 600; }
 .field-error { margin: 0; }
+.form-error .recovery-steps { margin: 8px 0 12px; padding-left: 20px; font-weight: 400; }
+.form-error .recovery-steps li { margin: 2px 0; }
 .form-error { margin: 0 0 16px; border: 1px solid var(--color-danger); border-radius: var(--radius-panel); padding: 12px; background: var(--color-danger-surface); overflow-wrap: anywhere; }
 .primary-action, .secondary-action { min-height: 36px; width: fit-content; }
 .primary-action { border-color: var(--color-primary); background: var(--color-primary); color: var(--color-on-primary); }
@@ -201,6 +203,9 @@ summary { min-height: 28px; padding-block: 3px; }
 .onboarding-content > header h1, .onboarding-content > header p { margin: 0 0 8px; }
 .onboarding-content > header p { color: var(--color-muted); }
 .onboarding-content .screen-content { width: 100%; }
+.screen-error { max-width: 44rem; margin: 32px auto; padding: 24px; border: 1px solid var(--color-border); border-radius: var(--radius-panel); background: var(--color-surface); }
+.screen-error h2 { margin: 0 0 8px; }
+.screen-error p { margin: 0 0 16px; color: var(--color-muted); }
 .onboarding-footer { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-top: 0; padding-top: 16px; border-top: 1px solid var(--color-border); background: var(--color-canvas); }
 .onboarding-footer > div { display: flex; flex-wrap: wrap; gap: 8px; }
 .shortcut-dialog { width: min(calc(100% - 32px), 42rem); }

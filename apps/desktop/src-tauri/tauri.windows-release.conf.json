@@ -33,7 +33,7 @@
         "installerHooks": "./windows/installer-hooks.nsh"
       },
       "webviewInstallMode": {
-        "type": "embedBootstrapper",
+        "type": "offlineInstaller",
         "silent": true
       }
     }

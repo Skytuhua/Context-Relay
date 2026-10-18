@@ -68,6 +68,45 @@ it('requires a deliberate project choice even when an old installer project exis
   expect(api.harnessApply).not.toHaveBeenCalled();
 });
 
+it.each(['Back', 'Finish later'] as const)('keeps an unfinished project when returning from %s', async (action) => {
+  const api = fixture();
+  render(<App gateway={api as unknown as WorkspaceGateway} />);
+  fireEvent.click(await screen.findByRole('checkbox', { name: 'Codex' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
+  fireEvent.change(screen.getByRole('textbox', { name: 'Project name' }), { target: { value: 'Private project draft' } });
+  fireEvent.change(screen.getByRole('textbox', { name: 'Project folder' }), { target: { value: 'C:\\Users\\Alice\\Private project' } });
+
+  fireEvent.click(screen.getByRole('button', { name: action }));
+  fireEvent.click(screen.getByRole('button', { name: action === 'Back' ? 'Continue' : 'Resume setup' }));
+
+  expect(screen.getByRole('textbox', { name: 'Project name' })).toHaveValue('Private project draft');
+  expect(screen.getByRole('textbox', { name: 'Project folder' })).toHaveValue('C:\\Users\\Alice\\Private project');
+  const storedValues = Array.from({ length: localStorage.length }, (_, index) => localStorage.getItem(localStorage.key(index)!)).join('\n');
+  expect(storedValues).not.toContain('Private project');
+  expect(api.createProject).not.toHaveBeenCalled();
+  expect(api.harnessApply).not.toHaveBeenCalled();
+});
+
+it('clears a saved project draft before the project form is opened again', async () => {
+  const api = fixture();
+  const savedProject = { ...project, projectId: '018f22e2-79b0-7cc8-98c4-dc0c0c073982', name: 'New project' };
+  api.createProject.mockResolvedValue(savedProject);
+  render(<App gateway={api as unknown as WorkspaceGateway} />);
+  fireEvent.click(await screen.findByRole('checkbox', { name: 'Codex' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
+  fireEvent.change(screen.getByRole('textbox', { name: 'Project name' }), { target: { value: savedProject.name } });
+  fireEvent.change(screen.getByRole('textbox', { name: 'Project folder' }), { target: { value: 'C:\\Projects\\new-project' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Add project' }));
+  await screen.findByRole('button', { name: 'Add project' });
+  expect(api.createProject).toHaveBeenCalledExactlyOnceWith(savedProject.name, 'C:\\Projects\\new-project');
+
+  fireEvent.click(screen.getByRole('button', { name: 'Finish later' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Resume setup' }));
+  expect(screen.getByRole('textbox', { name: 'Project name' })).toHaveValue('');
+  expect(screen.getByRole('textbox', { name: 'Project folder' })).toHaveValue('');
+  expect(api.harnessApply).not.toHaveBeenCalled();
+});
+
 it('defers, restarts and resumes the same selected project and step without replaying writes', async () => {
   const api = fixture();
   const gateway = api as unknown as WorkspaceGateway;
