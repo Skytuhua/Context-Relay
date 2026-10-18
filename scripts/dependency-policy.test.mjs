@@ -6,6 +6,9 @@ const desktopPackageUrl = new URL('../apps/desktop/package.json', import.meta.ur
 const lockfileUrl = new URL('../pnpm-lock.yaml', import.meta.url);
 const workspaceUrl = new URL('../pnpm-workspace.yaml', import.meta.url);
 
+// The overrides block is pinned line for line on purpose: it is the record of
+// which advisory forced each floor. Add a comment to pnpm-workspace.yaml and
+// this regex stops matching, so document a new floor here instead.
 test('Node dependency floor excludes every open patched advisory', async () => {
   const desktop = JSON.parse(await readFile(desktopPackageUrl, 'utf8'));
   const lockfile = await readFile(lockfileUrl, 'utf8');
@@ -17,7 +20,7 @@ test('Node dependency floor excludes every open patched advisory', async () => {
   assert.equal(desktop.devDependencies.vitest, '4.1.11');
   assert.match(
     workspace,
-    /overrides:\n  'brace-expansion@1\.1\.16': '1\.1\.18'\n  'brace-expansion@2\.1\.2': '2\.1\.4'\n  'esbuild@0\.27\.7': '0\.28\.1'\n  'browserslist@4\.28\.6': '4\.28\.7'\n  'fast-uri@3\.1\.3': '3\.1\.6'\n  'js-yaml@4\.3\.0': '4\.3\.2'\n  'nanoid@3\.3\.16': '3\.3\.18'\n  'postcss@8\.5\.19': '8\.5\.23'/,
+    /overrides:\n  'brace-expansion@1\.1\.16': '1\.1\.18'\n  'brace-expansion@2\.1\.2': '2\.1\.4'\n  'esbuild@0\.27\.7': '0\.28\.1'\n  'browserslist@4\.28\.6': '4\.28\.7'\n  'fast-uri@3\.1\.3': '3\.1\.8'\n  'js-yaml@4\.3\.0': '4\.3\.2'\n  'nanoid@3\.3\.16': '3\.3\.18'\n  'postcss@8\.5\.19': '8\.5\.23'/,
   );
 
   for (const fixed of [
@@ -26,7 +29,7 @@ test('Node dependency floor excludes every open patched advisory', async () => {
     'brace-expansion@1.1.18',
     'brace-expansion@2.1.4',
     'esbuild@0.28.1',
-    'fast-uri@3.1.6',
+    'fast-uri@3.1.8',
     'js-yaml@4.3.2',
     'nanoid@3.3.18',
     'postcss@8.5.23',
