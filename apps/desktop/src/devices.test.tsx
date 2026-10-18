@@ -593,6 +593,108 @@ describe('DevicesScreen', () => {
     expect(document.documentElement.outerHTML).not.toContain('recoveryPhraseWords');
   });
 
+  it('tells the user when a failed expiry cancel leaves the local service out of step', async () => {
+    // The local challenge is cleared before the cancel is sent, so a cancel that
+    // fails leaves the daemon holding an enrollment the user can no longer see.
+    // Saying nothing about it would leave them believing setup is fully wound down.
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    const gateway = new FakeDeviceGateway();
+    gateway.recoveryCancelError = new Error('cancel failed');
+    render(<DevicesScreen gateway={gateway} />);
+    await act(async () => undefined);
+    fireEvent.click(screen.getByRole('button', { name: 'Set up recovery' }));
+    await act(async () => undefined);
+    const form = screen.getByRole('form', { name: 'Confirm recovery phrase' });
+    fillRecoveryWords(form);
+
+    vi.setSystemTime(601_000);
+    await act(async () => {
+      vi.advanceTimersByTime(1_000);
+    });
+    // waitFor does not drive fake timers, so flush the rejected cancel directly.
+    expect(gateway.recoveryCancelCalls).toEqual([enrollmentId]);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    const alert = screen.getByRole('alert');
+    expect(alert).toHaveTextContent('Recovery setup expired. Start again with a new phrase.');
+    expect(alert).toHaveTextContent('local service');
+    // The recovery words must still be gone even though cleanup failed.
+    for (const canary of recoveryCanaries) {
+      expect(document.documentElement.outerHTML).not.toContain(canary);
+    }
+  });
+
+  it.each(['while starting', 'after receiving a new challenge'] as const)('ignores an old expiry cancel rejection %s', async (timing) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    const gateway = new FakeDeviceGateway();
+    let rejectExpiredCancel!: (error: Error) => void;
+    vi.spyOn(gateway, 'recoveryEnrollmentCancel').mockImplementationOnce(() => new Promise<void>((_resolve, reject) => {
+      rejectExpiredCancel = reject;
+    }));
+    render(<DevicesScreen gateway={gateway} />);
+    await act(async () => undefined);
+    fireEvent.click(screen.getByRole('button', { name: 'Set up recovery' }));
+    await act(async () => undefined);
+    fillRecoveryWords(screen.getByRole('form', { name: 'Confirm recovery phrase' }));
+
+    vi.setSystemTime(601_000);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+    expect(screen.queryByRole('form', { name: 'Confirm recovery phrase' })).not.toBeInTheDocument();
+
+    const nextChallenge: RecoveryEnrollmentHostBeginResult = {
+      kind: 'challenge',
+      data: {
+        enrollmentId: '018f22e2-79b0-7cc8-98c4-dc0c0c076002' as RecoveryEnrollmentId,
+        confirmationPositions: [2, 8, 14, 23],
+        createdAtMs: '602000' as DecimalTimestamp,
+        expiresAtMs: '1202000' as DecimalTimestamp,
+      },
+    };
+    let finishBegin!: (result: RecoveryEnrollmentHostBeginResult) => void;
+    vi.spyOn(gateway, 'recoveryEnrollmentBegin').mockImplementationOnce(() => new Promise(resolve => { finishBegin = resolve; }));
+    fireEvent.click(screen.getByRole('button', { name: 'Set up recovery' }));
+    if (timing === 'after receiving a new challenge') {
+      await act(async () => { finishBegin(nextChallenge); });
+    }
+
+    await act(async () => { rejectExpiredCancel(new Error('old cleanup failed')); });
+
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    if (timing === 'while starting') {
+      await act(async () => { finishBegin(nextChallenge); });
+    }
+    const nextForm = screen.getByRole('form', { name: 'Confirm recovery phrase' });
+    expect(within(nextForm).getByRole('textbox', { name: 'Word 2' })).toHaveValue('');
+    expect(screen.getByText('Enter the four requested words from the phrase you saved.')).toBeInTheDocument();
+    for (const canary of recoveryCanaries) expect(document.documentElement.outerHTML).not.toContain(canary);
+  });
+
+  it('ignores an old expiry cleanup failure after the gateway changes', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    const gateway = new FakeDeviceGateway();
+    let rejectExpiredCancel!: (error: Error) => void;
+    vi.spyOn(gateway, 'recoveryEnrollmentCancel').mockImplementationOnce(() => new Promise<void>((_resolve, reject) => {
+      rejectExpiredCancel = reject;
+    }));
+    const view = render(<DevicesScreen gateway={gateway} />);
+    await act(async () => undefined);
+    fireEvent.click(screen.getByRole('button', { name: 'Set up recovery' }));
+    await act(async () => undefined);
+    vi.setSystemTime(601_000);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+
+    view.rerender(<DevicesScreen gateway={new FakeDeviceGateway()} />);
+    await act(async () => undefined);
+    await act(async () => { rejectExpiredCancel(new Error('old gateway cleanup failed')); });
+
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Set up recovery' })).toBeEnabled();
+  });
+
   it('expires a memory-only challenge at the exact deadline and clears its words', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(1_000);

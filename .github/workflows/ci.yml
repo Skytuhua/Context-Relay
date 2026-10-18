@@ -84,7 +84,21 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+      - name: Verify Rust test scope contract
+        run: node --test scripts/rust-test-scope.test.mjs
+      - name: Determine whether Rust tests are needed
+        id: rust_scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          CURRENT_SHA: ${{ github.sha }}
+          FORCE_RUST_TESTS: ${{ inputs.semgrep_release_qualification }}
+        run: node scripts/rust-test-scope.mjs
       - if: ${{ runner.os == 'Windows' }}
         shell: pwsh
         run: if ($env:RUNNER_ARCH -ne 'X64') { throw 'Windows x64 runner is required' }
@@ -113,9 +127,11 @@ jobs:
           root="$(cd "$mount" && pwd -P)"
           printf 'CONTEXT_RELAY_CASE_SENSITIVE_APFS_ROOT=%s\n' "$root" >> "$GITHUB_ENV"
       - run: rustup show
-      - if: ${{ runner.os == 'macOS' }}
+      # Keep the required job visible; only an explicit safe decision skips tests.
+      - if: ${{ runner.os == 'macOS' && steps.rust_scope.outputs.run_tests != 'false' }}
         run: cargo test --manifest-path crates/native-runner/tests/macos-launcher-harness/Cargo.toml --test guardian_native -- --nocapture
-      - run: cargo test --workspace --all-targets --features "${{ env.ORDINARY_RUST_FEATURES }}"
+      - if: ${{ steps.rust_scope.outputs.run_tests != 'false' }}
+        run: cargo test --workspace --all-targets --features "${{ env.ORDINARY_RUST_FEATURES }}"
 
   daemon-boundary:
     permissions:
@@ -130,6 +146,27 @@ jobs:
           node-version-file: .node-version
       - run: node --test scripts/check-daemon-boundary.test.mjs
       - run: node scripts/check-daemon-boundary.mjs
+
+  script-contracts:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+      - run: npm install --global pnpm@11.9.0
+      - run: pnpm install --frozen-lockfile
+      - name: Run release and packaging contract tests
+        # These suites assert the security properties of the packaging, hydration
+        # and Semgrep bundle scripts. They need no Rust toolchain, network or
+        # Docker, so they run as their own independent gate. hydrate-sidecars
+        # and prepare-semgrep-runtime are covered by the native jobs that
+        # actually execute those scripts.
+        run: node --test scripts/apply-semgrep-source-patches.test.mjs scripts/check-license-metadata.test.mjs scripts/ci-gates-workflow.test.mjs scripts/finalize-semgrep-native-release.test.mjs scripts/native-ci-workflow.test.mjs scripts/native-smoke-evidence.test.mjs scripts/package-macos.test.mjs scripts/package-windows.test.mjs scripts/reseal-semgrep-source-bundle.test.mjs scripts/search-resources.test.mjs scripts/secret-scan-workflow.test.mjs scripts/semgrep-source-bundle.test.mjs scripts/semgrep-source-inventory.test.mjs scripts/supabase-workflow.test.mjs scripts/tauri-assets.test.mjs scripts/windows-preview.test.mjs
 
   bindings:
     permissions:
@@ -371,7 +408,7 @@ jobs:
     outputs:
       changed: ${{ steps.changes.outputs.changed }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -425,13 +462,13 @@ jobs:
       CONTEXT_RELAY_SETUP_NODE_ACTION_SHA: 49933ea5288caeca8642d1e84afbd3f7d6820020
       CONTEXT_RELAY_SETUP_OCAML_ACTION_SHA: 3e4c6ff8c9a04c9ec8f6f87701cd4b661b0f1f18
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version-file: .node-version
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: semgrep/semgrep
           ref: bd614accba811b407ae5c9ec6f1eecd3bdc29911
@@ -439,7 +476,7 @@ jobs:
           submodules: recursive
           fetch-depth: 1
           persist-credentials: false
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: ocaml/opam-repository
           ref: 78d29aba187e8362b8ab86c189790c0af9153d4b
@@ -595,25 +632,25 @@ jobs:
     runs-on: windows-2025
     timeout-minutes: 180
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version-file: .node-version
-      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         if: ${{ inputs.semgrep_artifact_run_id == '' }}
         with:
           name: task9-semgrep-windows-build-a-${{ github.sha }}-${{ github.run_id }}${{ inputs.semgrep_release_qualification && format('-{0}', github.run_attempt) || '' }}
           path: ${{ runner.temp }}/context-relay-semgrep-output-windows
-      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         if: ${{ inputs.semgrep_artifact_run_id != '' }}
         with:
           name: task9-semgrep-windows-build-a-${{ inputs.semgrep_artifact_commit }}-${{ inputs.semgrep_artifact_run_id }}
           path: ${{ runner.temp }}/context-relay-semgrep-output-windows
           run-id: ${{ inputs.semgrep_artifact_run_id }}
           github-token: ${{ github.token }}
-      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         if: ${{ inputs.semgrep_release_qualification }}
         with:
           name: task9-semgrep-windows-build-b-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -731,13 +768,13 @@ jobs:
       CONTEXT_RELAY_SETUP_NODE_ACTION_SHA: 49933ea5288caeca8642d1e84afbd3f7d6820020
       CONTEXT_RELAY_SETUP_OCAML_ACTION_SHA: a739c5405d73c42ef15a9dc995efc0f87396cc36
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version-file: .node-version
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: semgrep/semgrep
           ref: bd614accba811b407ae5c9ec6f1eecd3bdc29911
@@ -745,7 +782,7 @@ jobs:
           submodules: recursive
           fetch-depth: 1
           persist-credentials: false
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: ocaml/opam-repository
           ref: 78d29aba187e8362b8ab86c189790c0af9153d4b
@@ -829,25 +866,25 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 180
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version-file: .node-version
-      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         if: ${{ inputs.semgrep_artifact_run_id == '' }}
         with:
           name: task9-semgrep-macos-build-a-${{ github.sha }}-${{ github.run_id }}${{ inputs.semgrep_release_qualification && format('-{0}', github.run_attempt) || '' }}
           path: ${{ runner.temp }}/context-relay-semgrep-output-macos
-      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         if: ${{ inputs.semgrep_artifact_run_id != '' }}
         with:
           name: task9-semgrep-macos-build-a-${{ inputs.semgrep_artifact_commit }}-${{ inputs.semgrep_artifact_run_id }}
           path: ${{ runner.temp }}/context-relay-semgrep-output-macos
           run-id: ${{ inputs.semgrep_artifact_run_id }}
           github-token: ${{ github.token }}
-      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         if: ${{ inputs.semgrep_release_qualification }}
         with:
           name: task9-semgrep-macos-build-b-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}

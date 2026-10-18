@@ -18,6 +18,8 @@ interface Props {
   progress: SetupProgress;
   onChange: (progress: SetupProgress) => void;
   onProjectSaved: (project: ProjectIdentity) => void;
+  initialProjectDraft?: { name: string; path: string };
+  onProjectDraft?: (draft: { name: string; path: string }) => void;
   onFinishLater: () => void;
   onTour: () => void;
   onSkipTour?: () => void;
@@ -28,12 +30,15 @@ interface Props {
   operationBusy?: boolean;
 }
 
-export function SetupWizard({ gateway, projects, progress, onChange, onProjectSaved, onFinishLater, onTour, onSkipTour, onOpenGuide, renderConnection, renderTest, testComplete = false, operationBusy = false }: Props) {
+export function SetupWizard({ gateway, projects, progress, onChange, onProjectSaved, initialProjectDraft, onProjectDraft, onFinishLater, onTour, onSkipTour, onOpenGuide, renderConnection, renderTest, testComplete = false, operationBusy = false }: Props) {
   const [reports, setReports] = useState<Partial<Record<HarnessId, ProbeReport | 'failed'>>>({});
   const [refresh, setRefresh] = useState(0);
   const [projectBusy, setProjectBusy] = useState(false);
   const [activeHarness, setActiveHarness] = useState<HarnessId>('codex');
   const [setupStates, setSetupStates] = useState<Partial<Record<HarnessId, string>>>({});
+  // Tracked separately from the label because the label is presentational text and
+  // the wizard's gate needs the actual saved state.
+  const [appliedHarnesses, setAppliedHarnesses] = useState<Partial<Record<HarnessId, boolean>>>({});
   const heading = useRef<HTMLHeadingElement>(null);
   const index = STEPS.findIndex(step => step.id === progress.step);
   useEffect(() => {
@@ -41,15 +46,19 @@ export function SetupWizard({ gateway, projects, progress, onChange, onProjectSa
     let active = true;
     const controller = new AbortController();
     setSetupStates({});
+    setAppliedHarnesses({});
     void projectHarnessSetups(gateway, progress.projectId, controller.signal).then(records => {
       if (!active) return;
       const next: Partial<Record<HarnessId, string>> = {};
+      const applied: Partial<Record<HarnessId, boolean>> = {};
       for (const record of records) {
         if (record.harness === 'hermes' && record.harnessProfile !== progress.hermesProfile) continue;
         next[record.harness] = record.state === 'applied' ? 'Settings saved · test next' : record.state === 'previewed' ? 'Review ready · save next' : record.state === 'rolled_back' ? 'Setup undone' : 'Needs review';
+        applied[record.harness] = record.state === 'applied';
       }
       setSetupStates(next);
-    }).catch(() => { if (active) setSetupStates({}); });
+      setAppliedHarnesses(applied);
+    }).catch(() => { if (active) { setSetupStates({}); setAppliedHarnesses({}); } });
     return () => { active = false; controller.abort(); };
   }, [gateway, progress.step, progress.projectId, progress.hermesProfile, operationBusy]);
   const project = projects.find(item => item.projectId === progress.projectId);
@@ -70,9 +79,15 @@ export function SetupWizard({ gateway, projects, progress, onChange, onProjectSa
 
   function update(patch: Partial<SetupProgress>) { onChange({ ...progress, ...patch, status: 'in_progress' }); }
   function step(id: SetupStep) { update({ step: id }); }
+  // Leaving this step requires settings actually saved for a selected harness.
+  // Advancing without saving reaches the test step, where Continue depends on a
+  // verified read that no connected harness can produce, leaving the wizard
+  // permanently blocked with no explanation.
+  const connected = progress.harnesses.some(id => appliedHarnesses[id]);
   const canContinue = !projectBusy && (progress.step === 'harnesses' ? progress.harnesses.length > 0
-    : progress.step === 'project' || progress.step === 'connect' ? !!project && progress.harnesses.length > 0
-      : progress.step === 'test' ? testComplete : true);
+    : progress.step === 'project' ? !!project
+      : progress.step === 'connect' ? !!project && connected
+        : progress.step === 'test' ? testComplete : true);
 
   return <div className="onboarding-shell">
     <aside className="onboarding-rail">
@@ -108,13 +123,13 @@ export function SetupWizard({ gateway, projects, progress, onChange, onProjectSa
         {projects.length > 0 && <fieldset><legend>Use an existing project</legend>{projects.map(item => <label className="status-row" key={item.projectId}>
           <input type="radio" name="setup-project" checked={progress.projectId === item.projectId} onChange={() => update({ projectId: item.projectId, noteId: null, checkId: null })} />{item.name}
         </label>)}</fieldset>}
-        <ProjectForm gateway={gateway} ready onBusy={setProjectBusy} onSaved={item => { onProjectSaved(item); update({ projectId: item.projectId, noteId: null, checkId: null }); }} />
+        <ProjectForm gateway={gateway} ready onBusy={setProjectBusy} initialDraft={initialProjectDraft} onDraft={onProjectDraft} onSaved={item => { onProjectSaved(item); update({ projectId: item.projectId, noteId: null, checkId: null }); }} />
       </section>}
       {(progress.step === 'connect' || progress.step === 'test') && (!project || !harness ? <section>
         <p>Choose a project to continue. Your previous selection may no longer be available.</p><button type="button" onClick={() => step(progress.harnesses.length ? 'project' : 'harnesses')}>Choose a project</button>
       </section> : progress.step === 'connect' ? <section>
         <p>Connect each harness to <strong>{project.name}</strong>. Review the changes before saving. Approvals in the harness may still be required afterward.</p>
-        <div className="context-tabs" aria-label="Selected harnesses">{progress.harnesses.map(id => <button type="button" disabled={operationBusy} key={id} aria-pressed={harness === id} onClick={() => setActiveHarness(id)}><span>{HARNESS_NAMES[id]}</span><small>{setupStates[id] ?? 'Review setup'}</small></button>)}</div>
+        <div className="context-tabs" aria-label="Selected harnesses">{progress.harnesses.map(id => <button type="button" disabled={operationBusy} key={id} aria-pressed={harness === id} onClick={() => setActiveHarness(id)}><span>{HARNESS_NAMES[id]}</span>{' '}<small>{setupStates[id] ?? 'Review setup'}</small></button>)}</div>
         {renderConnection(project, harness)}
       </section> : renderTest(project, progress.harnesses))}
       {progress.step === 'tour' && <section className="help-content">

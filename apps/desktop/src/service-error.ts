@@ -32,10 +32,10 @@ const UNREACHABLE_CODES = new Set(['timeout', 'busy', 'connection_refused', 'pip
 // connection failure, so it is matched literally rather than left to guesswork.
 const SERVICE_UNAVAILABLE = 'The local service is unavailable';
 const NOT_RUNNING = new RegExp(
-  `daemon|service[_ ](?:is[_ ])?not[_ ](?:running|started)|not running|no such (?:file|process)|${SERVICE_UNAVAILABLE}`,
+  `(?:daemon|service)[_ ](?:is[_ ])?not[_ ](?:running|started)|not running|no such process|${SERVICE_UNAVAILABLE}`,
   'i',
 );
-const UNREACHABLE = /connect|pipe|socket|timeout|timed out|unreachable|broken pipe|network/i;
+const UNREACHABLE = /connect|pipe|socket|timeout|timed out|did not respond in time|unreachable|broken pipe|network/i;
 
 /**
  * Turns a failure from the first connection attempt into something actionable.

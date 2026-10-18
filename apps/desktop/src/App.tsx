@@ -1,5 +1,5 @@
 import { AccountLifecyclePanel } from './account-lifecycle';
-import { type FormEvent, useCallback, useEffect, useRef, useState } from 'react';
+import { type FormEvent, type ReactNode, useCallback, useEffect, useRef, useState } from 'react';
 
 import type {
   MemoryCandidate,
@@ -26,6 +26,7 @@ import { useSearchProgress } from './use-search-progress';
 import { useScopedEditor } from './use-scoped-editor';
 import { connectionFailureGuidance, type ConnectionFailureGuidance } from './service-error';
 import { LocalWorkspaceGateway, RecoveryStorageFullError, type WorkspaceGateway } from './workspace';
+import { ErrorBoundary } from './error-boundary';
 
 type ScreenId =
   | 'home'
@@ -168,7 +169,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
     const timeout = window.setTimeout(() => {
       active = false;
       setConnectionFailure(
-        connectionFailureGuidance({ detail: 'the local service did not respond in time' }),
+        connectionFailureGuidance({ code: 'timeout' }),
       );
       setConnectionState('failed');
     }, STARTUP_TIMEOUT_MS);
@@ -222,6 +223,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
   }, [activeScreen, submittedSearch, searchRevision, searchProjectId, gateway, connectionState]);
 
   if (!currentScreen) return null;
+  const screenResetKey = `${activeScreen}:${activeProject?.projectId ?? 'global'}`;
 
   function transitionProject(project: ProjectIdentity | null) {
     if (project?.projectId !== activeProject?.projectId) {
@@ -689,6 +691,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
     {preferenceError && <p className="form-error" role="alert">{preferenceError}</p>}
     {error && <p className="form-error" role="alert">{error}</p>}
     <SetupWizard gateway={gateway} projects={projects} progress={preferences.setup}
+      initialProjectDraft={projectDraft.current} onProjectDraft={draft => { projectDraft.current = draft; }}
       onChange={next => { if (next.projectId !== preferences.setup.projectId) { setTestVerified(false); const project = projects.find(item => item.projectId === next.projectId); if (project || next.projectId === null) transitionProject(project ?? null); } updateSetup(next); }}
       onProjectSaved={project => { setProjects(current => current.some(item => item.projectId === project.projectId) ? current : [...current, project]); transitionProject(project); }}
       onFinishLater={() => updateSetup({ ...preferences.setup, status: 'deferred' })}
@@ -766,22 +769,27 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
           </div>}
           {saving && SAVE_MESSAGES[saving] && <p role="status">{SAVE_MESSAGES[saving]}</p>}
           {recordsLoading && <p role="status">Loading your saved records…</p>}
-          {renderScreen(activeScreen)}
-          {recoveryStorageFull && activeScreen !== 'home' && <WriteRecovery gateway={gateway} projects={projects} onBusy={recoveryBusy} onConfirmed={() => {
+          <ErrorBoundary label={currentScreen.label} resetKey={screenResetKey}><ScreenContent render={() => renderScreen(activeScreen)} /></ErrorBoundary>
+          {recoveryStorageFull && activeScreen !== 'home' && <ErrorBoundary label="Write recovery" resetKey={screenResetKey}><WriteRecovery gateway={gateway} projects={projects} onBusy={recoveryBusy} onConfirmed={() => {
             if (activeScreen === 'memory' || activeScreen === 'tasks') refreshSavedRecords(activeScreen === 'memory' ? 'memory' : 'task', activeProject?.projectId ?? null);
             else if (activeScreen === 'review') refreshSavedRecords('review', activeProject?.projectId ?? null);
-          }} />}
+          }} /></ErrorBoundary>}
           <div hidden={activeScreen !== 'harnesses'}>
-            <HarnessesScreen gateway={gateway} projects={projects} preferredProjectId={activeProject?.projectId} onProjectChange={(id) => {
+            <ErrorBoundary label="Harnesses" resetKey={screenResetKey}><HarnessesScreen gateway={gateway} projects={projects} preferredProjectId={activeProject?.projectId} onProjectChange={(id) => {
               const project = projects.find((item) => item.projectId === id);
               if (project) selectProject(project);
-            }} onAddProject={() => void selectScreen('projects')} onSaveContext={() => { setCreatingContext(true); setEditingMemory(null); void selectScreen('memory'); }} active={activeScreen === 'harnesses'} />
+            }} onAddProject={() => void selectScreen('projects')} onSaveContext={() => { setCreatingContext(true); setEditingMemory(null); void selectScreen('memory'); }} active={activeScreen === 'harnesses'} /></ErrorBoundary>
           </div>
           </div>
         </main>
       </div>
     </>
   );
+}
+
+// Evaluate screen rendering inside the boundary, including inline record lists.
+function ScreenContent({ render }: { render: () => ReactNode }) {
+  return render();
 }
 
 function Field({
