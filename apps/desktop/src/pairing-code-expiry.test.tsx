@@ -58,16 +58,21 @@ it('tells the user a code expired instead of showing 0 seconds remaining', async
 
   // Cross the expiry.
   await vi.advanceTimersByTimeAsync(2 * MINUTE);
-  await waitFor(() => expect(screen.getByText('This code expired. Generate a new one to pair another device.')).toBeTruthy());
+  await waitFor(() => expect(screen.getByText('This code expired. Close this pairing, then create a new code.')).toBeTruthy());
   expect(screen.queryByText(/0 seconds remaining/)).toBeNull();
 });
 
-it('offers a way to get a new code once the old one expired', async () => {
-  renderPairing(MINUTE);
+it('closes the expired pairing before offering a separate new code action', async () => {
+  const gateway = renderPairing(MINUTE);
   await createCode();
   await screen.findByText(/remaining$/);
   await vi.advanceTimersByTimeAsync(2 * MINUTE);
-  await waitFor(() => expect(screen.getByRole('button', { name: 'Generate a new code' })).toBeTruthy());
+  fireEvent.click(await screen.findByRole('button', { name: 'Close expired pairing' }));
+  await screen.findByRole('button', { name: 'Create pairing code' });
+  expect(gateway.cancelPairing).toHaveBeenCalledExactlyOnceWith('018f22e2-79b0-7cc8-98c4-dc0c0c075030');
+  expect(gateway.createPairingInvite).toHaveBeenCalledTimes(1);
+  expect(screen.queryByText('WXYZ-1234')).not.toBeInTheDocument();
+  expect(screen.getByText('Expired pairing closed. Select Create pairing code to try again.')).toBeInTheDocument();
 });
 
 it('keeps the ordinary label while the code is still valid', async () => {

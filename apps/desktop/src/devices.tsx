@@ -381,7 +381,7 @@ export function DevicesScreen({
       setApproval(null);
       setRejected(false);
       setAwaitingConfirmation(false);
-      setMessage(inviteExpired ? 'That code expired and this pairing was closed. Start again to generate a new one.' : 'Pairing canceled.');
+      setMessage(inviteExpired ? 'Expired pairing closed. Select Create pairing code to try again.' : 'Pairing canceled.');
     } catch (cause) {
       setError(safePairingError(cause, 'Pairing could not be canceled.'));
     } finally {
@@ -590,7 +590,7 @@ export function DevicesScreen({
             <h3>One-time pairing code</h3>
             <code className="pairing-code">{invite.code}</code>
             {inviteExpired ? (
-              <p role="status">This code expired. Generate a new one to pair another device.</p>
+              <p role="status">This code expired. Close this pairing, then create a new code.</p>
             ) : (
               <p>
                 Expires {formatTimestamp(invite.expiresAt)} · {formatRemaining(invite.expiresAt, nowMs)} remaining
@@ -602,7 +602,7 @@ export function DevicesScreen({
               onClick={() => void cancelPairing()}
               type="button"
             >
-              {inviteExpired ? 'Generate a new code' : 'Cancel pairing'}
+              {inviteExpired ? 'Close expired pairing' : 'Cancel pairing'}
             </button>
           </div>
         )}
