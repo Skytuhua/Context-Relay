@@ -40,6 +40,26 @@ beforeEach(() => {
   invoke.mockReset();
 });
 
+const listReads = [
+  { name: 'projects', kind: 'projects', field: 'projects', read: (gateway: LocalWorkspaceGateway) => gateway.projects() },
+  { name: 'memories', kind: 'memories', field: 'memories', read: (gateway: LocalWorkspaceGateway) => gateway.memories(null) },
+  { name: 'search', kind: 'memories', field: 'memories', read: (gateway: LocalWorkspaceGateway) => gateway.searchMemories('sign', null) },
+  { name: 'tasks', kind: 'tasks', field: 'tasks', read: (gateway: LocalWorkspaceGateway) => gateway.tasks(task.projectId) },
+  { name: 'candidates', kind: 'candidates', field: 'candidates', read: (gateway: LocalWorkspaceGateway) => gateway.candidates(null) },
+];
+
+it.each(listReads)('rejects a non-array $name result before it reaches a screen', async ({ kind, field, read }) => {
+  for (const malformed of ['', 'record', null, undefined, {}, 42]) {
+    invoke.mockResolvedValueOnce({ kind, data: { [field]: malformed } });
+    await expect(read(new LocalWorkspaceGateway())).rejects.toThrow(`invalid ${field} list from the local workspace`);
+  }
+});
+
+it.each(listReads)('accepts an empty $name list', async ({ kind, field, read }) => {
+  invoke.mockResolvedValueOnce({ kind, data: { [field]: [] } });
+  await expect(read(new LocalWorkspaceGateway())).resolves.toEqual([]);
+});
+
 it('accepts a well formed memory list', async () => {
   invoke.mockResolvedValueOnce({ kind: 'memories', data: { memories: [memory] } });
   await expect(new LocalWorkspaceGateway().memories(null)).resolves.toEqual([memory]);

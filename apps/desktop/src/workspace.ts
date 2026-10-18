@@ -832,10 +832,11 @@ function recoveryStatusResult(result: LocalResult) {
 }
 
 function validatedList<T>(
-  value: readonly T[],
+  value: unknown,
   assert: (item: unknown) => asserts item is T,
   field: string,
 ): T[] {
+  if (!Array.isArray(value)) throw new TypeError(`invalid ${field} list from the local workspace`);
   for (const item of value) {
     try {
       assert(item);
