@@ -599,19 +599,17 @@ mod tests {
             }
             cases.push(case);
         }
-        // The descendant writes `escaped` 1500ms after it starts, so waiting a
-        // fixed 1700ms raced that write whenever the machine was loaded. Poll
-        // for the deadline instead: the assertion below is about the file
-        // never appearing, and a bounded wait makes that a real guarantee
-        // rather than a bet on scheduling.
-        for case in &cases {
-            let deadline = Instant::now() + Duration::from_secs(20);
-            while Instant::now() < deadline {
-                if case.join("escaped").exists() {
-                    break;
-                }
-                thread::sleep(Duration::from_millis(50));
+        // Allow scheduler delays beyond the descendant's 1500ms write delay.
+        // Every case has started, so observe them together for one full window
+        // after the final probe instead of waiting 20 seconds for each case.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            if cases.iter().any(|case| case.join("escaped").exists()) {
+                break;
             }
+            thread::sleep(
+                Duration::from_millis(50).min(deadline.saturating_duration_since(Instant::now())),
+            );
         }
         for case in cases {
             assert!(
