@@ -84,7 +84,21 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+      - name: Verify Rust test scope contract
+        run: node --test scripts/rust-test-scope.test.mjs
+      - name: Determine whether Rust tests are needed
+        id: rust_scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          CURRENT_SHA: ${{ github.sha }}
+          FORCE_RUST_TESTS: ${{ inputs.semgrep_release_qualification }}
+        run: node scripts/rust-test-scope.mjs
       - if: ${{ runner.os == 'Windows' }}
         shell: pwsh
         run: if ($env:RUNNER_ARCH -ne 'X64') { throw 'Windows x64 runner is required' }
@@ -113,37 +127,11 @@ jobs:
           root="$(cd "$mount" && pwd -P)"
           printf 'CONTEXT_RELAY_CASE_SENSITIVE_APFS_ROOT=%s\n' "$root" >> "$GITHUB_ENV"
       - run: rustup show
-      - name: Skip the suite when nothing Rust changed
-        shell: bash
-        run: |
-          set -euo pipefail
-          # `Rust tests (windows-x64)` is a strict required check, so this job
-          # must always report success or failure — it cannot simply be skipped
-          # at the workflow level. Instead, detect Rust-relevant changes against
-          # the base commit and exit successfully when there are none. A
-          # frontend-only PR then costs minutes instead of ~3 hours.
-          base='${{ github.event.pull_request.base.sha }}'
-          if [ -n "$base" ]; then
-            # The checkout is shallow; deepen just enough to reach the base
-            # before deciding, so the skip never fires on a missing history.
-            git fetch --quiet --deepen=100 origin "$base" || true
-          fi
-          if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
-            echo 'No usable base commit; running the full suite.'
-            exit 0
-          fi
-          changed=$(git diff --name-only "$base" "$GITHUB_SHA" -- \
-            'crates/**' 'apps/desktop/src-tauri/**' 'Cargo.lock' 'Cargo.toml' \
-            '.cargo/**' 'rust-toolchain*' '.github/workflows/ci.yml' | wc -l)
-          echo "Rust-relevant changes: $changed"
-          if [ "$changed" -eq 0 ]; then
-            echo 'EVENT:NOTHING_RUST_CHANGED' >> "$GITHUB_STEP_SUMMARY"
-            echo 'No Rust-relevant files changed; skipping cargo test.'
-            exit 0
-          fi
-      - if: ${{ runner.os == 'macOS' }}
+      # Keep the required job visible; only an explicit safe decision skips tests.
+      - if: ${{ runner.os == 'macOS' && steps.rust_scope.outputs.run_tests != 'false' }}
         run: cargo test --manifest-path crates/native-runner/tests/macos-launcher-harness/Cargo.toml --test guardian_native -- --nocapture
-      - run: cargo test --workspace --all-targets --features "${{ env.ORDINARY_RUST_FEATURES }}"
+      - if: ${{ steps.rust_scope.outputs.run_tests != 'false' }}
+        run: cargo test --workspace --all-targets --features "${{ env.ORDINARY_RUST_FEATURES }}"
 
   daemon-boundary:
     permissions:
