@@ -3,7 +3,11 @@ import type { HarnessId, HarnessParams, HarnessSetupRecord, HarnessSetupState, H
 import { type HarnessGateway, validateHarnessPlan, validateHarnessProbe } from './harness-gateway';
 import { useHarnessExecution } from './use-harness-execution';
 import { useHarnessPreparation } from './use-harness-preparation';
-import { isServiceVersionMismatch, SERVICE_UPDATE_GUIDANCE } from './service-error';
+import {
+  connectionFailureGuidance,
+  isServiceVersionMismatch,
+  SERVICE_UPDATE_GUIDANCE,
+} from './service-error';
 import { copyHarnessCommand, harnessLaunchPresentation, openHarness } from './harness-launch';
 
 const harnessNames: Record<HarnessId, string> = { claude_code: 'Claude Code', codex: 'Codex', hermes: 'Hermes' };
@@ -514,8 +518,16 @@ function blockedSetupGuidance(harness: HarnessId, report: ProbeReport): string {
   return 'Local policy prevents automatic setup. Check the restrictions configured for this harness before trying again.';
 }
 
+const SERVICE_DOWN_GUIDANCE = 'The local workspace service is not running.';
+
 function setupError(error: unknown, harness: HarnessId) {
   if (isServiceVersionMismatch(error)) return SERVICE_UPDATE_GUIDANCE;
+  // When the local service is down, the harness is irrelevant and naming it sends
+  // the user to the wrong place. The daemon reports this as a generic
+  // "unavailable", so classify on the cause rather than the operation.
+  if (connectionFailureGuidance(error).reason === 'service-not-running') {
+    return `${SERVICE_DOWN_GUIDANCE} Close and reopen Context Relay, then review this setup again.`;
+  }
   // Map only known daemon errors to fixed guidance. Never display raw native output.
   if (error && typeof error === 'object' && 'code' in error && 'message' in error && error.code === 'not_found') {
     if (harness === 'claude_code' && error.message === 'Claude Code executable was not found') {
