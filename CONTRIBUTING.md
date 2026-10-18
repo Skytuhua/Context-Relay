@@ -16,13 +16,13 @@ pnpm install --frozen-lockfile
 
 ### Rust build memory
 
-Limit cargo's parallelism on machines with less than about 16 GB of free memory:
+On machines with limited free memory, reduce Cargo's parallelism:
 
 ```sh
 cargo build --workspace --all-targets -j 2
 ```
 
-The workspace pulls in SQLCipher and OpenSSL through the Tauri dependency graph. Building every target at default job counts can exhaust memory and kill a `rustc` process partway through, which then surfaces as unrelated `E0463: can't find crate for context_relay_core` errors on the next run rather than as an out-of-memory message. A killed compile leaves a partial `target/debug/deps`, so clear it if the follow-on errors do not go away. See [Debugging](#debugging) for the full symptom list.
+The workspace builds native dependencies including SQLCipher and OpenSSL. Compiling many targets at once can exhaust available memory. If a compiler process terminates without a Rust diagnostic, inspect the earlier build output and the operating system's resource reports, then retry with fewer jobs. See [Debugging](#debugging) for follow-on errors.
 
 ## Verification
 
@@ -47,17 +47,14 @@ Use `pnpm generate:bindings` after changing exported Rust protocol types, and co
 
 ### A Rust build dies with `E0463: can't find crate`
 
-This is almost always a killed compile, not a broken dependency graph. The sequence is:
+`E0463` means the compiler could not find a required crate. Start with the first error in the build log: a missing dependency, a toolchain or target mismatch, and an interrupted compilation require different fixes.
 
-1. `cargo build` stops with `error: could not compile '<crate>'` and a `rustc` line ending in `exit code 15`, with no preceding error in that crate
-2. the next run fails with `E0463` for `context_relay_core` or `context_relay_contextd`, in files you did not touch
-
-Rebuild with limited parallelism (`-j 2`, see [Rust build memory](#rust-build-memory)). If the `E0463` errors persist, the previous run left a partial artifact behind: remove `target/debug/deps` and rebuild. Do not "fix" this by changing dependency versions.
+If the previous build shows a compiler process was terminated, retry with limited parallelism (`-j 2`, see [Rust build memory](#rust-build-memory)). If the error persists and the log points to a stale artifact, use `cargo clean -p <affected-package>` with the same target directory, then rebuild that package. Check the diagnosis before cleaning a shared build directory or changing dependency versions.
 
 ### The frontend test suite cannot find a package
 
-A module resolves as `undefined` or `Cannot find package` after switching branches usually means a stale workspace symlink rather than a real dependency problem. `pnpm install --frozen-lockfile` in the repository root restores it; `--lockfile-only` does not, because it never links anything into `node_modules`.
+A `Cannot find package` error after switching branches can mean the installed dependency links no longer match the branch's lockfile. Run `pnpm install --frozen-lockfile` in the repository root to reconcile them, then retry the failing command. `--lockfile-only` updates the lockfile without installing packages into `node_modules`.
 
 ### A dialog test throws `showModal is not a function`
 
-The test environment implements neither `HTMLDialogElement.showModal` nor `close`. Stub both in `beforeEach` before rendering a component that opens a dialog.
+Check which dialog methods the installed test environment provides. When `HTMLDialogElement.showModal` or `close` is missing, stub the missing methods before rendering a component that opens a dialog, and restore them after the test. Keep assertions for opening, closing, and focus behavior so the stub does not hide a regression.
