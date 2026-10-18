@@ -18,21 +18,23 @@ test('Node dependency floor excludes every open patched advisory', async () => {
   assert.equal(desktop.devDependencies.ajv, '8.18.0');
   assert.equal(desktop.devDependencies.vite, '7.3.5');
   assert.equal(desktop.devDependencies.vitest, '4.1.11');
+  // This release removes fast-glob -> micromatch -> unpatched braces.
+  assert.equal(desktop.devDependencies['typescript-eslint'], '8.71.2');
   assert.match(
     workspace,
-    /overrides:\n  'brace-expansion@1\.1\.16': '1\.1\.18'\n  'brace-expansion@2\.1\.2': '2\.1\.4'\n  'esbuild@0\.27\.7': '0\.28\.1'\n  'browserslist@4\.28\.6': '4\.28\.7'\n  'fast-uri@3\.1\.3': '3\.1\.8'\n  'js-yaml@4\.3\.0': '4\.3\.2'\n  'nanoid@3\.3\.16': '3\.3\.18'\n  'postcss@8\.5\.19': '8\.5\.23'/,
+    /overrides:\n  'brace-expansion@>=1\.0\.0 <1\.1\.21': '1\.1\.21'\n  'brace-expansion@>=2\.0\.0 <2\.1\.7': '2\.1\.7'\n  'esbuild@0\.27\.7': '0\.28\.1'\n  'browserslist@4\.28\.6': '4\.28\.7'\n  'fast-uri@3\.1\.3': '3\.1\.8'\n  'js-yaml@4\.3\.0': '4\.3\.2'\n  'nanoid@3\.3\.16': '3\.3\.18'\n  'postcss@8\.5\.19': '8\.5\.23'\n  'source-map-js@<1\.2\.2': '1\.2\.2'/,
   );
 
   for (const fixed of [
     'ajv@8.18.0',
     'browserslist@4.28.7',
-    'brace-expansion@1.1.18',
-    'brace-expansion@2.1.4',
+    'brace-expansion@1.1.21',
     'esbuild@0.28.1',
     'fast-uri@3.1.8',
     'js-yaml@4.3.2',
     'nanoid@3.3.18',
     'postcss@8.5.23',
+    'source-map-js@1.2.2',
     'vite@7.3.5',
     'vitest@4.1.11',
     '@vitest/mocker@4.1.11',
@@ -45,6 +47,6 @@ test('Node dependency floor excludes every open patched advisory', async () => {
 
   assert.doesNotMatch(
     resolvedLockfile,
-    /(?:ajv@8\.17\.1|brace-expansion@1\.1\.1[0-7]|brace-expansion@2\.1\.[0-3]|esbuild@0\.27\.|fast-uri@3\.1\.[0-5]|js-yaml@4\.[0-2]\.|js-yaml@4\.3\.[01]|nanoid@3\.3\.(?:[0-9]|1[0-7])|postcss@8\.5\.(?:[0-9]|1[0-9]|2[0-2])|vite@7\.[0-2]\.|vite@7\.3\.[0-4]|vitest@3\.2\.[0-5])(?=:|\()/,
+    /(?:ajv@8\.17\.1|brace-expansion@1\.(?:0\.\d+|1\.(?:[0-9]|1[0-9]|20))|brace-expansion@2\.(?:0\.\d+|1\.[0-6])|braces@(?:[0-2]\.\d+\.\d+|3\.0\.[0-3])|esbuild@0\.27\.\d+|fast-uri@3\.1\.[0-7]|js-yaml@4\.[0-2]\.\d+|js-yaml@4\.3\.[01]|nanoid@3\.3\.(?:[0-9]|1[0-7])|postcss@8\.5\.(?:[0-9]|1[0-9]|2[0-2])|source-map-js@(?:0\.\d+\.\d+|1\.[01]\.\d+|1\.2\.[01])|vite@7\.[0-2]\.\d+|vite@7\.3\.[0-4]|vitest@3\.2\.[0-5])(?=:|\()/,
   );
 });
