@@ -16,6 +16,18 @@ describe('connectionFailureGuidance', () => {
     expect(connectionFailureGuidance(new Error('connect failed: broken pipe')).reason).toBe('service-unreachable');
   });
 
+  it('does not interpret every mention of the daemon as a stopped service', () => {
+    expect(connectionFailureGuidance(new Error('daemon request timed out')).reason).toBe('service-unreachable');
+    expect(connectionFailureGuidance(new Error('daemon socket connect failed')).reason).toBe('service-unreachable');
+    expect(connectionFailureGuidance(new Error('daemon returned an unexpected reply')).reason).toBe('unknown');
+    expect(connectionFailureGuidance(new Error('no such file: a project folder')).reason).toBe('unknown');
+  });
+
+  it('classifies the bounded startup timeout as an unreachable service', () => {
+    expect(connectionFailureGuidance({ code: 'timeout' }).reason).toBe('service-unreachable');
+    expect(connectionFailureGuidance({ detail: 'the local service did not respond in time' }).reason).toBe('service-unreachable');
+  });
+
   it('reads a cause from code, reason or detail, not just message', () => {
     expect(connectionFailureGuidance({ code: 'service_not_running' }).reason).toBe('service-not-running');
     expect(connectionFailureGuidance({ reason: 'the local service is not running' }).reason).toBe('service-not-running');

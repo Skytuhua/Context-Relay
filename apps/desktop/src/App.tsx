@@ -168,7 +168,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
     const timeout = window.setTimeout(() => {
       active = false;
       setConnectionFailure(
-        connectionFailureGuidance({ detail: 'the local service did not respond in time' }),
+        connectionFailureGuidance({ code: 'timeout' }),
       );
       setConnectionState('failed');
     }, STARTUP_TIMEOUT_MS);

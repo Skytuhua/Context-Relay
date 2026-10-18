@@ -93,7 +93,7 @@ describe('App', () => {
     render(<App gateway={reconnectingGateway} />);
     await act(async () => { await vi.advanceTimersByTimeAsync(45_000); });
     expect(screen.queryByText('Opening your workspace…')).not.toBeInTheDocument();
-    expect(screen.getByRole('alert')).toBeVisible();
+    expect(screen.getByRole('alert')).toHaveTextContent('Context Relay could not reach the local workspace service.');
     stalled = false;
     fireEvent.click(screen.getByRole('button', { name: 'Retry connection' }));
     await act(async () => {});
