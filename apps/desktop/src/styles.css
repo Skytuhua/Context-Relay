@@ -201,6 +201,9 @@ summary { min-height: 28px; padding-block: 3px; }
 .onboarding-content > header h1, .onboarding-content > header p { margin: 0 0 8px; }
 .onboarding-content > header p { color: var(--color-muted); }
 .onboarding-content .screen-content { width: 100%; }
+.screen-error { max-width: 44rem; margin: 32px auto; padding: 24px; border: 1px solid var(--color-border); border-radius: var(--radius-panel); background: var(--color-surface); }
+.screen-error h2 { margin: 0 0 8px; }
+.screen-error p { margin: 0 0 16px; color: var(--color-muted); }
 .onboarding-footer { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-top: 0; padding-top: 16px; border-top: 1px solid var(--color-border); background: var(--color-canvas); }
 .onboarding-footer > div { display: flex; flex-wrap: wrap; gap: 8px; }
 .harness-choices { display: grid; gap: 8px; }
