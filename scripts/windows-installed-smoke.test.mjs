@@ -82,10 +82,15 @@ try {
 }
 Write-Output 'Driver AST, helper compilation, and path/hash refusal checks passed without product execution.'
 `;
+  // A pwsh -> Node -> Windows PowerShell launch otherwise inherits PowerShell
+  // 7 module paths. Let this child construct its native module search paths.
+  const childEnvironment = Object.fromEntries(
+    Object.entries(process.env).filter(([name]) => name.toUpperCase() !== 'PSMODULEPATH'),
+  );
   const result = spawnSync(join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
     ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', command], {
       encoding: 'utf8', timeout: 150_000, maxBuffer: 1024 * 1024,
-      env: { ...process.env, CONTEXT_RELAY_SMOKE_DRIVER: fileURLToPath(new URL('./windows-installed-smoke.ps1', import.meta.url)) },
+      env: { ...childEnvironment, CONTEXT_RELAY_SMOKE_DRIVER: fileURLToPath(new URL('./windows-installed-smoke.ps1', import.meta.url)) },
     });
   assert.ifError(result.error);
   assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
