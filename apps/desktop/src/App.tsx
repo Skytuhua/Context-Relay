@@ -1,5 +1,5 @@
 import { AccountLifecyclePanel } from './account-lifecycle';
-import { type FormEvent, useCallback, useEffect, useRef, useState } from 'react';
+import { type FormEvent, type ReactNode, useCallback, useEffect, useRef, useState } from 'react';
 
 import type {
   MemoryCandidate,
@@ -24,8 +24,9 @@ import { SearchProgress } from './search-progress';
 import { HostedSignIn } from './hosted-sign-in';
 import { useSearchProgress } from './use-search-progress';
 import { useScopedEditor } from './use-scoped-editor';
-import { isServiceVersionMismatch, SERVICE_UPDATE_GUIDANCE } from './service-error';
+import { connectionFailureGuidance, type ConnectionFailureGuidance } from './service-error';
 import { LocalWorkspaceGateway, RecoveryStorageFullError, type WorkspaceGateway } from './workspace';
+import { ErrorBoundary } from './error-boundary';
 
 type ScreenId =
   | 'home'
@@ -111,7 +112,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
   const [status, setStatus] = useState<StatusOutput | null>(null);
   const [connectionState, setConnectionState] = useState<'connecting' | 'ready' | 'failed'>('connecting');
   const [connectionAttempt, setConnectionAttempt] = useState(0);
-  const [serviceVersionMismatch, setServiceVersionMismatch] = useState(false);
+  const [connectionFailure, setConnectionFailure] = useState<ConnectionFailureGuidance | null>(null);
   const [projects, setProjects] = useState<ProjectIdentity[]>([]);
   const [activeProject, setActiveProject] = useState<ProjectIdentity | null>(null);
   const [memories, setMemories] = useState<MemoryRecord[]>([]);
@@ -162,11 +163,14 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
   useEffect(() => {
     let active = true;
     setConnectionState('connecting');
-    setServiceVersionMismatch(false);
+    setConnectionFailure(null);
     // Bound the initial reads even if the native bridge never settles. Retrying
     // these reads must not replay any workspace mutation or accept stale results.
     const timeout = window.setTimeout(() => {
       active = false;
+      setConnectionFailure(
+        connectionFailureGuidance({ code: 'timeout' }),
+      );
       setConnectionState('failed');
     }, STARTUP_TIMEOUT_MS);
     void Promise.all([gateway.status(), gateway.projects()])
@@ -181,7 +185,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
       .catch((failure: unknown) => {
         if (!active) return;
         window.clearTimeout(timeout);
-        setServiceVersionMismatch(isServiceVersionMismatch(failure));
+        setConnectionFailure(connectionFailureGuidance(failure));
         setConnectionState('failed');
       });
     return () => {
@@ -219,6 +223,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
   }, [activeScreen, submittedSearch, searchRevision, searchProjectId, gateway, connectionState]);
 
   if (!currentScreen) return null;
+  const screenResetKey = `${activeScreen}:${activeProject?.projectId ?? 'global'}`;
 
   function transitionProject(project: ProjectIdentity | null) {
     if (project?.projectId !== activeProject?.projectId) {
@@ -686,6 +691,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
     {preferenceError && <p className="form-error" role="alert">{preferenceError}</p>}
     {error && <p className="form-error" role="alert">{error}</p>}
     <SetupWizard gateway={gateway} projects={projects} progress={preferences.setup}
+      initialProjectDraft={projectDraft.current} onProjectDraft={draft => { projectDraft.current = draft; }}
       onChange={next => { if (next.projectId !== preferences.setup.projectId) { setTestVerified(false); const project = projects.find(item => item.projectId === next.projectId); if (project || next.projectId === null) transitionProject(project ?? null); } updateSetup(next); }}
       onProjectSaved={project => { setProjects(current => current.some(item => item.projectId === project.projectId) ? current : [...current, project]); transitionProject(project); }}
       onFinishLater={() => updateSetup({ ...preferences.setup, status: 'deferred' })}
@@ -746,7 +752,14 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
           {(activeScreen === 'memory' || activeScreen === 'review') && <div className="context-tabs" role="group" aria-label="Context views"><button type="button" aria-pressed={activeScreen === 'memory'} onClick={() => void selectScreen('memory')}>Saved</button><button type="button" aria-pressed={activeScreen === 'review'} onClick={() => void selectScreen('review')}>Suggestions</button></div>}
           {connectionState === 'failed' && (
             <div className="form-error" role="alert">
-              <p>{serviceVersionMismatch ? SERVICE_UPDATE_GUIDANCE : 'Could not connect to the local workspace. Retry the connection to continue.'}</p>
+              <p>{connectionFailure?.message ?? 'Could not connect to the local workspace.'}</p>
+              {connectionFailure && connectionFailure.steps.length > 0 && (
+                <ol className="recovery-steps">
+                  {connectionFailure.steps.map((step) => (
+                    <li key={step}>{step}</li>
+                  ))}
+                </ol>
+              )}
               <button onClick={() => setConnectionAttempt((attempt) => attempt + 1)} type="button">Retry connection</button>
             </div>
           )}
@@ -756,22 +769,27 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
           </div>}
           {saving && SAVE_MESSAGES[saving] && <p role="status">{SAVE_MESSAGES[saving]}</p>}
           {recordsLoading && <p role="status">Loading your saved records…</p>}
-          {renderScreen(activeScreen)}
-          {recoveryStorageFull && activeScreen !== 'home' && <WriteRecovery gateway={gateway} projects={projects} onBusy={recoveryBusy} onConfirmed={() => {
+          <ErrorBoundary label={currentScreen.label} resetKey={screenResetKey}><ScreenContent render={() => renderScreen(activeScreen)} /></ErrorBoundary>
+          {recoveryStorageFull && activeScreen !== 'home' && <ErrorBoundary label="Write recovery" resetKey={screenResetKey}><WriteRecovery gateway={gateway} projects={projects} onBusy={recoveryBusy} onConfirmed={() => {
             if (activeScreen === 'memory' || activeScreen === 'tasks') refreshSavedRecords(activeScreen === 'memory' ? 'memory' : 'task', activeProject?.projectId ?? null);
             else if (activeScreen === 'review') refreshSavedRecords('review', activeProject?.projectId ?? null);
-          }} />}
+          }} /></ErrorBoundary>}
           <div hidden={activeScreen !== 'harnesses'}>
-            <HarnessesScreen gateway={gateway} projects={projects} preferredProjectId={activeProject?.projectId} onProjectChange={(id) => {
+            <ErrorBoundary label="Harnesses" resetKey={screenResetKey}><HarnessesScreen gateway={gateway} projects={projects} preferredProjectId={activeProject?.projectId} onProjectChange={(id) => {
               const project = projects.find((item) => item.projectId === id);
               if (project) selectProject(project);
-            }} onAddProject={() => void selectScreen('projects')} onSaveContext={() => { setCreatingContext(true); setEditingMemory(null); void selectScreen('memory'); }} active={activeScreen === 'harnesses'} />
+            }} onAddProject={() => void selectScreen('projects')} onSaveContext={() => { setCreatingContext(true); setEditingMemory(null); void selectScreen('memory'); }} active={activeScreen === 'harnesses'} /></ErrorBoundary>
           </div>
           </div>
         </main>
       </div>
     </>
   );
+}
+
+// Evaluate screen rendering inside the boundary, including inline record lists.
+function ScreenContent({ render }: { render: () => ReactNode }) {
+  return render();
 }
 
 function Field({

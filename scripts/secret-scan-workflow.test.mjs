@@ -97,7 +97,7 @@ test('repository secret scan verifies pinned Gitleaks and scans every Git ref', 
   assert.match(source, /^\s+push:\s*$/m);
   assert.match(source, /branches:\s*\[main\]/);
   assert.match(source, /permissions:\s*\n\s+contents:\s*read/);
-  assert.match(source, /actions\/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10/);
+  assert.match(source, /actions\/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1/);
   assert.match(source, /fetch-depth:\s*0/);
   assert.match(source, /persist-credentials:\s*false/);
   assert.match(source, /gitleaks_8\.30\.1_windows_x64\.zip/);
@@ -116,7 +116,7 @@ test('repository secret scan verifies pinned Gitleaks and scans every Git ref', 
   const uses = [...source.matchAll(/^\s+- uses:\s*(\S+?)(?:\s+#.*)?\s*$/gm)]
     .map((match) => match[1]);
   assert.deepEqual(uses, [
-    'actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10',
+    'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1',
   ]);
 });
 

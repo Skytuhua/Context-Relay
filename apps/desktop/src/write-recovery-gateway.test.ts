@@ -1,7 +1,8 @@
 import { expect, it, vi } from 'vitest';
-import type { DesktopWrite, LocalRequest, LocalResult, MemoryCandidate, OperationId } from './bindings';
+import type { DesktopWrite, LocalRequest, LocalResult, MemoryRecord, OperationId } from './bindings';
 import { LocalClient } from './local-client';
 import { LocalWorkspaceGateway, RecoveryStorageFullError } from './workspace';
+import { fixtureCandidate, fixtureMemory } from './test-fixtures';
 
 it('reports preparation quota without sending the record mutation', async () => {
   const call = vi.fn().mockRejectedValue({ code: 'quota_exceeded' });
@@ -12,7 +13,7 @@ it('reports preparation quota without sending the record mutation', async () => 
 });
 
 it('requires an acknowledgment of the requested suggestion decision before clearing its copy', async () => {
-  const candidate = { id: '018f22e2-79b0-7cc8-98c4-dc0c0c075001' } as MemoryCandidate;
+  const candidate = fixtureCandidate();
   let state = 'pending';
   const call = vi.fn(async (request: LocalRequest) => request.method === 'candidate_review'
     ? { kind: 'candidates', data: { candidates: [{ ...candidate, state }] } } : { kind: 'empty' });
@@ -51,10 +52,22 @@ function fixture() {
         return { kind: 'empty' };
       case 'memory_create': {
         const id = request.params.operationId;
-        if (!records.has(id)) records.set(id, { id, revision: id, title: request.params.title });
+        if (!records.has(id)) {
+          records.set(id, fixtureMemory({
+            id: id as unknown as MemoryRecord['id'],
+            revision: id as unknown as MemoryRecord['revision'],
+            title: request.params.title,
+            bodyMarkdown: request.params.bodyMarkdown,
+          }));
+        }
         if (loseSave) { loseSave = false; throw new Error('save reply lost'); }
-        if (wrongSave) return { kind: 'memory', data: { memory: { id: 'another-record' } } } as LocalResult;
-        if (staleRevision) return { kind: 'memory', data: { memory: { id, revision: 'older-operation' } } } as unknown as LocalResult;
+        // Deliberately acknowledges a different record so the gateway must keep
+        // the recovery copy instead of treating the save as confirmed.
+        if (wrongSave) return { kind: 'memory', data: { memory: fixtureMemory({ title: 'another record' }) } } as LocalResult;
+        if (staleRevision) {
+          const current = records.get(id) as MemoryRecord;
+          return { kind: 'memory', data: { memory: { ...current, revision: '018f22e2-79b0-7cc8-98c4-dc0c0c079999' as MemoryRecord['revision'] } } } as LocalResult;
+        }
         return { kind: 'memory', data: { memory: records.get(id) } } as LocalResult;
       }
       default: throw new Error('unexpected request');
