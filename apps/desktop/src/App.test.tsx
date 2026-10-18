@@ -93,7 +93,7 @@ describe('App', () => {
     render(<App gateway={reconnectingGateway} />);
     await act(async () => { await vi.advanceTimersByTimeAsync(45_000); });
     expect(screen.queryByText('Opening your workspace…')).not.toBeInTheDocument();
-    expect(screen.getByRole('alert')).toBeVisible();
+    expect(screen.getByRole('alert')).toHaveTextContent('Context Relay could not reach the local workspace service.');
     stalled = false;
     fireEvent.click(screen.getByRole('button', { name: 'Retry connection' }));
     await act(async () => {});
@@ -110,8 +110,9 @@ describe('App', () => {
       return gateway.status();
     } }} />);
     const alert = await screen.findByRole('alert');
-    expect(alert).toHaveTextContent('Context Relay and its local service use different versions');
-    expect(alert).toHaveTextContent('run the latest installer');
+    expect(alert).toHaveTextContent('Context Relay and its local service are different versions');
+    // The cause is now explained as ordered steps rather than one long sentence.
+    expect(alert).toHaveTextContent('Run the latest installer.');
     expect(alert).not.toHaveTextContent('PRIVATE NATIVE DETAILS');
     fireEvent.click(screen.getByRole('button', { name: 'Projects' }));
     expect(screen.getByRole('button', { name: 'Add project' })).toBeDisabled();
