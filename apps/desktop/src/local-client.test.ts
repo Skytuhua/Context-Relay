@@ -77,7 +77,7 @@ it('opens the native folder picker without sending workspace mutations, includin
 it('forwards only the typed request through the local_request command', async () => {
   const response = { kind: 'projects', data: { projects: [] } } as const;
   invoke.mockResolvedValue(response);
-  const request = { method: 'projects_list', params: {} } as const;
+  const request = { method: 'sync_status', params: {} } as const;
 
   await expect(new LocalClient().call(request)).resolves.toEqual(response);
   expect(invoke).toHaveBeenCalledWith('local_request', { request });

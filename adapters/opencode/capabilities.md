@@ -120,9 +120,10 @@ construction, native-memory source qualification, and native CLI recovery do not
 gain an OpenCode authority path. MCP access gets a separate `opencode` policy row;
 vault migration 49 preserves all existing policies while allowing that identity.
 
-Local protocol 1.18 requires a coordinated desktop, daemon, and bridge upgrade.
+Local protocol 1.19 requires a coordinated desktop, daemon, and bridge upgrade.
 The normal handshake continues to require the exact current version; only the
-existing authenticated shutdown path recognizes 1.17 for an upgrade. Update other
+existing authenticated shutdown path recognizes prior local versions, including
+1.18, for an upgrade. Update other
 Context Relay devices before expecting them to consume records with OpenCode
 provenance.
 

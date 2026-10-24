@@ -21,6 +21,25 @@ it('registers the project identity and folder in one request', async () => {
   });
 });
 
+it('binds a local folder to the existing project ID without registering another project', async () => {
+  vi.spyOn(navigator, 'userAgent', 'get').mockReturnValue('Windows NT 10.0');
+  const projectId = '018f22e2-79b0-7cc8-98c4-dc0c0c073980';
+  await new LocalWorkspaceGateway().bindProjectFolder(projectId, '"C:\\Work\\Research 專案 🚀"');
+  expect(invoke).toHaveBeenCalledExactlyOnceWith('local_request', {
+    request: {
+      method: 'project_path_set',
+      params: { projectId, path: expect.objectContaining({ platform: 'windows', display: 'C:\\Work\\Research 專案 🚀' }) },
+    },
+  });
+  expect(Buffer.from(invoke.mock.calls[0][1].request.params.path.bytes, 'base64url').toString('utf16le')).toBe('C:\\Work\\Research 專案 🚀');
+});
+
+it('reports an unacknowledged folder binding without retrying it automatically', async () => {
+  invoke.mockRejectedValueOnce(new Error('response lost'));
+  await expect(new LocalWorkspaceGateway().bindProjectFolder('018f22e2-79b0-7cc8-98c4-dc0c0c073980', 'C:\\Work')).rejects.toThrow('response lost');
+  expect(invoke).toHaveBeenCalledTimes(1);
+});
+
 it('reuses the registration identity after an uncertain acknowledgment and never retries automatically', async () => {
   invoke.mockRejectedValueOnce(new Error('response lost')).mockResolvedValue({ kind: 'empty' });
   const gateway = new LocalWorkspaceGateway();

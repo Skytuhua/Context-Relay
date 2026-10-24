@@ -39,11 +39,11 @@ beforeEach(() => {
       protocol: { min: PROTOCOL_VERSION, max: PROTOCOL_VERSION }, vault: 'unlocked',
       resolvedProject: null, sync: 'offline', access: { mode: 'default' },
     } } };
-    if (request.method === 'projects_list') return { kind: 'projects', data: { projects } };
+    if (request.method === 'projects_list_page') return { kind: 'projects_page', data: { page: { projects, nextCursor: null } } };
     // Dashboard reads are separate from the mutation lifecycle recorded below.
-    if (request.method === 'memory_list') return { kind: 'memories', data: { memories: [] } };
-    if (request.method === 'tasks_list') return { kind: 'tasks', data: { tasks: [] } };
-    if (request.method === 'candidates_list') return { kind: 'candidates', data: { candidates: [] } };
+    if (request.method === 'memory_list_page') return { kind: 'memories_page', data: { page: { memories: [], nextCursor: null } } };
+    if (request.method === 'tasks_list_page') return { kind: 'tasks_page', data: { page: { tasks: [], nextCursor: null } } };
+    if (request.method === 'candidates_list_page') return { kind: 'candidates_page', data: { page: { candidates: [], nextCursor: null } } };
     // Discovery ordering and capabilities are exercised by harness-discovery.test.tsx.
     // This suite records the subsequent preview/apply/rollback lifecycle.
     if (request.method === 'harness_probe') return { kind: 'probe', data: { report: {

@@ -1364,17 +1364,42 @@ impl Vault {
         let transaction = self.connection.unchecked_transaction()?;
         let endpoint = super::membership::history(&transaction, super::membership::CURRENT_BUDGET)?
             .map(|h| h.endpoint());
+        // Pending device chains stop at blocked retries; decimal length ordering preserves u64s.
         let mut statement = transaction.prepare(
-            "SELECT outbox.operation_id, operations.payload_json, outbox.attempt_count
-             FROM outbox
-             JOIN operations ON operations.id = outbox.operation_id
-             WHERE outbox.next_attempt_ms <= ?1
-               AND (?3=0 OR EXISTS(SELECT 1 FROM sync_operation_meta WHERE operation_id=operations.id))
-               AND (
-                   outbox.safe_error_code IS NULL
-                   OR outbox.safe_error_code IN ('offline', 'transient')
+            "WITH pending AS (
+                 SELECT outbox.*, operations.payload_json,
+                        meta.operation_id AS signed_id,
+                        meta.account_id, meta.workspace_id, meta.device_id, meta.device_sequence,
+                        CASE WHEN meta.operation_id IS NULL
+                                  AND json_valid(CAST(operations.payload_json AS TEXT))
+                             THEN CAST(operations.payload_json AS TEXT) END AS legacy_json
+                 FROM outbox
+                 JOIN operations ON operations.id = outbox.operation_id
+                 LEFT JOIN sync_operation_meta AS meta ON meta.operation_id = operations.id
+             ), routed AS (
+                 SELECT operation_id, payload_json, attempt_count, next_attempt_ms,
+                        safe_error_code, queued_at, signed_id,
+                        COALESCE(account_id, json_extract(legacy_json, '$.accountId')) AS account_id,
+                        COALESCE(workspace_id, json_extract(legacy_json, '$.workspaceId')) AS workspace_id,
+                        COALESCE(device_id, json_extract(legacy_json, '$.deviceId')) AS device_id,
+                        COALESCE(device_sequence, json_extract(legacy_json, '$.deviceSequence')) AS device_sequence
+                 FROM pending
+             ), ordered AS (
+                 SELECT *, min(
+                     next_attempt_ms <= ?1
+                     AND (?3=0 OR signed_id IS NOT NULL)
+                     AND (safe_error_code IS NULL OR safe_error_code IN ('offline', 'transient'))
+                 ) OVER (
+                     PARTITION BY account_id, workspace_id, device_id
+                     ORDER BY length(device_sequence), device_sequence, queued_at, operation_id
+                     ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                 ) AS ready_prefix
+                 FROM routed
                )
-             ORDER BY outbox.next_attempt_ms, outbox.queued_at, outbox.operation_id
+             SELECT operation_id, payload_json, attempt_count
+             FROM ordered WHERE ready_prefix = 1
+             ORDER BY account_id, workspace_id, device_id,
+                      length(device_sequence), device_sequence, queued_at, operation_id
              LIMIT ?2",
         )?;
         let rows = statement.query_map(params![now_ms, limit, endpoint.is_some()], |row| {

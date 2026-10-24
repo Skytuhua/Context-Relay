@@ -282,7 +282,7 @@ fn list_and_upsert_are_project_scoped_and_status_filtered() {
 }
 
 #[test]
-fn oversized_filtered_task_list_errors_instead_of_returning_a_partial_prefix() {
+fn oversized_filtered_task_list_returns_complete_byte_bounded_pages() {
     let mut fixture = Fixture::new("task-list-output-budget", HarnessAccessPolicy::Default);
     for record in [60, 61, 62] {
         let mut task = fixture.insert_task(
@@ -296,12 +296,32 @@ fn oversized_filtered_task_list_errors_instead_of_returning_a_partial_prefix() {
         fixture.vault.put_task(&task).unwrap();
     }
 
-    let error = fixture
+    let first = fixture
         .call("context_relay_list_tasks", json!({"status": "open"}))
-        .unwrap_err();
-
-    assert_error(&error, ErrorCode::FrameTooLarge);
-    assert!(error.field_path.is_none());
+        .unwrap();
+    let mut ids = Vec::new();
+    let mut page = first;
+    loop {
+        assert!(serde_json::to_vec(&page).unwrap().len() < MAX_IPC_FRAME_BYTES / 4);
+        ids.extend(
+            page["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|task| task["id"].as_str().unwrap().to_owned()),
+        );
+        let Some(cursor) = page["nextCursor"].as_str() else {
+            break;
+        };
+        page = fixture
+            .call(
+                "context_relay_list_tasks",
+                json!({"status":"open", "cursor":cursor}),
+            )
+            .unwrap();
+        assert!(ids.len() < 4);
+    }
+    assert_eq!(ids, [id(60), id(61), id(62)]);
     assert_eq!(
         fixture
             .vault
@@ -310,6 +330,32 @@ fn oversized_filtered_task_list_errors_instead_of_returning_a_partial_prefix() {
             .len(),
         3
     );
+}
+
+#[test]
+fn task_list_reports_an_individual_record_that_cannot_fit_and_rejects_bad_cursors() {
+    let mut fixture = Fixture::new(
+        "task-list-single-output-budget",
+        HarnessAccessPolicy::Default,
+    );
+    let mut task = fixture.insert_task(
+        60,
+        fixture.project.project_id,
+        "Escaped task",
+        TaskStatus::Open,
+        Vec::new(),
+    );
+    task.body_markdown = format!("a{}", "\0".repeat(MAX_MARKDOWN_BYTES - 1));
+    fixture.vault.put_task(&task).unwrap();
+    let error = fixture
+        .call("context_relay_list_tasks", json!({}))
+        .unwrap_err();
+    assert_error(&error, ErrorCode::FrameTooLarge);
+    assert!(error.message.contains("record"));
+    let error = fixture
+        .call("context_relay_list_tasks", json!({"cursor":"invalid"}))
+        .unwrap_err();
+    assert_error(&error, ErrorCode::InvalidRequest);
 }
 
 #[test]

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type ReactNode } from 'react';
 import type { HarnessId, ProbeReport, ProjectIdentity } from './bindings';
 import type { SetupProgress, SetupStep } from './desktop-preferences';
 import { ProjectForm } from './project-form';
+import { ProjectFolderBinding } from './project-folder-binding';
 import type { WorkspaceGateway } from './workspace';
 import { HARNESS_NAMES, MANAGED_HARNESS_IDS } from './harness-names';
 import { projectHarnessSetups } from './harness-history';
@@ -138,10 +139,11 @@ export function SetupWizard({ gateway, projects, progress, onChange, onProjectSa
       </section>}
       {progress.step === 'project' && <section aria-label="Project selection">
         <p>A project is the folder you work in. Its saved context and tasks stay together, so your harness gets the right information.</p>
-        {projects.length > 0 && <fieldset><legend>Use an existing project</legend>{projects.map(item => <label className="status-row" key={item.projectId}>
-          <input type="radio" name="setup-project" disabled={projectBusy || operationBusy} checked={progress.projectId === item.projectId} onChange={() => update({ projectId: item.projectId, noteId: null, checkId: null })} />{item.name}
-        </label>)}</fieldset>}
-        <ProjectForm gateway={gateway} ready onBusy={setProjectBusy} initialDraft={initialProjectDraft} onDraft={onProjectDraft} onSaved={item => { onProjectSaved(item); update({ projectId: item.projectId, noteId: null, checkId: null }); }} />
+        {projects.length > 0 && <fieldset><legend>Use an existing project</legend>{projects.map(item => <div key={item.projectId}>
+          <label className="status-row"><input type="radio" name="setup-project" disabled={projectBusy || operationBusy} checked={progress.projectId === item.projectId} onChange={() => update({ projectId: item.projectId, noteId: null, checkId: null })} />{item.name}</label>
+          <ProjectFolderBinding gateway={gateway} project={item} ready={!projectBusy && !operationBusy} onBusy={setProjectBusy} />
+        </div>)}</fieldset>}
+        <ProjectForm gateway={gateway} ready disabled={projectBusy || operationBusy} onBusy={setProjectBusy} initialDraft={initialProjectDraft} onDraft={onProjectDraft} onSaved={item => { onProjectSaved(item); update({ projectId: item.projectId, noteId: null, checkId: null }); }} />
       </section>}
       {(progress.step === 'connect' || progress.step === 'test') && (!project || !harness ? <section>
         <p>Choose a project to continue. Your previous selection may no longer be available.</p><button type="button" onClick={() => step(progress.harnesses.length ? 'project' : 'harnesses')}>Choose a project</button>

@@ -281,6 +281,57 @@ test("chunked oversized requests stop reading at the cap before authentication",
   assert.deepEqual(calls, []);
 });
 
+for (const failure of ["read error", "non-byte chunk"]) {
+  test(`invalid body streams return a safe 400 (${failure})`, async () => {
+    const { createSyncEdgeHandler } = await loadCore();
+    const { deps, calls } = dependencies();
+    const body = new ReadableStream({
+      start(controller) {
+        if (failure === "read error") controller.error(new Error("private stream details"));
+        else {
+          controller.enqueue("private stream details");
+          controller.close();
+        }
+      },
+    });
+    const response = await createSyncEdgeHandler(deps)(
+      new Request("https://example.invalid/functions/v1/sync", {
+        method: "POST",
+        body,
+        duplex: "half",
+      }),
+    );
+    assert.equal(response.status, 400);
+    assert.deepEqual(await response.json(), { v: 1, error: "invalid_request" });
+    assert.deepEqual(calls, []);
+    assert.equal(body.locked, false);
+  });
+}
+
+test("the sync body cap stays authoritative when stream cancellation fails", async () => {
+  const { createSyncEdgeHandler, MAX_SYNC_REQUEST_BYTES } = await loadCore();
+  const { deps, calls } = dependencies();
+  const body = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new Uint8Array(MAX_SYNC_REQUEST_BYTES + 1));
+    },
+    cancel() {
+      throw new Error("private cancellation details");
+    },
+  });
+  const response = await createSyncEdgeHandler(deps)(
+    new Request("https://example.invalid/functions/v1/sync", {
+      method: "POST",
+      body,
+      duplex: "half",
+    }),
+  );
+  assert.equal(response.status, 413);
+  assert.deepEqual(await response.json(), { v: 1, error: "request_too_large" });
+  assert.deepEqual(calls, []);
+  assert.equal(body.locked, false);
+});
+
 test("operation push JSON is strict and rejects client ownership fields", async () => {
   const { createSyncEdgeHandler } = await loadCore();
   const { deps, calls } = dependencies();

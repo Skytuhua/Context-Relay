@@ -99,9 +99,17 @@ dto!(ArchiveMemoryOutput {
 dto!(ListTasksInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional, type = "TaskStatus | null")]
-    status: Option<TaskStatus>
+    status: Option<TaskStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "string | null")]
+    cursor: Option<String>
 });
-dto!(ListTasksOutput { tasks: Vec<TaskRecord> });
+dto!(ListTasksOutput {
+    tasks: Vec<TaskRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "string | null")]
+    next_cursor: Option<String>
+});
 dto!(UpsertTaskInput {
     operation_id: OperationId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -348,9 +356,9 @@ pub fn mcp_schema(name: &str) -> Option<McpToolSchema> {
         }
         "context_relay_list_tasks" => (
             vec![],
-            json!({"status":{"oneOf":[{"type":"null"},task_status()]}}),
+            json!({"status":{"oneOf":[{"type":"null"},task_status()]},"cursor":{"oneOf":[{"type":"null"},text(1,crate::MAX_LIST_CURSOR_BYTES)]}}),
             vec!["tasks"],
-            json!({"tasks":{"type":"array","maxItems":crate::MAX_BATCH_OPERATIONS,"items":task()}}),
+            json!({"tasks":{"type":"array","maxItems":crate::MAX_LIST_PAGE_ITEMS,"items":task()},"nextCursor":{"oneOf":[{"type":"null"},text(1,crate::MAX_LIST_CURSOR_BYTES)]}}),
         ),
         "context_relay_upsert_task" => {
             let op = operation();
@@ -461,7 +469,10 @@ fn validate_input(name: &str, value: &Value) -> Result<(), ValidationError> {
             required_text(&dto.markdown, "markdown", MAX_MARKDOWN_BYTES)
         }
         "context_relay_archive_memory" => parse::<ArchiveMemoryInput>(value, invalid),
-        "context_relay_list_tasks" => parse::<ListTasksInput>(value, invalid),
+        "context_relay_list_tasks" => {
+            let dto: ListTasksInput = parse_value(value, invalid)?;
+            crate::validate_list_cursor(dto.cursor.as_deref())
+        }
         "context_relay_upsert_task" => {
             let dto: UpsertTaskInput = parse_value(value, invalid)?;
             required_text(&dto.title, "title", MAX_TITLE_BYTES)?;
@@ -529,10 +540,11 @@ fn validate_output(name: &str, value: &Value) -> Result<(), ValidationError> {
             .validate(),
         "context_relay_list_tasks" => {
             let dto: ListTasksOutput = parse_value(value, invalid)?;
-            if dto.tasks.len() > crate::MAX_BATCH_OPERATIONS {
+            crate::validate_list_cursor(dto.next_cursor.as_deref())?;
+            if dto.tasks.len() > crate::MAX_LIST_PAGE_ITEMS {
                 return Err(ValidationError::TooLarge {
                     field: "tasks",
-                    limit: crate::MAX_BATCH_OPERATIONS,
+                    limit: crate::MAX_LIST_PAGE_ITEMS,
                 });
             }
             for item in &dto.tasks {

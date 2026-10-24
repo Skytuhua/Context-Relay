@@ -158,6 +158,8 @@ class FakeWorkspaceGateway implements WorkspaceGateway {
     return this.projectsValue;
   }
 
+  async bindProjectFolder() {}
+
   async createProject(name: string) {
     const project = {
       projectId: id('80'),

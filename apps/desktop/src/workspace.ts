@@ -136,6 +136,7 @@ export interface WorkspaceGateway extends DeviceGateway, HarnessGateway {
   status(): Promise<StatusOutput>;
   projects(): Promise<ProjectIdentity[]>;
   createProject(name: string, path: string): Promise<ProjectIdentity>;
+  bindProjectFolder(projectId: string, path: string): Promise<void>;
   memories(projectId: string | null): Promise<MemoryRecord[]>;
   createMemory(
     projectId: string | null,
@@ -584,6 +585,11 @@ export class LocalWorkspaceGateway implements WorkspaceGateway {
     if (result.kind !== 'empty') unexpected(result);
     this.pendingProject = null;
     return project;
+  }
+
+  async bindProjectFolder(projectId: string, path: string) {
+    const result = await this.call({ method: 'project_path_set', params: { projectId: projectId as ProjectId, path: nativePath(path) } });
+    if (result.kind !== 'empty') unexpected(result);
   }
 
   async memories(projectId: string | null) {

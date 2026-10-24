@@ -937,11 +937,13 @@ pub enum LocalRequest {
     NativeHookEvent(NativeHookEventParams),
     Unlock(EmptyParams),
     ProjectsList(EmptyParams),
+    ProjectsListPage(crate::ProjectsListPageParams),
     ProjectUpsert(ProjectUpsertParams),
     ProjectRegister(ProjectRegisterParams),
     ProjectPathSet(ProjectPathParams),
     MemoryGet(MemoryParams),
     MemoryList(MemoryListParams),
+    MemoryListPage(crate::MemoryListPageParams),
     MemorySearch(SearchParams),
     SearchIndexStatus(EmptyParams),
     SearchIndexRetry(EmptyParams),
@@ -949,8 +951,10 @@ pub enum LocalRequest {
     MemoryUpdate(MemoryUpdateParams),
     MemoryArchive(MemoryArchiveParams),
     CandidatesList(CandidateListParams),
+    CandidatesListPage(crate::CandidateListPageParams),
     CandidateReview(CandidateReviewParams),
     TasksList(ProjectParams),
+    TasksListPage(crate::TasksListPageParams),
     TaskUpsert(TaskUpsertParams),
     TaskComplete(TaskCompleteParams),
     TaskTransition(TaskTransitionParams),
@@ -1032,6 +1036,10 @@ fn validate_tags(tags: &[String]) -> Result<(), ValidationError> {
 impl LocalRequest {
     pub fn validate(&self) -> Result<(), ValidationError> {
         match self {
+            Self::ProjectsListPage(p) => crate::validate_list_cursor(p.cursor.as_deref()),
+            Self::MemoryListPage(p) => crate::validate_list_cursor(p.cursor.as_deref()),
+            Self::CandidatesListPage(p) => crate::validate_list_cursor(p.cursor.as_deref()),
+            Self::TasksListPage(p) => crate::validate_list_cursor(p.cursor.as_deref()),
             Self::RecoveryHistoryCandidates(p) => {
                 if p.accepted_endpoint_sha256.0 == [0; 32] {
                     return Err(ValidationError::Invalid("recovery endpoint"));
@@ -1547,6 +1555,18 @@ pub enum LocalResult {
         #[ts(type = "unknown")]
         output: serde_json::Value,
     },
+    ProjectsPage {
+        page: crate::ProjectsPage,
+    },
+    MemoriesPage {
+        page: crate::MemoriesPage,
+    },
+    CandidatesPage {
+        page: crate::CandidatesPage,
+    },
+    TasksPage {
+        page: crate::TasksPage,
+    },
     Projects {
         projects: Vec<ProjectIdentity>,
     },
@@ -1693,6 +1713,18 @@ enum LocalResultSerde {
     McpOutput {
         name: String,
         output: serde_json::Value,
+    },
+    ProjectsPage {
+        page: crate::ProjectsPage,
+    },
+    MemoriesPage {
+        page: crate::MemoriesPage,
+    },
+    CandidatesPage {
+        page: crate::CandidatesPage,
+    },
+    TasksPage {
+        page: crate::TasksPage,
     },
     Projects {
         projects: Vec<ProjectIdentity>,
@@ -1886,6 +1918,10 @@ impl LocalResult {
                 Ok(())
             }
             Self::McpOutput { name, output } => crate::validate_mcp_fixture(name, false, output),
+            Self::ProjectsPage { page } => page.validate(),
+            Self::MemoriesPage { page } => page.validate(),
+            Self::CandidatesPage { page } => page.validate(),
+            Self::TasksPage { page } => page.validate(),
             Self::Projects { projects } => {
                 for project in projects {
                     project.validate()?;

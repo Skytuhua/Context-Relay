@@ -122,6 +122,167 @@ fn native_folder(path: &Path) -> WireNativeValue {
     }
 }
 
+#[cfg(any(windows, target_os = "macos"))]
+#[tokio::test]
+async fn project_folder_binding_validates_and_preserves_existing_identity_after_restart() {
+    let engine = Arc::new(RecordingEngine::default());
+    let fixture = Fixture::start("project-folder-binding", engine.clone(), None).await;
+    let root = unique_temp_path("project-folder-binding-root");
+    std::fs::create_dir_all(&root).unwrap();
+    let moved = root.join("moved");
+    std::fs::create_dir(&moved).unwrap();
+    let file = root.join("file.txt");
+    std::fs::write(&file, "not a directory").unwrap();
+    let project = context_relay_protocol::ProjectIdentity {
+        project_id: PLAN.parse().unwrap(),
+        github_repository_id: None,
+        git_remote_fingerprint: None,
+        monorepo_subdirectory: None,
+        name: "Synced research".into(),
+    };
+    let bind = |path| {
+        LocalRequest::ProjectPathSet(context_relay_protocol::ProjectPathParams {
+            project_id: project.project_id,
+            path,
+        })
+    };
+    let mut installer = RawClient::connect(&fixture.runtime, ClientRole::Installer).await;
+    assert_eq!(
+        installer
+            .call(bind(native_folder(&root)))
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::ScopeDenied
+    );
+    let mut client = RawClient::connect(&fixture.runtime, ClientRole::Desktop).await;
+    assert_eq!(
+        client
+            .call(bind(native_folder(&root)))
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::NotFound
+    );
+    client
+        .call(LocalRequest::ProjectUpsert(
+            context_relay_protocol::ProjectUpsertParams {
+                project: project.clone(),
+            },
+        ))
+        .await
+        .unwrap();
+    client.call(bind(native_folder(&root))).await.unwrap();
+    client.call(bind(native_folder(&root))).await.unwrap();
+    let mut foreign = native_folder(&root);
+    foreign.platform = if cfg!(windows) {
+        NativePlatform::Macos
+    } else {
+        NativePlatform::Windows
+    };
+    for invalid in [
+        native_folder(&file),
+        native_folder(&root.join("missing")),
+        native_folder(Path::new(".")),
+        foreign,
+    ] {
+        assert_eq!(
+            client.call(bind(invalid)).await.unwrap_err().code,
+            ErrorCode::InvalidRequest
+        );
+    }
+    let config = fixture.stop().await;
+    config
+        .with_vault(|vault| {
+            assert_eq!(vault.projects()?, vec![project.clone()]);
+            assert_eq!(
+                vault.path(&project.project_id.to_string())?,
+                Some(native_folder(&root))
+            );
+            Ok(())
+        })
+        .unwrap();
+    let fixture = Fixture::from_config(config, engine).await;
+    let mut client = RawClient::connect(&fixture.runtime, ClientRole::Desktop).await;
+    client.call(bind(native_folder(&moved))).await.unwrap();
+    let config = fixture.stop().await;
+    config
+        .with_vault(|vault| {
+            assert_eq!(vault.projects()?, vec![project.clone()]);
+            assert_eq!(
+                vault.path(&project.project_id.to_string())?,
+                Some(native_folder(&moved))
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+#[tokio::test]
+async fn project_folder_binding_rejects_another_projects_canonical_directory() {
+    let fixture = Fixture::start(
+        "project-folder-duplicate",
+        Arc::new(RecordingEngine::default()),
+        None,
+    )
+    .await;
+    let root = unique_temp_path("project-folder-duplicate-root");
+    std::fs::create_dir_all(&root).unwrap();
+    let own = root.join("own");
+    std::fs::create_dir(&own).unwrap();
+    let project = |id: &str| context_relay_protocol::ProjectIdentity {
+        project_id: id.parse().unwrap(),
+        github_repository_id: None,
+        git_remote_fingerprint: None,
+        monorepo_subdirectory: None,
+        name: id.into(),
+    };
+    let mut client = RawClient::connect(&fixture.runtime, ClientRole::Desktop).await;
+    for (id, folder) in [(PLAN, &root), (ROLLBACK_PLAN, &own)] {
+        client
+            .call(LocalRequest::ProjectRegister(
+                context_relay_protocol::ProjectRegisterParams {
+                    project: project(id),
+                    path: native_folder(folder),
+                },
+            ))
+            .await
+            .unwrap();
+    }
+    let aliases = [
+        root.join("."),
+        if cfg!(windows) {
+            PathBuf::from(root.to_string_lossy().to_uppercase())
+        } else {
+            root.clone()
+        },
+    ];
+    for alias in aliases {
+        assert_eq!(
+            client
+                .call(LocalRequest::ProjectPathSet(
+                    context_relay_protocol::ProjectPathParams {
+                        project_id: ROLLBACK_PLAN.parse().unwrap(),
+                        path: native_folder(&alias),
+                    }
+                ))
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+    }
+    let config = fixture.stop().await;
+    config
+        .with_vault(|vault| {
+            assert_eq!(vault.path(ROLLBACK_PLAN)?, Some(native_folder(&own)));
+            assert_eq!(vault.path(PLAN)?, Some(native_folder(&root)));
+            Ok(())
+        })
+        .unwrap();
+}
+
 #[derive(Default)]
 struct RecordingEngine {
     #[cfg(all(windows, feature = "test-support"))]

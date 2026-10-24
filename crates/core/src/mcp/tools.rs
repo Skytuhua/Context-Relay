@@ -147,12 +147,15 @@ impl<'a> McpWorkspace<'a> {
         input: ListTasksInput,
     ) -> Result<ListTasksOutput, ClientError> {
         let project_id = resolved.access.require_tasks(false)?;
-        let tasks = self.workspace()?.tasks(project_id)?;
+        let page = self.vault.tasks_page(
+            project_id,
+            input.status,
+            input.cursor.as_deref(),
+            MCP_TOOL_OUTPUT_MAX_BYTES - 1024,
+        )?;
         let output = ListTasksOutput {
-            tasks: tasks
-                .into_iter()
-                .filter(|task| input.status.is_none_or(|status| task.status == status))
-                .collect(),
+            tasks: page.tasks,
+            next_cursor: page.next_cursor,
         };
         ensure_output_fits(&output)?;
         Ok(output)

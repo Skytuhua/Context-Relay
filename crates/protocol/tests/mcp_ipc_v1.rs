@@ -18,8 +18,8 @@ fn binding() -> McpBinding {
 fn status_output() -> serde_json::Value {
     json!({
         "protocol": {
-            "min": {"major": 1, "minor": 18},
-            "max": {"major": 1, "minor": 18}
+            "min": {"major": 1, "minor": 19},
+            "max": {"major": 1, "minor": 19}
         },
         "vault": "unlocked",
         "resolvedProject": null,

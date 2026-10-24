@@ -3,13 +3,14 @@ import type { FormEvent } from 'react';
 import type { ProjectIdentity } from './bindings';
 import type { WorkspaceGateway } from './workspace';
 
-export function ProjectForm({ gateway, ready, onSaved, onBusy, initialDraft, onDraft }: {
+export function ProjectForm({ gateway, ready, onSaved, onBusy, initialDraft, onDraft, disabled = false }: {
   gateway: WorkspaceGateway;
   ready: boolean;
   onSaved: (project: ProjectIdentity) => void;
   onBusy: (busy: boolean) => void;
   initialDraft?: { name: string; path: string };
   onDraft?: (draft: { name: string; path: string }) => void;
+  disabled?: boolean;
 }) {
   const [name, setName] = useState(initialDraft?.name ?? '');
   const [path, setPath] = useState(initialDraft?.path ?? '');
@@ -18,7 +19,7 @@ export function ProjectForm({ gateway, ready, onSaved, onBusy, initialDraft, onD
   const [error, setError] = useState<string | null>(null);
 
   async function chooseFolder() {
-    if (busyRef.current) return;
+    if (busyRef.current || disabled) return;
     busyRef.current = true;
     onBusy(true);
     setBusy('folder');
@@ -42,7 +43,7 @@ export function ProjectForm({ gateway, ready, onSaved, onBusy, initialDraft, onD
 
   async function save(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (busyRef.current || !ready) return;
+    if (busyRef.current || disabled || !ready) return;
     if (!name.trim() || !path.trim()) return setError('Choose a folder and give your project a name.');
     busyRef.current = true;
     onBusy(true);
@@ -66,17 +67,17 @@ export function ProjectForm({ gateway, ready, onSaved, onBusy, initialDraft, onD
   return <form aria-label="Add project" aria-describedby={error ? 'project-error' : 'project-help'} className="capture-form" onSubmit={save}>
     <h2>Add a project folder</h2>
     <p id="project-help">Choose the folder where you work with your harness. Context Relay keeps its saved context and tasks together.</p>
-    <button className="secondary-action" type="button" disabled={!!busy} onClick={() => void chooseFolder()}>{busy === 'folder' ? 'Choosing folder…' : 'Choose folder…'}</button>
+    <button className="secondary-action" type="button" disabled={!!busy || disabled} onClick={() => void chooseFolder()}>{busy === 'folder' ? 'Choosing folder…' : 'Choose folder…'}</button>
     <div className="field">
       <label htmlFor="project-folder">Project folder</label>
-      <input id="project-folder" name="path" value={path} disabled={!!busy} onChange={(event) => { setPath(event.target.value); onDraft?.({ name, path: event.target.value }); }} required placeholder="Choose a folder or paste its full path" />
+      <input id="project-folder" name="path" value={path} disabled={!!busy || disabled} onChange={(event) => { setPath(event.target.value); onDraft?.({ name, path: event.target.value }); }} required placeholder="Choose a folder or paste its full path" />
     </div>
     <div className="field">
       <label htmlFor="project-name">Project name</label>
-      <input id="project-name" name="name" value={name} disabled={!!busy} onChange={(event) => { setName(event.target.value); onDraft?.({ name: event.target.value, path }); }} required placeholder="For example, My website" />
+      <input id="project-name" name="name" value={name} disabled={!!busy || disabled} onChange={(event) => { setName(event.target.value); onDraft?.({ name: event.target.value, path }); }} required placeholder="For example, My website" />
     </div>
     {!ready && <p>Connect to the local workspace before adding the project.</p>}
     {error && <p id="project-error" className="form-error" role="alert">{error}</p>}
-    <button className="primary-action" type="submit" disabled={!!busy || !ready}>{busy === 'save' ? 'Adding project…' : 'Add project'}</button>
+    <button className="primary-action" type="submit" disabled={!!busy || disabled || !ready}>{busy === 'save' ? 'Adding project…' : 'Add project'}</button>
   </form>;
 }
