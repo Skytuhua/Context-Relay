@@ -1,10 +1,10 @@
 # Context Relay protocol version 1
 
-Context Relay protocol version 1.16 is identified by `PROTOCOL_MAJOR = 1` and `PROTOCOL_MINOR = 16`. Sync operations use schema version 1; scope-bound signed checkpoints use the independent checkpoint schema version 2. Local IPC frames are limited to 8 MiB.
+Context Relay protocol version 1.19 is identified by `PROTOCOL_MAJOR = 1` and `PROTOCOL_MINOR = 19`. Sync operations use schema version 1; scope-bound signed checkpoints use the independent checkpoint schema version 2. Local IPC frames are limited to 8 MiB.
 
 Harness discovery includes nullable `codexSavedHookApproval` with `sessionStart` and `stop` states. These describe saved user hook definitions and approvals, not effective runtime enablement or a verified connection. `null` means the check is unavailable, including unsupported versions or unreadable settings.
 
-Ordinary clients and servers require exact protocol1.16. Incompatible major or minor versions return `protocol_version_unsupported` before dispatch. The installer-only authenticated shutdown path separately recognizes explicit legacy versions, including the qualified1.12 and prior1.15 versions; it provides no reusable legacy application client.
+Ordinary clients and servers require exact protocol 1.19. Incompatible major or minor versions return `protocol_version_unsupported` before dispatch. The installer-only authenticated shutdown path separately recognizes explicit legacy versions, including the qualified1.12 and prior1.15 versions; it provides no reusable legacy application client.
 
 All product identifiers are UUIDv7 values. JSON uses lowercase hyphenated text. Canonical CBOR uses exactly 16 bytes. JSON encodes wire `u64` values as canonical decimal strings. CBOR encodes them as unsigned integers.
 
@@ -103,11 +103,11 @@ automatically or falls back to the legacy two-request creation sequence.
 `project_upsert` and `project_path_set` remain available for their existing
 independent operations. Their presence is not an atomic creation contract.
 
-Ordinary local clients require exactly 1.16 and reject 1.15 before application
+Ordinary local clients require exactly 1.19 and reject 1.18 before application
 dispatch. The Windows updater always extracts its new authenticated shutdown
 helper before replacing companions; it never runs an old daemon executable
 that might ignore `--shutdown` and start a service. The helper has one private
-compatibility path for explicitly listed protocols 1.4 through 1.15, including
+compatibility path for explicitly listed protocols 1.4 through 1.18, including
 the qualified 1.12 predecessor: verify both installation-token proofs,
 send only the fixed shutdown request, require its matching empty acknowledgment,
 and wait for the exact connected process to exit. It cannot return a reusable
@@ -125,3 +125,31 @@ Desktop-only `recovery_history_candidates` takes `restoreId`, exact `acceptedEnd
 Desktop-only `recovery_history_select` takes the three exact nonsecret identifiers: restore ID, accepted endpoint hash, and checkpoint hash. The daemon downloads and authenticates those exact bytes before the existing durable selection transaction. `recovery_restore_resume` acts only on that durable choice and reuses signed operation download, reconstruction and installation. It never chooses a checkpoint implicitly or treats missing operations as missing keys. Event/page4096, operation100000, dependency1000000, checkpoint1MiB and category64MiB limits remain unchanged.
 
 `recovery_history_unlock` is confined to DesktopRecoveryHost. React invokes the native Tauri command with only the three nonsecret identifiers. The native host rereads exact positive `historical_keys_needed` status before opening the existing phrase dialog. Only native IPC adds `RecoveryPhraseWords`. The daemon rechecks original hosted intent/session, original preparation/claim/pin/recipient, accepted lineage, exact selected endpoint/checkpoint and cancellation before transactional retention. Cancel and stale state preserve the durable target. Initial and supplemental key receipts reuse `recovery-history-key/v1` AAD and recipient signatures; supplemental retention is additive only for genuinely absent historical epochs below current D. It never replaces original preparation, repairs corrupt receipts, supplies independent current-D material, activates writes, or publishes another recovery claim. Exact retry preserves ciphertext and signatures. Migration47 adds only the four bounded supplemental receipt columns from the original representation.
+
+
+## Bounded record lists, protocol 1.19
+
+Desktop record lists use `projects_list_page`, `memory_list_page`,
+`candidates_list_page`, and `tasks_list_page`. Each accepts a nullable `cursor`;
+memories retain required-nullable `projectId` and `includeArchived`, candidates
+retain required-nullable `projectId`, and tasks require `projectId`.
+The corresponding `projects_page`, `memories_page`, `candidates_page`, and
+`tasks_page` result carries `data.page` with the full records under the same
+plural name and a required-nullable `nextCursor`. Pass each returned cursor
+with the same scope and filters until `nextCursor` is null.
+
+Pages use ascending stable record IDs, contain at most 128 records, and reserve
+space inside a 7 MiB encoded JSON budget for list and transport envelopes. Byte
+accounting includes JSON escaping. Cursors bind their version, list family,
+scope and filters; malformed or mismatched cursors return `invalid_request`.
+Traversal uses the live keyset: changes between requests are not a snapshot.
+Projects may be sorted by name after traversal for display.
+
+Legacy list methods return a complete bounded result or `frame_too_large`
+with pagination guidance. They never silently return only a prefix.
+`context_relay_list_tasks` accepts optional `cursor` alongside `status` and
+returns optional `nextCursor`. Its encoded output stays below 2 MiB to leave
+room for both MCP text and structured copies. An individual record larger
+than that budget returns an explicit error; its content is never truncated.
+Ordinary 1.18 peers fail the exact-version handshake before page dispatch;
+the authenticated updater shutdown path alone accepts 1.18.

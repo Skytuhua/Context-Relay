@@ -2,6 +2,20 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "properties": {
+    "nextCursor": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "maxLength": 256,
+          "minLength": 1,
+          "pattern": ".*\\S.*",
+          "type": "string",
+          "x-utf8-maxBytes": 256
+        }
+      ]
+    },
     "tasks": {
       "items": {
         "additionalProperties": false,
@@ -141,7 +155,7 @@
         ],
         "type": "object"
       },
-      "maxItems": 10000,
+      "maxItems": 128,
       "type": "array"
     }
   },

@@ -6,8 +6,8 @@ use context_relay_protocol::{
 fn status_output_requires_the_exact_supported_local_version() {
     let mut output = serde_json::json!({
         "protocol": {
-            "min": { "major": 1, "minor": 18 },
-            "max": { "major": 1, "minor": 18 }
+            "min": { "major": 1, "minor": 19 },
+            "max": { "major": 1, "minor": 19 }
         },
         "vault": "unlocked",
         "resolvedProject": null,
@@ -27,7 +27,7 @@ fn status_output_requires_the_exact_supported_local_version() {
         }),
         serde_json::json!({
             "min": { "major": 1, "minor": 7 },
-            "max": { "major": 1, "minor": 18 }
+            "max": { "major": 1, "minor": 19 }
         }),
         serde_json::json!({
             "min": { "major": 1, "minor": 1 },
@@ -123,7 +123,7 @@ fn nested_output_bounds_and_decision_kind_match_semantic_validation() {
     let list = mcp_schema("context_relay_list_tasks").unwrap().output;
     assert_eq!(
         list["properties"]["tasks"]["maxItems"],
-        MAX_BATCH_OPERATIONS
+        context_relay_protocol::MAX_LIST_PAGE_ITEMS
     );
     assert_eq!(
         list["properties"]["tasks"]["items"]["properties"]["evidence"]["items"]["properties"]["reference"]

@@ -41,45 +41,43 @@ beforeEach(() => {
 });
 
 const listReads = [
-  { name: 'projects', kind: 'projects', field: 'projects', read: (gateway: LocalWorkspaceGateway) => gateway.projects() },
-  { name: 'memories', kind: 'memories', field: 'memories', read: (gateway: LocalWorkspaceGateway) => gateway.memories(null) },
+  { name: 'projects', kind: 'projects_page', field: 'projects', read: (gateway: LocalWorkspaceGateway) => gateway.projects() },
+  { name: 'memories', kind: 'memories_page', field: 'memories', read: (gateway: LocalWorkspaceGateway) => gateway.memories(null) },
   { name: 'search', kind: 'memories', field: 'memories', read: (gateway: LocalWorkspaceGateway) => gateway.searchMemories('sign', null) },
-  { name: 'tasks', kind: 'tasks', field: 'tasks', read: (gateway: LocalWorkspaceGateway) => gateway.tasks(task.projectId) },
-  { name: 'candidates', kind: 'candidates', field: 'candidates', read: (gateway: LocalWorkspaceGateway) => gateway.candidates(null) },
+  { name: 'tasks', kind: 'tasks_page', field: 'tasks', read: (gateway: LocalWorkspaceGateway) => gateway.tasks(task.projectId) },
+  { name: 'candidates', kind: 'candidates_page', field: 'candidates', read: (gateway: LocalWorkspaceGateway) => gateway.candidates(null) },
 ];
+
+function listReply(kind: string, field: string, records: unknown) {
+  return { kind, data: kind.endsWith('_page') ? { page: { [field]: records, nextCursor: null } } : { [field]: records } };
+}
 
 it.each(listReads)('rejects a non-array $name result before it reaches a screen', async ({ kind, field, read }) => {
   for (const malformed of ['', 'record', null, undefined, {}, 42]) {
-    invoke.mockResolvedValueOnce({ kind, data: { [field]: malformed } });
-    await expect(read(new LocalWorkspaceGateway())).rejects.toThrow(`invalid ${field} list from the local workspace`);
+    invoke.mockResolvedValueOnce(listReply(kind, field, malformed));
+    await expect(read(new LocalWorkspaceGateway())).rejects.toThrow(kind.endsWith('_page') ? 'list page' : `invalid ${field} list from the local workspace`);
   }
 });
 
 it.each(listReads)('accepts an empty $name list', async ({ kind, field, read }) => {
-  invoke.mockResolvedValueOnce({ kind, data: { [field]: [] } });
+  invoke.mockResolvedValueOnce(listReply(kind, field, []));
   await expect(read(new LocalWorkspaceGateway())).resolves.toEqual([]);
 });
 
 it('accepts a well formed memory list', async () => {
-  invoke.mockResolvedValueOnce({ kind: 'memories', data: { memories: [memory] } });
+  invoke.mockResolvedValueOnce(listReply('memories_page', 'memories', [memory]));
   await expect(new LocalWorkspaceGateway().memories(null)).resolves.toEqual([memory]);
 });
 
 it('rejects a memory whose hybrid logical clock cannot be read as a u64', async () => {
   // dashboard.tsx calls BigInt(record.updatedHlc.physicalMs) while sorting, so a
   // non-decimal clock crashes the screen instead of surfacing a retryable error.
-  invoke.mockResolvedValueOnce({
-    kind: 'memories',
-    data: { memories: [{ ...memory, updatedHlc: hlc('0x6af0c0') }] },
-  });
+  invoke.mockResolvedValueOnce(listReply('memories_page', 'memories', [{ ...memory, updatedHlc: hlc('0x6af0c0') }]));
   await expect(new LocalWorkspaceGateway().memories(null)).rejects.toThrow(/invalid memory\.updatedHlc/);
 });
 
 it('rejects a memory with an unknown field instead of rendering it', async () => {
-  invoke.mockResolvedValueOnce({
-    kind: 'memories',
-    data: { memories: [{ ...memory, unexpected: 'value' }] },
-  });
+  invoke.mockResolvedValueOnce(listReply('memories_page', 'memories', [{ ...memory, unexpected: 'value' }]));
   await expect(new LocalWorkspaceGateway().memories(null)).rejects.toThrow(/invalid memory/);
 });
 
@@ -89,12 +87,12 @@ it('rejects a search result that is not a memory record', async () => {
 });
 
 it('validates a done task that carries no evidence', async () => {
-  invoke.mockResolvedValueOnce({ kind: 'tasks', data: { tasks: [{ ...task, status: 'done', evidence: [] }] } });
+  invoke.mockResolvedValueOnce(listReply('tasks_page', 'tasks', [{ ...task, status: 'done', evidence: [] }]));
   await expect(new LocalWorkspaceGateway().tasks(task.projectId)).rejects.toThrow(/invalid task\.evidence/);
 });
 
 it('accepts a well formed task list', async () => {
-  invoke.mockResolvedValueOnce({ kind: 'tasks', data: { tasks: [task] } });
+  invoke.mockResolvedValueOnce(listReply('tasks_page', 'tasks', [task]));
   await expect(new LocalWorkspaceGateway().tasks(task.projectId)).resolves.toEqual([task]);
 });
 
@@ -106,21 +104,15 @@ it('validates the proposed memory nested inside a candidate', async () => {
     sourceHarness: 'codex',
     state: 'pending',
   };
-  invoke.mockResolvedValueOnce({ kind: 'candidates', data: { candidates: [candidate] } });
+  invoke.mockResolvedValueOnce(listReply('candidates_page', 'candidates', [candidate]));
   await expect(new LocalWorkspaceGateway().candidates(null)).resolves.toEqual([candidate]);
 
-  invoke.mockResolvedValueOnce({
-    kind: 'candidates',
-    data: { candidates: [{ ...candidate, proposedMemory: { ...memory, title: '' } }] },
-  });
+  invoke.mockResolvedValueOnce(listReply('candidates_page', 'candidates', [{ ...candidate, proposedMemory: { ...memory, title: '' } }]));
   await expect(new LocalWorkspaceGateway().candidates(null)).rejects.toThrow(/invalid memory\.title/);
 });
 
 it('validates a project identity before it drives the project switcher', async () => {
-  invoke.mockResolvedValueOnce({
-    kind: 'projects',
-    data: { projects: [{ projectId: 'not-a-uuid', githubRepositoryId: null, gitRemoteFingerprint: null, monorepoSubdirectory: null, name: 'Website' }] },
-  });
+  invoke.mockResolvedValueOnce(listReply('projects_page', 'projects', [{ projectId: 'not-a-uuid', githubRepositoryId: null, gitRemoteFingerprint: null, monorepoSubdirectory: null, name: 'Website' }]));
   await expect(new LocalWorkspaceGateway().projects()).rejects.toThrow(/invalid project\.projectId/);
 });
 
@@ -132,9 +124,9 @@ it('accepts OpenCode candidates while retaining the harness allowlist at the rea
     sourceHarness: 'opencode',
     state: 'pending',
   };
-  invoke.mockResolvedValueOnce({ kind: 'candidates', data: { candidates: [candidate] } });
+  invoke.mockResolvedValueOnce(listReply('candidates_page', 'candidates', [candidate]));
   await expect(new LocalWorkspaceGateway().candidates(null)).resolves.toEqual([candidate]);
 
-  invoke.mockResolvedValueOnce({ kind: 'candidates', data: { candidates: [{ ...candidate, sourceHarness: 'unrecognized_harness' }] } });
+  invoke.mockResolvedValueOnce(listReply('candidates_page', 'candidates', [{ ...candidate, sourceHarness: 'unrecognized_harness' }]));
   await expect(new LocalWorkspaceGateway().candidates(null)).rejects.toThrow(/invalid candidate\.sourceHarness/);
 });

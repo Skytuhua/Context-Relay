@@ -1106,6 +1106,72 @@ fn exact_replay_is_a_noop_but_altered_replay_rolls_back() {
 }
 
 #[test]
+fn outbox_orders_numeric_sequences_before_limit_and_gates_blocked_predecessors() {
+    let path = TempVault::new("sync-ordered-outbox");
+    let keys = MemoryKeyStore::default();
+    let key = [43; 32];
+    keys.insert(CREDENTIAL, key);
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    let mutation = RecordMutationV1::UpsertSecretRef(SecretRef {
+        id: id(ID_6),
+        name: "Token".to_owned(),
+        provider: "provider".to_owned(),
+        required_on_device: true,
+    });
+    let mut previous = None;
+    let mut ids = Vec::new();
+    for sequence in 1..=12 {
+        let built = build(&mutation, &generated_id(600 - sequence), previous);
+        vault
+            .commit_outgoing_operation(&mutation, &built, None)
+            .unwrap();
+        ids.push(built.operation.operation_id);
+        previous = Some(OperationChainHead {
+            sequence: built.operation.device_sequence,
+            canonical_hash: built.canonical_hash,
+        });
+    }
+    // Equal queue times and reversed UUIDs must not select sequence 12 first.
+    let raw = open_keyed(path.path(), &key);
+    raw.execute("UPDATE outbox SET queued_at = 0", []).unwrap();
+    drop(raw);
+    assert_eq!(
+        vault
+            .due_outbox(0, 10)
+            .unwrap()
+            .iter()
+            .map(|row| row.operation_id)
+            .collect::<Vec<_>>(),
+        ids[..10]
+    );
+    vault.defer_outbox(&[ids[1]], 500, "transient").unwrap();
+    assert_eq!(vault.due_outbox(499, 10).unwrap().len(), 1);
+    vault.acknowledge_outbox(&[ids[0]]).unwrap();
+    assert!(vault.due_outbox(499, 10).unwrap().is_empty());
+    assert_eq!(vault.due_outbox(500, 1).unwrap()[0].operation_id, ids[1]);
+    vault
+        .defer_outbox(&[ids[1]], 0, "integrity_quarantined")
+        .unwrap();
+    assert!(vault.due_outbox(u64::MAX, 10).unwrap().is_empty());
+
+    // Pre-metadata signed envelopes obey the same gate and numeric ordering.
+    let raw = open_keyed(path.path(), &key);
+    raw.execute("DELETE FROM sync_operation_meta", []).unwrap();
+    drop(raw);
+    assert!(vault.due_outbox(u64::MAX, 10).unwrap().is_empty());
+    vault.acknowledge_outbox(&[ids[1]]).unwrap();
+    assert_eq!(
+        vault
+            .due_outbox(0, 10)
+            .unwrap()
+            .iter()
+            .map(|row| row.operation_id)
+            .collect::<Vec<_>>(),
+        ids[2..]
+    );
+}
+
+#[test]
 fn outbox_retry_ack_heads_cursor_and_u64_sequences_survive_reopen() {
     let path = TempVault::new("sync-durable-state");
     let keys = MemoryKeyStore::default();

@@ -78,7 +78,7 @@ fn opencode_requires_the_coordinated_protocol_upgrade() {
         PROTOCOL_VERSION,
         ProtocolVersion {
             major: 1,
-            minor: 18
+            minor: 19
         }
     );
     let previous = ProtocolVersion {
