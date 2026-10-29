@@ -1,3 +1,5 @@
+import { readBoundedBody } from "../account-lifecycle/core.mjs";
+
 export const MAX_SYNC_REQUEST_BYTES = 8 * 1024 * 1024;
 export const MAX_SYNC_OPERATIONS = 256;
 
@@ -190,38 +192,6 @@ function strictAuthorization(request) {
   return header.slice("Bearer ".length);
 }
 
-async function readBoundedBody(request) {
-  if (request.body === null) return new Uint8Array();
-  const reader = request.body.getReader();
-  const chunks = [];
-  let total = 0;
-  try {
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      if (!(value instanceof Uint8Array)) {
-        throw new SyncEdgeError(400, "invalid_request");
-      }
-      total += value.length;
-      if (total > MAX_SYNC_REQUEST_BYTES) {
-        try {
-          await reader.cancel();
-        } catch {
-          // The size limit remains authoritative even if the peer cannot be cancelled cleanly.
-        }
-        throw new SyncEdgeError(413, "request_too_large");
-      }
-      chunks.push(value);
-    }
-  } catch (error) {
-    if (error instanceof SyncEdgeError) throw error;
-    throw new SyncEdgeError(400, "invalid_request");
-  } finally {
-    reader.releaseLock();
-  }
-  return concatenate(chunks);
-}
-
 async function readRequest(request) {
   if (request.method !== "POST") throw new SyncEdgeError(405, "method_not_allowed");
   const contentLength = request.headers.get("content-length");
@@ -233,7 +203,13 @@ async function readRequest(request) {
       throw new SyncEdgeError(413, "request_too_large");
     }
   }
-  const bytes = await readBoundedBody(request);
+  let bytes;
+  try {
+    bytes = await readBoundedBody(request, MAX_SYNC_REQUEST_BYTES);
+  } catch (error) {
+    if (error?.code === "request_too_large") throw new SyncEdgeError(413, error.code);
+    throw new SyncEdgeError(400, "invalid_request");
+  }
   let body;
   try {
     body = JSON.parse(textDecoder.decode(bytes));

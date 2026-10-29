@@ -2173,8 +2173,31 @@ fn task_transition_cannot_reuse_an_operation_bound_by_task_upsert() {
     );
 }
 
+#[cfg(any(windows, target_os = "macos"))]
 #[test]
 fn project_and_native_path_mapping_round_trip_through_the_service() {
+    let root = tempfile::tempdir().unwrap();
+    let folder = WireNativeValue {
+        #[cfg(windows)]
+        platform: NativePlatform::Windows,
+        #[cfg(target_os = "macos")]
+        platform: NativePlatform::Macos,
+        #[cfg(windows)]
+        bytes: {
+            use std::os::windows::ffi::OsStrExt as _;
+            root.path()
+                .as_os_str()
+                .encode_wide()
+                .flat_map(u16::to_le_bytes)
+                .collect()
+        },
+        #[cfg(target_os = "macos")]
+        bytes: {
+            use std::os::unix::ffi::OsStrExt as _;
+            root.path().as_os_str().as_bytes().to_vec()
+        },
+        display: None,
+    };
     let fixture = Fixture::new("project-path");
     let mut vault = fixture.vault();
     let mut service = OfflineWorkspace::new(&mut vault, ID_9.parse().unwrap());
@@ -2188,13 +2211,13 @@ fn project_and_native_path_mapping_round_trip_through_the_service() {
 
     service.upsert_project(project.clone()).unwrap();
     service
-        .set_project_path(project.project_id, native_path())
+        .set_project_path(project.project_id, folder.clone())
         .unwrap();
 
     assert_eq!(service.projects().unwrap(), vec![project.clone()]);
     assert_eq!(
         service.project_path(project.project_id).unwrap(),
-        Some(native_path())
+        Some(folder)
     );
     assert_eq!(
         service.access_policy(HarnessId::ClaudeCode).unwrap(),

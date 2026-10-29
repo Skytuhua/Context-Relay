@@ -1,6 +1,6 @@
 use context_relay_protocol::{
-    CandidateId, CandidateState, DeviceId, HarnessId, HybridLogicalClock, MemoryCandidate,
-    MemoryId, MemoryKind, MemoryOrigin, MemoryRecord, OperationId, Provenance, Sha256Digest,
+    CandidateId, CandidateState, HarnessId, HybridLogicalClock, MemoryCandidate, MemoryId,
+    MemoryKind, MemoryOrigin, MemoryRecord, OperationId, Provenance, Sha256Digest,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -134,14 +134,13 @@ pub(crate) fn build_native_memory_candidate(
     unmanaged_digest: Sha256Digest,
     candidate_markdown: Vec<u8>,
     change_kind: NativeMemoryChangeKind,
-    device_id: DeviceId,
+    clock: HybridLogicalClock,
 ) -> Result<MemoryCandidate, NativeMemoryError> {
     source.validate_compatible()?;
     let body_markdown =
         String::from_utf8(candidate_markdown).map_err(|_| NativeMemoryError::InvalidUtf8)?;
     let (candidate_id, memory_id, operation_id) =
         native_memory_identity(source.id, unmanaged_digest)?;
-    let clock = operation_clock(operation_id, device_id);
     let candidate = MemoryCandidate {
         id: candidate_id,
         proposed_memory: MemoryRecord {
@@ -153,7 +152,7 @@ pub(crate) fn build_native_memory_candidate(
             tags: native_memory_tags(source.harness),
             origin: MemoryOrigin::NativeImport,
             provenance: Provenance {
-                origin_device: device_id,
+                origin_device: clock.node,
                 harness: Some(source.harness),
                 source: None,
                 created_hlc: clock,
@@ -237,12 +236,4 @@ pub(crate) const fn native_memory_evidence(change_kind: NativeMemoryChangeKind) 
         NativeMemoryChangeKind::InitialPreview => "initial native-memory preview",
         NativeMemoryChangeKind::LiveEdit => "native-memory edit",
     }
-}
-
-fn operation_clock(operation_id: OperationId, device_id: DeviceId) -> HybridLogicalClock {
-    let bytes = operation_id.as_bytes();
-    let physical_ms = u64::from_be_bytes([
-        0, 0, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5],
-    ]);
-    HybridLogicalClock::new(physical_ms, 0, device_id)
 }

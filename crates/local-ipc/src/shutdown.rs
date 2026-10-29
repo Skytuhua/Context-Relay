@@ -132,6 +132,11 @@ async fn request_shutdown(
                     major: 1,
                     minor: 17,
                 })
+            && server_hello.protocol
+                != (ProtocolVersion {
+                    major: 1,
+                    minor: 18,
+                })
         {
             return Err(IpcError::ProtocolVersionUnsupported);
         }
@@ -313,6 +318,22 @@ mod tests {
     #[tokio::test]
     async fn authenticated_shutdown_accepts_the_previous_1_16_installer() {
         assert_shutdown_waits_for_exit("legacy-ack-1-16").await;
+    }
+
+    #[tokio::test]
+    async fn authenticated_shutdown_accepts_the_previous_1_18_installer() {
+        assert_shutdown_waits_for_exit("legacy-ack-1-18").await;
+    }
+
+    #[tokio::test]
+    async fn ordinary_client_still_rejects_the_previous_1_18_installer() {
+        let fixture = Fixture::start("legacy-client-1-18", false).await;
+        let stream = connect(&fixture.runtime).await.unwrap();
+        let result =
+            crate::Client::from_stream(stream, ClientRole::Desktop, &token().unwrap()).await;
+        assert!(matches!(result, Err(IpcError::ProtocolVersionUnsupported)));
+        assert!(!fixture.root.join("request").exists());
+        fixture.finish().await;
     }
 
     #[tokio::test]
@@ -669,6 +690,7 @@ mod tests {
                 "legacy-ack-1-14" | "legacy-client-1-14" => 14,
                 "legacy-ack-1-15" | "legacy-client-1-15" => 15,
                 "legacy-ack-1-16" | "legacy-client-1-16" => 16,
+                "legacy-ack-1-18" | "legacy-client-1-18" => 18,
                 _ => 4,
             },
         };
@@ -684,6 +706,7 @@ mod tests {
                 | "legacy-client-1-14"
                 | "legacy-client-1-15"
                 | "legacy-client-1-16"
+                | "legacy-client-1-18"
         ) {
             assert!(
                 read_json::<_, serde_json::Value>(&mut stream)
@@ -746,7 +769,7 @@ mod tests {
             "legacy-ack" | "legacy-ack-1-5" | "legacy-ack-1-6" | "legacy-ack-1-7"
             | "legacy-ack-1-8" | "legacy-ack-1-9" | "legacy-ack-1-10" | "legacy-ack-1-11"
             | "legacy-ack-1-12" | "legacy-ack-1-13" | "legacy-ack-1-14" | "legacy-ack-1-15"
-            | "legacy-ack-1-16" => {}
+            | "legacy-ack-1-16" | "legacy-ack-1-18" => {}
             _ => panic!("unexpected legacy fixture mode"),
         }
         write_json(&mut stream, &response).await.unwrap();
@@ -765,6 +788,7 @@ mod tests {
                 | "legacy-ack-1-14"
                 | "legacy-ack-1-15"
                 | "legacy-ack-1-16"
+                | "legacy-ack-1-18"
         ) {
             fs::write(root.join("ack"), b"").unwrap();
             wait_for(&root.join("exit")).await;

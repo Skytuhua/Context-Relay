@@ -2,6 +2,20 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "properties": {
+    "cursor": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "maxLength": 256,
+          "minLength": 1,
+          "pattern": ".*\\S.*",
+          "type": "string",
+          "x-utf8-maxBytes": 256
+        }
+      ]
+    },
     "status": {
       "oneOf": [
         {

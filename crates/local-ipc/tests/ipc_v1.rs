@@ -243,13 +243,13 @@ fn verify_server_proof(
 
 #[test]
 fn challenged_hmac_matches_frozen_vector() {
-    // The protocol bytes are part of the authenticated transcript. These 1.18
+    // The protocol bytes are part of the authenticated transcript. These 1.19
     // client/server vectors were independently checked with Python stdlib HMAC-SHA256.
     assert_eq!(
         PROTOCOL_VERSION,
         ProtocolVersion {
             major: 1,
-            minor: 18
+            minor: 19
         }
     );
     let (token, client_nonce, daemon_nonce, challenge) = auth_fixture();
@@ -264,7 +264,7 @@ fn challenged_hmac_matches_frozen_vector() {
 
     assert_eq!(
         serde_json::to_string(&proof).unwrap(),
-        r#""Q3O2Puzfxf4yhA6EcHO4pKsYvF4_J9eTNIbS1By-A7g""#
+        r#""bxIGthwQ9P2sFBcpJ0CP5RDgT364tGa0uyGMQIiJ_ek""#
     );
     assert!(
         verify_proof(
@@ -452,7 +452,7 @@ fn server_auth_requires_the_installation_token_and_binds_the_client_proof() {
         PROTOCOL_VERSION,
         ProtocolVersion {
             major: 1,
-            minor: 18
+            minor: 19
         }
     );
     let (token, client_nonce, daemon_nonce, challenge) = auth_fixture();
@@ -476,7 +476,7 @@ fn server_auth_requires_the_installation_token_and_binds_the_client_proof() {
 
     assert_eq!(
         serde_json::to_string(&server_proof).unwrap(),
-        r#""GhPpaOeTNc1eoUOfjpJFibTEfwep_ifJoQ4Stz8zvaE""#
+        r#""qt1qeSrkApwasKjomGpZgv4M-wcq0U0Di_aTfPtErBs""#
     );
     assert!(
         verify_server_proof(
@@ -765,6 +765,31 @@ fn all_request_fixtures() -> Vec<(&'static str, LocalRequest)> {
         ),
         ("Unlock", request_fixture("unlock", empty())),
         ("ProjectsList", request_fixture("projects_list", empty())),
+        (
+            "ProjectsListPage",
+            request_fixture("projects_list_page", serde_json::json!({"cursor":null})),
+        ),
+        (
+            "MemoryListPage",
+            request_fixture(
+                "memory_list_page",
+                serde_json::json!({"projectId":null,"includeArchived":false,"cursor":null}),
+            ),
+        ),
+        (
+            "CandidatesListPage",
+            request_fixture(
+                "candidates_list_page",
+                serde_json::json!({"projectId":null,"cursor":null}),
+            ),
+        ),
+        (
+            "TasksListPage",
+            request_fixture(
+                "tasks_list_page",
+                serde_json::json!({"projectId":ID,"cursor":null}),
+            ),
+        ),
         (
             "ProjectUpsert",
             request_fixture(
@@ -1185,7 +1210,7 @@ fn all_request_fixtures() -> Vec<(&'static str, LocalRequest)> {
 #[test]
 fn role_allowlist_covers_core_and_tracked_setup_requests() {
     let fixtures = all_request_fixtures();
-    assert_eq!(fixtures.len(), 74);
+    assert_eq!(fixtures.len(), 78);
 
     for (name, request) in &fixtures {
         let common = matches!(*name, "Cancel" | "Health");
@@ -1248,7 +1273,7 @@ fn role_allowlist_covers_core_and_tracked_setup_requests() {
             .iter()
             .filter(|(_, request)| role_allows(ClientRole::Desktop, request))
             .count(),
-        69
+        73
     );
     assert_eq!(
         fixtures

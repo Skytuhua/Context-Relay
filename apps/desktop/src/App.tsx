@@ -12,6 +12,7 @@ import type {
 import { DevicesScreen } from './devices';
 import { HarnessesScreen } from './harnesses';
 import { ProjectForm } from './project-form';
+import { ProjectFolderBinding } from './project-folder-binding';
 import { WorkspaceIcon } from './workspace-icon';
 import { Dashboard } from './dashboard';
 import { DashboardTour, HelpScreen } from './help-tour';
@@ -559,7 +560,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
       case 'projects':
         return (
           <section className="screen-content">
-            <ProjectForm gateway={gateway} ready={connectionState === 'ready'} initialDraft={projectDraft.current} onDraft={value => { projectDraft.current = value; }} onSaved={projectSaved} onBusy={projectFormBusy} />
+            <ProjectForm gateway={gateway} ready={connectionState === 'ready'} disabled={projectBusy || !!saving} initialDraft={projectDraft.current} onDraft={value => { projectDraft.current = value; }} onSaved={projectSaved} onBusy={projectFormBusy} />
             <RecordList title="Projects">
               {projects.map((project) => (
                 <li key={project.projectId}>
@@ -572,6 +573,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
                   >
                     {project.name}
                   </button>
+                  <ProjectFolderBinding gateway={gateway} project={project} ready={connectionState === 'ready' && !projectBusy && !saving} onBusy={projectFormBusy} />
                 </li>
               ))}
             </RecordList>

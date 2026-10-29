@@ -218,7 +218,7 @@ fn staged_push_releases_vault_and_preserves_captured_retry_bytes_after_reopen() 
             .safe_code(),
         "transient"
     );
-    assert_eq!(vault.due_outbox(999, 10).unwrap().len(), 1);
+    assert!(vault.due_outbox(999, 10).unwrap().is_empty());
     drop(vault);
     let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
     let prepared = engine.prepare_push(&mut vault, 1_000).unwrap().unwrap();
@@ -487,7 +487,7 @@ impl RetryRandomSource for AttemptBoundRandom {
 }
 
 #[test]
-fn transient_batch_uses_each_rows_durable_attempt_count() {
+fn transient_batch_waits_for_its_earliest_pending_device_sequence() {
     let device = device(ID_3, 91);
     let trust = trust(&device);
     let operations = chain(&device, 2, 21_000);
@@ -515,17 +515,24 @@ fn transient_batch_uses_each_rows_durable_attempt_count() {
             .safe_code(),
         "transient"
     );
+    assert!(vault.due_outbox(1_000, 256).unwrap().is_empty());
+    assert!(vault.due_outbox(7_999, 256).unwrap().is_empty());
+    let prepared = engine.prepare_push(&mut vault, 8_000).unwrap().unwrap();
     assert_eq!(
-        vault
-            .due_outbox(1_000, 256)
-            .unwrap()
+        prepared
+            .operations()
             .iter()
-            .map(|row| row.operation_id)
+            .map(|operation| operation.device_sequence)
             .collect::<Vec<_>>(),
-        vec![operations[1].1.operation.operation_id]
+        vec![1, 2]
     );
-    assert_eq!(vault.due_outbox(7_999, 256).unwrap().len(), 1);
-    assert_eq!(vault.due_outbox(8_000, 256).unwrap().len(), 2);
+    let receipt = provider
+        .push_operations(prepared.scope(), prepared.operations())
+        .unwrap();
+    engine
+        .finish_push(&mut vault, prepared, Ok(receipt), 8_000)
+        .unwrap();
+    assert!(vault.outbox_operations().unwrap().is_empty());
 }
 
 #[test]

@@ -1274,6 +1274,10 @@ fn route_request(role: ClientRole, request: LocalRequest) -> RoutedRequest {
         | LocalRequest::DesktopWriteGet(_)
         | LocalRequest::DesktopWriteForget(_)
         | LocalRequest::ProjectsList(_)
+        | LocalRequest::ProjectsListPage(_)
+        | LocalRequest::MemoryListPage(_)
+        | LocalRequest::CandidatesListPage(_)
+        | LocalRequest::TasksListPage(_)
         | LocalRequest::ProjectUpsert(_)
         | LocalRequest::ProjectRegister(_)
         | LocalRequest::MemoryList(_)
@@ -1999,11 +2003,11 @@ fn execute_vault_command(
             })
         }
         VaultCommand::Unlock => unreachable!("unlock is handled before open-state dispatch"),
-        VaultCommand::ProjectPathSet(params) => state
-            .vault
-            .put_path(&params.project_id.to_string(), &params.path)
-            .map(|()| LocalResult::Empty)
-            .map_err(client_error_from_vault),
+        VaultCommand::ProjectPathSet(params) => {
+            OfflineWorkspace::new(&mut state.vault, state.device_id)
+                .set_project_path(params.project_id, params.path)
+                .map(|()| LocalResult::Empty)
+        }
         VaultCommand::MemoryGet(params) => state
             .vault
             .memory(&params.memory_id)
@@ -2406,9 +2410,42 @@ fn execute_workspace_request(
             .forget_desktop_write(params.operation_id)
             .map(|()| LocalResult::Empty)
             .map_err(client_error_from_vault),
-        LocalRequest::ProjectsList(_) => OfflineWorkspace::new(&mut state.vault, state.device_id)
-            .projects()
-            .map(|projects| LocalResult::Projects { projects }),
+        LocalRequest::ProjectsListPage(params) => state
+            .vault
+            .projects_page(params.cursor.as_deref())
+            .map(|page| LocalResult::ProjectsPage { page }),
+        LocalRequest::MemoryListPage(params) => state
+            .vault
+            .memories_page(
+                params.project_id,
+                params.include_archived,
+                params.cursor.as_deref(),
+            )
+            .map(|page| LocalResult::MemoriesPage { page }),
+        LocalRequest::CandidatesListPage(params) => state
+            .vault
+            .candidates_page(params.project_id, params.cursor.as_deref())
+            .map(|page| LocalResult::CandidatesPage { page }),
+        LocalRequest::TasksListPage(params) => state
+            .vault
+            .tasks_page(
+                params.project_id,
+                None,
+                params.cursor.as_deref(),
+                context_relay_protocol::MAX_LIST_PAGE_BYTES,
+            )
+            .map(|page| LocalResult::TasksPage { page }),
+        LocalRequest::ProjectsList(_) => {
+            let page = state.vault.projects_page(None)?;
+            require_complete_legacy_list(page.next_cursor)?;
+            let mut projects = page.projects;
+            projects.sort_by(|left, right| {
+                left.name
+                    .cmp(&right.name)
+                    .then(left.project_id.cmp(&right.project_id))
+            });
+            Ok(LocalResult::Projects { projects })
+        }
         LocalRequest::ProjectUpsert(params) => {
             OfflineWorkspace::new(&mut state.vault, state.device_id)
                 .upsert_project(params.project)
@@ -2424,11 +2461,16 @@ fn execute_workspace_request(
                 .search_memories(params)
                 .map(|memories| LocalResult::Memories { memories })
         }
-        LocalRequest::MemoryList(params) => state
-            .vault
-            .memories(params.project_id, params.include_archived)
-            .map_err(client_error_from_vault)
-            .map(|memories| LocalResult::Memories { memories }),
+        LocalRequest::MemoryList(params) => {
+            let page =
+                state
+                    .vault
+                    .memories_page(params.project_id, params.include_archived, None)?;
+            require_complete_legacy_list(page.next_cursor)?;
+            Ok(LocalResult::Memories {
+                memories: page.memories,
+            })
+        }
         LocalRequest::MemoryCreate(params) => {
             with_local_workspace(state, |mut workspace| workspace.create_memory(params)).map(
                 |memory| LocalResult::Memory {
@@ -2451,9 +2493,11 @@ fn execute_workspace_request(
             )
         }
         LocalRequest::CandidatesList(params) => {
-            OfflineWorkspace::new(&mut state.vault, state.device_id)
-                .candidates(params.project_id)
-                .map(|candidates| LocalResult::Candidates { candidates })
+            let page = state.vault.candidates_page(params.project_id, None)?;
+            require_complete_legacy_list(page.next_cursor)?;
+            Ok(LocalResult::Candidates {
+                candidates: page.candidates,
+            })
         }
         LocalRequest::CandidateReview(params) => {
             with_local_workspace(state, |mut workspace| workspace.review_candidate(params)).map(
@@ -2462,9 +2506,16 @@ fn execute_workspace_request(
                 },
             )
         }
-        LocalRequest::TasksList(params) => OfflineWorkspace::new(&mut state.vault, state.device_id)
-            .tasks(params.project_id)
-            .map(|tasks| LocalResult::Tasks { tasks }),
+        LocalRequest::TasksList(params) => {
+            let page = state.vault.tasks_page(
+                params.project_id,
+                None,
+                None,
+                context_relay_protocol::MAX_LIST_PAGE_BYTES,
+            )?;
+            require_complete_legacy_list(page.next_cursor)?;
+            Ok(LocalResult::Tasks { tasks: page.tasks })
+        }
         LocalRequest::TaskUpsert(params) => {
             with_local_workspace(state, |mut workspace| workspace.upsert_task(params))
                 .map(|task| LocalResult::Tasks { tasks: vec![task] })
@@ -2769,6 +2820,19 @@ fn map_guard_error(error: IpcError) -> DaemonError {
 
 fn map_transport_error(_: IpcError) -> DaemonError {
     DaemonError::Transport
+}
+
+fn require_complete_legacy_list(next_cursor: Option<String>) -> Result<(), ClientError> {
+    if next_cursor.is_some() {
+        return Err(ClientError {
+            code: ErrorCode::FrameTooLarge,
+            message: "This list requires pagination; update the client to use the list_page method"
+                .into(),
+            field_path: None,
+            retryable: false,
+        });
+    }
+    Ok(())
 }
 
 pub fn client_error_from_vault(error: VaultError) -> ClientError {
@@ -3877,6 +3941,72 @@ mod tests {
 
     const LIFECYCLE_BEGIN_ID: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c07a102";
     const LIFECYCLE_CANCEL_ID: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c07a103";
+
+    #[test]
+    fn legacy_record_lists_report_pagination_and_page_requests_fit_the_frame() {
+        let path = unit_test_support::TempVault::new("daemon-list-pages");
+        let keys = Arc::new(MemoryKeyStore::default());
+        let mut config = VaultConfig::new(path.path().to_owned(), "test-vault-key", keys);
+        let (mut state, _) =
+            open_workspace(&mut config).unwrap_or_else(|_| panic!("open workspace"));
+        let status = ServiceStatus::new();
+        let project_id = "018f22e2-79b0-7cc8-98c4-dc0c0c073981".parse().unwrap();
+        for id in [
+            "018f22e2-79b0-7cc8-98c4-dc0c0c073982",
+            "018f22e2-79b0-7cc8-98c4-dc0c0c073983",
+        ] {
+            state
+                .vault
+                .put_task(&context_relay_protocol::TaskRecord {
+                    id: id.parse().unwrap(),
+                    project_id,
+                    title: "Large task".into(),
+                    body_markdown: format!(
+                        "a{}",
+                        "\0".repeat(context_relay_protocol::MAX_MARKDOWN_BYTES - 1)
+                    ),
+                    status: context_relay_protocol::TaskStatus::Open,
+                    evidence: vec![],
+                    revision: id.parse().unwrap(),
+                })
+                .unwrap();
+        }
+        let error = execute_workspace_request(
+            &mut state,
+            LocalRequest::TasksList(context_relay_protocol::ProjectParams { project_id }),
+            &status,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::FrameTooLarge);
+        assert!(error.message.contains("pagination"));
+        let mut cursor = None;
+        let mut total = 0;
+        loop {
+            let result = execute_workspace_request(
+                &mut state,
+                LocalRequest::TasksListPage(context_relay_protocol::TasksListPageParams {
+                    project_id,
+                    cursor,
+                }),
+                &status,
+            )
+            .unwrap();
+            assert!(
+                serde_json::to_vec(&result).unwrap().len()
+                    < context_relay_protocol::MAX_IPC_FRAME_BYTES
+            );
+            let LocalResult::TasksPage { page } = result else {
+                panic!("expected task page")
+            };
+            total += page.tasks.len();
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+            assert!(total < 3);
+        }
+        assert_eq!(total, 2);
+    }
 
     #[derive(Clone)]
     struct TestAccountLifecycleTransport {
@@ -7928,10 +8058,13 @@ mod tests {
         worker.shutdown_and_join();
     }
 
+    #[cfg(any(windows, target_os = "macos"))]
     #[tokio::test]
     async fn vault_worker_executes_real_commands_and_skips_canceled_queued_work() {
         let path = unique_temp_path("worker-commands").join("vault.db");
         let keys = Arc::new(MemoryKeyStore::default());
+        let project_id = "018f22e2-79b0-7cc8-98c4-dc0c0c07398f";
+        let first_path = seed_path_project(&path, "worker-commands", keys.as_ref(), project_id);
         let mut worker = VaultWorker::spawn(VaultConfig::new(
             path.clone(),
             "worker-commands",
@@ -7940,16 +8073,6 @@ mod tests {
         .await
         .unwrap();
         let client = worker.client();
-        let project_id = "018f22e2-79b0-7cc8-98c4-dc0c0c07398f";
-        let LocalRequest::ProjectPathSet(first_path) = request_fixture(
-            "project_path_set",
-            serde_json::json!({
-                "projectId": project_id,
-                "path": {"platform": "windows", "bytes": "AQI", "display": "C:\\work"},
-            }),
-        ) else {
-            unreachable!()
-        };
         let expected_path = first_path.path.clone();
         let first = client
             .try_submit(
@@ -8455,6 +8578,12 @@ mod tests {
         let provider = Arc::new(FixedTokenProvider::default());
         let keys = Arc::new(MemoryKeyStore::default());
         let path = unique_temp_path("daemon-e2e").join("vault.db");
+        let path_set = seed_path_project(
+            &path,
+            "test-vault-key",
+            keys.as_ref(),
+            "018f22e2-79b0-7cc8-98c4-dc0c0c07398f",
+        );
         let daemon = Daemon::start(test_config(runtime.clone(), path, keys, provider))
             .await
             .unwrap();
@@ -8480,15 +8609,6 @@ mod tests {
                 .unwrap(),
             LocalResult::Empty
         );
-        let LocalRequest::ProjectPathSet(path_set) = request_fixture(
-            "project_path_set",
-            serde_json::json!({
-                "projectId": "018f22e2-79b0-7cc8-98c4-dc0c0c07398f",
-                "path": {"platform": "windows", "bytes": "AQI", "display": null},
-            }),
-        ) else {
-            unreachable!()
-        };
         assert_eq!(
             desktop
                 .call(LocalRequest::ProjectPathSet(path_set))
@@ -8551,6 +8671,12 @@ mod tests {
         let provider = Arc::new(FixedTokenProvider::default());
         let keys = Arc::new(MemoryKeyStore::default());
         let path = unique_temp_path("daemon-cancel-queue").join("vault.db");
+        let active_path = seed_path_project(
+            &path,
+            "test-vault-key",
+            keys.as_ref(),
+            "018f22e2-79b0-7cc8-98c4-dc0c0c07398f",
+        );
         let gate = Arc::new(BlockingWorkerHook::new());
         let config = test_config(runtime.clone(), path.clone(), keys.clone(), provider)
             .with_worker_hook(gate.clone());
@@ -8561,15 +8687,6 @@ mod tests {
         let mut queued_client = RawClient::connect(&runtime, ClientRole::Desktop).await;
         let mut cancel_client = RawClient::connect(&runtime, ClientRole::Desktop).await;
 
-        let LocalRequest::ProjectPathSet(active_path) = request_fixture(
-            "project_path_set",
-            serde_json::json!({
-                "projectId": "018f22e2-79b0-7cc8-98c4-dc0c0c07398f",
-                "path": {"platform": "windows", "bytes": "AQI", "display": "C:\\active"},
-            }),
-        ) else {
-            unreachable!()
-        };
         let active_project_id = active_path.project_id.to_string();
         let expected_active_path = active_path.path.clone();
         let active_id = next_record_id();
@@ -8639,6 +8756,8 @@ mod tests {
         let provider = Arc::new(FixedTokenProvider::default());
         let keys = Arc::new(MemoryKeyStore::default());
         let path = unique_temp_path("daemon-timeout").join("vault.db");
+        let project_id = "018f22e2-79b0-7cc8-98c4-dc0c0c07398f";
+        let path_set = seed_path_project(&path, "test-vault-key", keys.as_ref(), project_id);
         let gate = Arc::new(BlockingWorkerHook::new());
         let config = test_config(runtime.clone(), path.clone(), keys.clone(), provider)
             .with_worker_hook(gate.clone());
@@ -8647,16 +8766,6 @@ mod tests {
         let owner = tokio::spawn(daemon.run());
         let mut client = RawClient::connect(&runtime, ClientRole::Desktop).await;
         tokio::time::pause();
-        let project_id = "018f22e2-79b0-7cc8-98c4-dc0c0c07398f";
-        let LocalRequest::ProjectPathSet(path_set) = request_fixture(
-            "project_path_set",
-            serde_json::json!({
-                "projectId": project_id,
-                "path": {"platform": "windows", "bytes": "AQI", "display": null},
-            }),
-        ) else {
-            unreachable!()
-        };
         let expected_path = path_set.path.clone();
         let request =
             tokio::spawn(async move { client.call(LocalRequest::ProjectPathSet(path_set)).await });
@@ -9021,6 +9130,31 @@ mod tests {
                 command
             }
             other => panic!("expected queued MCP workspace command, got {other:?}"),
+        }
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    fn seed_path_project(
+        path: &Path,
+        credential: &str,
+        keys: &dyn DatabaseKeyStore,
+        id: &str,
+    ) -> ProjectPathParams {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let project_id = id.parse().unwrap();
+        Vault::open(path, credential, keys)
+            .unwrap()
+            .put_project(&ProjectIdentity {
+                project_id,
+                github_repository_id: None,
+                git_remote_fingerprint: None,
+                monorepo_subdirectory: None,
+                name: "Local folder fixture".into(),
+            })
+            .unwrap();
+        ProjectPathParams {
+            project_id,
+            path: wire_native_path(&canonical_test_directory("bound-project-folder")),
         }
     }
 

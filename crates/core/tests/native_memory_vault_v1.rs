@@ -13,8 +13,8 @@ use context_relay_core::{
     },
 };
 use context_relay_protocol::{
-    CandidateReviewParams, CandidateState, ErrorCode, HarnessId, MemoryOrigin, NativePlatform,
-    PlanId, ScopeRef, Sha256Digest, WireNativeValue,
+    CandidateReviewParams, CandidateState, ErrorCode, HarnessId, MemoryCreateParams, MemoryKind,
+    MemoryOrigin, NativePlatform, OperationId, PlanId, ScopeRef, Sha256Digest, WireNativeValue,
 };
 use rusqlite::{Connection, params};
 use sha2::{Digest as _, Sha256};
@@ -1509,6 +1509,79 @@ fn persistence_rejects_evidence_from_the_wrong_reconciliation_phase() {
         Some(ledger)
     );
     assert_eq!(target.candidates(None).unwrap(), vec![initial_candidate]);
+}
+
+#[test]
+fn accepted_native_import_retains_observation_time_without_outranking_a_new_note() {
+    let path = TempVault::new("native-memory-observation-clock");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    let source = source(ScopeRef::Global, HarnessId::Codex, "observation-clock");
+    let now_ms = || {
+        u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap()
+    };
+    let before = now_ms();
+    let candidate = OfflineWorkspace::new(&mut vault, ID_7.parse().unwrap())
+        .reconcile_native_memory(ready(source.clone(), "imported fact"))
+        .unwrap()
+        .unwrap();
+    let after = now_ms();
+    let clock = candidate.proposed_memory.created_hlc;
+    assert!((before..=after).contains(&clock.physical_ms));
+    assert_eq!(candidate.proposed_memory.updated_hlc, clock);
+    assert_eq!(candidate.proposed_memory.provenance.created_hlc, clock);
+    let accepted = OfflineWorkspace::new(&mut vault, ID_7.parse().unwrap())
+        .review_candidate(CandidateReviewParams {
+            operation_id: ID_1.parse().unwrap(),
+            candidate_id: candidate.id,
+            accepted: true,
+        })
+        .unwrap();
+    drop(vault);
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    assert_eq!(vault.candidate(&candidate.id).unwrap(), Some(accepted));
+    OfflineWorkspace::new(&mut vault, ID_7.parse().unwrap())
+        .reconcile_native_memory(ready_live(source.clone(), "different fact"))
+        .unwrap();
+    assert_eq!(
+        OfflineWorkspace::new(&mut vault, ID_7.parse().unwrap())
+            .reconcile_native_memory(ready_live(source, "imported fact"))
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        vault
+            .candidate(&candidate.id)
+            .unwrap()
+            .unwrap()
+            .proposed_memory
+            .created_hlc,
+        clock
+    );
+
+    let mut note_uuid = *uuid::Uuid::now_v7().as_bytes();
+    note_uuid[..6].copy_from_slice(&(after + 1).to_be_bytes()[2..]);
+    let note = OfflineWorkspace::new(&mut vault, ID_7.parse().unwrap())
+        .create_memory(MemoryCreateParams {
+            operation_id: OperationId::new(uuid::Uuid::from_bytes(note_uuid)).unwrap(),
+            scope: ScopeRef::Global,
+            kind: MemoryKind::Note,
+            title: "New note".to_owned(),
+            body_markdown: "written after the import".to_owned(),
+            tags: Vec::new(),
+        })
+        .unwrap();
+    let imported = vault
+        .memory(&candidate.proposed_memory.id)
+        .unwrap()
+        .unwrap();
+    assert!(note.updated_hlc > imported.updated_hlc);
 }
 
 #[test]

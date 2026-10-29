@@ -216,6 +216,10 @@ pub(crate) fn canonical_directory(value: &WireNativeValue) -> Result<PathBuf, ()
         .ok_or(())
 }
 
+pub(crate) fn same_directory(left: &Path, right: &Path) -> Result<bool, ()> {
+    Ok(directory_identity(left)? == directory_identity(right)?)
+}
+
 fn decode_native_path(value: &WireNativeValue) -> Result<PathBuf, ()> {
     #[cfg(windows)]
     {

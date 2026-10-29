@@ -30,6 +30,7 @@ use crate::search::{
 };
 
 mod desktop_writes;
+mod list_pages;
 mod native_transactions;
 pub use native_transactions::*;
 mod devices;

@@ -17,7 +17,7 @@ use crate::{
     native_memory::{
         NativeMemoryDiagnostic, NativeMemoryDiagnosticClass, NativeMemoryError, NativeMemoryLedger,
         NativeMemorySnapshot, ReadyNativeMemory, ReconcileDecision, build_native_memory_candidate,
-        reconcile_classified,
+        native_memory_evidence, native_memory_identity, reconcile_classified,
     },
     search::{AllowedSearchScope, EMBEDDING_DIMENSIONS, Embedding384},
     vault::{
@@ -377,14 +377,34 @@ impl<'a> OfflineWorkspace<'a> {
                         change_kind,
                         ..
                     } => {
-                        let candidate = build_native_memory_candidate(
-                            &ready.source,
-                            unmanaged_digest,
-                            candidate_markdown,
-                            change_kind,
-                            self.device_id,
-                        )
-                        .map_err(|_| invalid_request())?;
+                        let (candidate_id, _, _) =
+                            native_memory_identity(ready.source.id, unmanaged_digest)
+                                .map_err(|_| invalid_request())?;
+                        let candidate =
+                            if let Some(mut stored) = vault(self.vault.candidate(&candidate_id))? {
+                                // Re-observation retains the original import clock and reviewed identity.
+                                stored.id = candidate_id;
+                                stored.state = CandidateState::Pending;
+                                stored.evidence_summary =
+                                    native_memory_evidence(change_kind).to_owned();
+                                stored
+                            } else {
+                                let observed_ms = u64::try_from(
+                                    std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map_err(|_| internal())?
+                                        .as_millis(),
+                                )
+                                .map_err(|_| internal())?;
+                                build_native_memory_candidate(
+                                    &ready.source,
+                                    unmanaged_digest,
+                                    candidate_markdown,
+                                    change_kind,
+                                    HybridLogicalClock::new(observed_ms, 0, self.device_id),
+                                )
+                                .map_err(|_| invalid_request())?
+                            };
                         ledger.last_observed_digest = Some(full_digest);
                         ledger.last_unmanaged_digest = Some(unmanaged_digest);
                         ledger.last_imported_digest = Some(unmanaged_digest);
@@ -1217,12 +1237,7 @@ impl<'a> OfflineWorkspace<'a> {
     ) -> Result<(), ClientError> {
         // Registration stores only a binding. Native setup still revalidates
         // its reviewed filesystem targets before granting an AI app access.
-        crate::mcp::binding::canonical_directory(&path).map_err(|()| ClientError {
-            code: ErrorCode::InvalidRequest,
-            message: "Choose an existing, accessible project folder".into(),
-            field_path: Some("path".into()),
-            retryable: false,
-        })?;
+        existing_project_directory(&path)?;
         vault(self.vault.register_project(&project, &path))
     }
 
@@ -1235,6 +1250,35 @@ impl<'a> OfflineWorkspace<'a> {
         project_id: ProjectId,
         path: WireNativeValue,
     ) -> Result<(), ClientError> {
+        let projects = self.projects()?;
+        if !projects
+            .iter()
+            .any(|project| project.project_id == project_id)
+        {
+            return Err(not_found());
+        }
+        let root = existing_project_directory(&path)?;
+        for project in projects {
+            if project.project_id == project_id {
+                continue;
+            }
+            let Some(existing) = vault(self.vault.path(&project.project_id.to_string()))? else {
+                continue;
+            };
+            let Ok(other_root) = crate::mcp::binding::canonical_directory(&existing) else {
+                continue;
+            };
+            if crate::mcp::binding::same_directory(&root, &other_root)
+                .map_err(|()| invalid_request())?
+            {
+                return Err(ClientError {
+                    code: ErrorCode::Conflict,
+                    message: "This folder is already assigned to another project".into(),
+                    field_path: Some("path".into()),
+                    retryable: false,
+                });
+            }
+        }
         vault(self.vault.put_path(&project_id.to_string(), &path))
     }
 
@@ -1464,6 +1508,15 @@ fn vault<T>(result: Result<T, VaultError>) -> Result<T, ClientError> {
     result.map_err(|error| match error {
         VaultError::OperationConflict => operation_conflict(),
         _ => internal(),
+    })
+}
+
+fn existing_project_directory(path: &WireNativeValue) -> Result<std::path::PathBuf, ClientError> {
+    crate::mcp::binding::canonical_directory(path).map_err(|()| ClientError {
+        code: ErrorCode::InvalidRequest,
+        message: "Choose an existing, accessible project folder".into(),
+        field_path: Some("path".into()),
+        retryable: false,
     })
 }
 
