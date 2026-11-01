@@ -61,7 +61,7 @@ jobs:
         env:
           CONTEXT_RELAY_HOSTED_URL: ${{ vars.CONTEXT_RELAY_HOSTED_URL }}
           CONTEXT_RELAY_HOSTED_PUBLISHABLE_KEY: ${{ vars.CONTEXT_RELAY_HOSTED_PUBLISHABLE_KEY }}
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: context-relay-windows-x64-${{ github.sha }}
           path: |
@@ -97,7 +97,7 @@ jobs:
             -EvidenceDirectory (Join-Path $env:RUNNER_TEMP 'context-relay-installed-evidence')
       - name: Retain bounded installed-smoke evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: context-relay-windows-installed-${{ github.sha }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/context-relay-installed-evidence/installed-smoke.json

@@ -28,7 +28,7 @@ jobs:
       - name: Observe short isolated window and restore policies
         shell: pwsh
         run: ./third_party/sidecars/semgrep/diagnose-windows-firewall.ps1 -OutputRoot "$env:RUNNER_TEMP/firewall-diagnostic"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: always()
         with:
           name: windows-firewall-diagnostic
