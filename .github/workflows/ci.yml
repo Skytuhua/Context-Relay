@@ -615,7 +615,7 @@ jobs:
           cygcheck.exe -cd | Set-Content -LiteralPath $cygcheckPath -Encoding utf8
           node scripts/prepare-semgrep-runtime.mjs --windows-evidence $factsPath $cygcheckPath $builderEvidence
           node scripts/prepare-semgrep-runtime.mjs --windows-stable-toolchain $builderEvidence (Join-Path $output "$label.builder-toolchain.windows-x86_64.v1.json")
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: task9-semgrep-windows-build-${{ matrix.build }}-${{ github.sha }}-${{ github.run_id }}${{ inputs.semgrep_release_qualification && format('-{0}', github.run_attempt) || '' }}
           path: ${{ runner.temp }}/context-relay-semgrep-output-windows-${{ matrix.build }}
@@ -745,7 +745,7 @@ jobs:
           }
           $smokeEvidence = Join-Path $env:CONTEXT_RELAY_RUNTIME_ARTIFACT_ROOT 'native-smoke.windows-x86_64.v1.json'
           node scripts/native-smoke-evidence.mjs --write $smokeEvidence windows-x86_64 $env:GITHUB_SHA $env:GITHUB_RUN_ID $env:GITHUB_RUN_ATTEMPT $env:CONTEXT_RELAY_CHECK_RUN_ID native-isolation-windows-x64
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: task9-semgrep-windows-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/context-relay-semgrep-candidate-windows/artifact
@@ -849,7 +849,7 @@ jobs:
           cp "$bundle" "$output/source-$slot.tar"
           node -e 'const fs=require("node:fs"); const p=process.argv[1]; const slot=process.env.CONTEXT_RELAY_BUILD_SLOT; const attempt=process.env.CONTEXT_RELAY_RELEASE_QUALIFICATION==="true"?`-${process.env.GITHUB_RUN_ATTEMPT}`:""; const value={schemaVersion:1,target:"macos-aarch64",build:`build-${slot}`,artifactName:`task9-semgrep-macos-build-${slot}-${process.env.GITHUB_SHA}-${process.env.GITHUB_RUN_ID}${attempt}`,commit:process.env.GITHUB_SHA,runId:process.env.GITHUB_RUN_ID,runAttempt:Number(process.env.GITHUB_RUN_ATTEMPT),checkRunId:Number(process.env.CONTEXT_RELAY_CHECK_RUN_ID),jobDefinition:process.env.CONTEXT_RELAY_JOB_DEFINITION,jobIndex:Number(process.env.CONTEXT_RELAY_JOB_INDEX),jobTotal:Number(process.env.CONTEXT_RELAY_JOB_TOTAL),runnerName:process.env.RUNNER_NAME,runnerOs:process.env.RUNNER_OS,runnerArch:process.env.RUNNER_ARCH,workflowRef:process.env.GITHUB_WORKFLOW_REF,workflowSha:process.env.GITHUB_WORKFLOW_SHA}; fs.writeFileSync(p,JSON.stringify(value)+"\n",{flag:"wx"});' "$output/$label.identity.v1.json"
           node -e 'const fs=require("node:fs"); const p=process.argv[1]; let fd; try { fd=fs.openSync(p,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW); const s=fs.fstatSync(fd); if(!s.isFile()||s.nlink !== 1||(s.mode & 0o777) !== 0o755) throw new Error("macOS producer executable mode mismatch"); } finally { if(fd !== undefined) fs.closeSync(fd); }' "$output/build-$slot/osemgrep"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: task9-semgrep-macos-build-${{ matrix.build }}-${{ github.sha }}-${{ github.run_id }}${{ inputs.semgrep_release_qualification && format('-{0}', github.run_attempt) || '' }}
           path: ${{ runner.temp }}/context-relay-semgrep-output-macos-${{ matrix.build }}
@@ -1004,7 +1004,7 @@ jobs:
             fi
           done
           node scripts/native-smoke-evidence.mjs --write "$CONTEXT_RELAY_RUNTIME_ARTIFACT_ROOT/native-smoke.macos-aarch64.v1.json" macos-aarch64 "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$CONTEXT_RELAY_CHECK_RUN_ID" native-isolation-macos-arm64
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: task9-semgrep-macos-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/context-relay-semgrep-candidate-macos/artifact

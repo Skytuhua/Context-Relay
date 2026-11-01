@@ -184,7 +184,7 @@ jobs:
             node -e 'const m=JSON.parse(process.argv[1]); if(m.immutable!==true||m.draft||m.prerelease||m.tag_name!==process.argv[2]||m.target_commitish!==process.argv[3]) process.exit(1)' "$metadata" "$tag" "$SOURCE_COMMIT"
           fi
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: final-semgrep-native-patch-${{ env.SOURCE_COMMIT }}-${{ env.SOURCE_RUN_ID }}-${{ env.SOURCE_RUN_ATTEMPT }}
           path: ${{ runner.temp }}/context-relay-semgrep-final/patch
